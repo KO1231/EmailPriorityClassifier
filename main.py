@@ -16,6 +16,7 @@ from email_priority_classifier.util.logger_util import setup_logger
 CLIENT_SECRETS_FILE = Path(__file__).resolve().parent / "secrets" / "client_secrets.json"
 TOKEN_FILE = Path(__file__).resolve().parent / "secrets" / "token.pickle"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.yml"
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 logger = setup_logger("main")
 
@@ -128,8 +129,11 @@ def main():
                 logger.info(f"(DEV MODE) Would modify thread label: {label_id} (Priority: {priority.name})")
                 continue
             modify_thread_label(service, thread_id, label_id)
-            logger.info(f"Modified thread label: {label_id} (Priority: {priority.name})")
+            logger.info(f"Modified thread label: {thread_id} (Priority: {priority.name})")
 
 
 if __name__ == "__main__":
-    main()
+    # Classifierのインスタンスを生成
+    classifier: EmailPriorityClassifier = ClassifierOpenAI()
+    # classifier: EmailPriorityClassifier = ClassifierGPTOSS(PROMPTS_DIR / "gptoss_system_prompt.txt", PROMPTS_DIR / "gptoss_user_prompt.txt")
+    main(classifier)

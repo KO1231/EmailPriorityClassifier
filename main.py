@@ -24,10 +24,15 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 logger = setup_logger("main", level=logging.INFO)
 
 
-def _classify_worker(thread_data: tuple[str, list[ClassifiedEmailData]], classifier: EmailPriorityClassifier) -> tuple[str, EmailPriority]:
+def _classify_worker(thread_data: tuple[str, list[ClassifiedEmailData]], classifier: EmailPriorityClassifier) -> tuple[str, EmailPriority] | tuple[
+    None, None]:
     """マルチプロセスで実行されるワーカー関数"""
     thread_id, thread_messages = thread_data
-    priority = classifier.calc(thread_messages)
+    try:
+        priority = classifier.calc(thread_messages)
+    except Exception as e:
+        logger.exception(f"Some error occurred while classifying thread. (threadId: {thread_id})")
+        return None, None
     return thread_id, priority
 
 
@@ -89,7 +94,19 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
                 thread_data_list = []
                 for i, thread in enumerate(threads):
                     thread_id = thread["id"]
-                    thread_messages = [ClassifiedEmailData.init(m, personal_label_info) for m in get_thread_messages(service, thread_id)]
+                    thread_messages = []
+                    succeed_processing = True
+                    for m in get_thread_messages(service, thread_id):
+                        try:
+                            thread_messages.append(ClassifiedEmailData.init(m, personal_label_info))
+                        except Exception as e:
+                            logger.exception(
+                                f"Some error occurred while initializing ClassifiedEmailData. (threadId: {thread_id}, messageId: {m.get('id', 'null')})")
+                            succeed_processing = False
+                            break
+                    if not succeed_processing:
+                        logger.warning(f"Skipping thread due to error in message processing. (threadId: {thread_id})")
+                        continue
                     if parameter_label_name_set & set(sum([m.labels for m in thread_messages], [])):
                         logger.warning("Found priority label in thread messages, skipping thread: {thread_id}")
                         continue
@@ -107,10 +124,12 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
                     batch_size = concurrency
                     for i in range(0, len(thread_data_list), batch_size):
                         batch = thread_data_list[i:i + batch_size]
-                        batch_results = pool.map(worker_func, batch)
+                        # 型は _classify_worker の戻り値から
+                        batch_results: list[tuple[str, EmailPriority] | tuple[None, None]] = pool.map(worker_func, batch)
 
                         for thread_id, priority in batch_results:
-                            result[priority].append(thread_id)
+                            if thread_id is not None and priority is not None:
+                                result[priority].append(thread_id)
                             processed_threads += 1
 
                             if max_threads is not None and processed_threads >= max_threads:
@@ -203,7 +222,11 @@ def main(classifier: EmailPriorityClassifier):
             if os.environ.get("DEV_NOT_MODIFY", "false").lower() == "true":
                 logger.info(f"(DEV MODE) Would modify thread label: {label_id} (Priority: {priority.name} [{i + 1} / {priority_amount}])")
                 continue
-            modify_thread_label(service, thread_id, label_id)
+            try:
+                modify_thread_label(service, thread_id, label_id)
+            except Exception as e:
+                logger.exception(f"Some error occurred while modifying thread label. (threadId: {thread_id}, labelId: {label_id})")
+                continue
             logger.info(f"Modified thread label: {thread_id} (Priority: {priority.name} [{i + 1} / {priority_amount}])")
 
 

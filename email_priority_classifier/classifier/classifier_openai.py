@@ -11,7 +11,7 @@ from email_priority_classifier.type import ClassifiedEmailData, EmailPriority
 from email_priority_classifier.util.logger_util import setup_logger
 
 _CLIENT = OpenAI()
-logger = setup_logger("classifier_openai", logging.DEBUG)
+logger = setup_logger("classifier_openai", logging.INFO)
 
 
 class OpenAIPromptInfo(NamedTuple):

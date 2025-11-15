@@ -61,7 +61,7 @@ class ClassifiedEmailData:
         body = payload.get("body", {})
         if len(body) != 0 and body.get("size", 0) != 0:
             data = self._decode_body(body["data"], payload.get("headers", []))
-            return json.dumps(data, indent=2)
+            return json.dumps(data)
 
         text_parts = [part for part in payload.get("parts", []) if part.get("mimeType", "").startswith("text/")]
         if len(text_parts) == 0:
@@ -72,9 +72,9 @@ class ClassifiedEmailData:
             if mimetype == "text/plain" or mimetype == "text/html":
                 # 全体のmimetypeがtext/plainかtext/htmlの場合、そのpartを返す
                 data = self._decode_body(text_part["body"]["data"], text_part.get("headers", []))
-                return json.dumps(data, indent=2)
+                return json.dumps(data)
 
-        return json.dumps(text_parts[0], indent=2)
+        return json.dumps(text_parts[0])
 
     @classmethod
     def init(cls, message: dict, personal_labels_info: dict[str, str]) -> "ClassifiedEmailData":

@@ -116,7 +116,7 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
                             if max_threads is not None and processed_threads >= max_threads:
                                 return result
 
-                        logger.info(f"Classified {processed_threads + i}{" / " + str(max_threads if max_threads else "")} threads....")
+                        logger.info(f"Classified {processed_threads}{" / " + str(max_threads) if max_threads else ""} threads....")
 
                         # レート制限: バッチ処理後に待機
                         # concurrency個のリクエストを並行実行したので、その分の時間を待つ

@@ -32,12 +32,14 @@ def _classify_worker(thread_data: tuple[str, list[ClassifiedEmailData]], classif
 
 def get_thread_messages(service: Resource, thread_id: str) -> list[dict]:
     try:
+        logger.debug(f"Getting thread messages for {thread_id}...")
         thread = service.users().threads().get(
             userId="me",
             id=thread_id,
             format="full",
             fields="id,messages(id,threadId,labelIds,payload,sizeEstimate,internalDate)"
         ).execute()
+        logger.debug(f"Got thread messages for {thread_id}.")
 
         if "id" not in thread or thread["id"] != thread_id:
             raise ValueError(f"Thread ID mismatch. Expected: {thread_id}, Actual: {thread.get('id', "null")}")
@@ -72,10 +74,13 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
         try:
             while request is not None:
                 # Fetch Threads
+                logger.info(f"Fetching {min(500, max_threads - processed_threads) if max_threads is not None else 500} threads from Gmail API...")
                 response = request.execute()
                 threads = response.get("threads", [])
+                logger.info(f"Fetched {len(threads)} threads...")
 
                 # スレッドデータを準備
+                logger.info("Fetching thread details for classification...")
                 thread_data_list = []
                 for thread in threads:
                     thread_id = thread["id"]
@@ -100,10 +105,15 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
                             if max_threads is not None and processed_threads >= max_threads:
                                 return result
 
+                        logger.info(f"Classified {processed_threads + i}{" / " + str(max_threads if max_threads else "")} threads....")
+
                         # レート制限: バッチ処理後に待機
                         # concurrency個のリクエストを並行実行したので、その分の時間を待つ
                         if rate_limit_in_min and i + batch_size < len(thread_data_list):
-                            time.sleep(60 * len(batch) / rate_limit_in_min)
+                            wait_time = 60 * len(batch) / rate_limit_in_min
+                            logger.info(f"Rate limit reached, waiting {wait_time} seconds...")
+                            time.sleep(wait_time)
+
                 else:
                     # シングルプロセスで順次処理
                     for thread_id, thread_messages in thread_data_list:
@@ -150,10 +160,13 @@ def fetch_personal_label_info(service: Resource) -> dict[str, str]:
 
 
 def main(classifier: EmailPriorityClassifier):
+    logger.info(f"Starting Email Priority Classifier...")
     config = load_config(str(CONFIG_FILE))
+    logger.info(f"Config loaded from {str(CONFIG_FILE)}")
     service = build("gmail", "v1",
                     credentials=get_credential(str(CLIENT_SECRETS_FILE), str(TOKEN_FILE)),
                     cache_discovery=False)
+    logger.info(f"Gmail API service built.")
 
     # ユーザー作成のラベル情報を取得
     personal_labels_info = fetch_personal_label_info(service)
@@ -174,9 +187,10 @@ def main(classifier: EmailPriorityClassifier):
     # Priorityごとにスレッドにラベルを付与
     for priority, thread_ids in classify_result.items():
         label_id = config.label_id[priority]
-        for thread_id in thread_ids:
+        priority_amount = len(thread_ids)
+        for i, thread_id in enumerate(thread_ids):
             if os.environ.get("DEV_NOT_MODIFY", "false").lower() == "true":
-                logger.info(f"(DEV MODE) Would modify thread label: {label_id} (Priority: {priority.name})")
+                logger.info(f"(DEV MODE) Would modify thread label: {label_id} (Priority: {priority.name} [{i + 1} / {priority_amount}])")
                 continue
             modify_thread_label(service, thread_id, label_id)
             logger.info(f"Modified thread label: {thread_id} (Priority: {priority.name})")

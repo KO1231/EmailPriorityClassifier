@@ -204,7 +204,7 @@ def main(classifier: EmailPriorityClassifier):
                 logger.info(f"(DEV MODE) Would modify thread label: {label_id} (Priority: {priority.name} [{i + 1} / {priority_amount}])")
                 continue
             modify_thread_label(service, thread_id, label_id)
-            logger.info(f"Modified thread label: {thread_id} (Priority: {priority.name})")
+            logger.info(f"Modified thread label: {thread_id} (Priority: {priority.name} [{i + 1} / {priority_amount}])")
 
 
 if __name__ == "__main__":

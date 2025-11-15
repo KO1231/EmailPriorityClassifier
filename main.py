@@ -1,5 +1,7 @@
 import os
 import time
+from functools import partial
+from multiprocessing import Pool
 from pathlib import Path
 
 from googleapiclient.discovery import build, Resource
@@ -19,6 +21,13 @@ CONFIG_FILE = Path(__file__).resolve().parent / "config.yml"
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 logger = setup_logger("main")
+
+
+def _classify_worker(thread_data: tuple[str, list[ClassifiedEmailData]], classifier: EmailPriorityClassifier) -> tuple[str, EmailPriority]:
+    """マルチプロセスで実行されるワーカー関数"""
+    thread_id, thread_messages = thread_data
+    priority = classifier.calc(thread_messages)
+    return thread_id, priority
 
 
 def get_thread_messages(service: Resource, thread_id: str) -> list[dict]:
@@ -41,7 +50,7 @@ def get_thread_messages(service: Resource, thread_id: str) -> list[dict]:
 
 
 def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_label_names: list[str], personal_label_info: dict[str, str], *,
-             max_threads: int | None = None, rate_limit_in_min: int | None = None) -> dict[
+             max_threads: int | None = None, rate_limit_in_min: int | None = None, concurrency: int = 1) -> dict[
     EmailPriority, list[str]]:
     result = {EmailPriority.P1: [], EmailPriority.P2: [], EmailPriority.P3: []}
 
@@ -50,28 +59,69 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
             userId="me",
             fields="threads(id),nextPageToken",
             includeSpamTrash=False,
+            maxResults=min(500, max_threads),
             q=f"(in:inbox) AND NOT({" OR ".join([f"label:{label_name}" for label_name in parameter_label_names])})"
         )
 
         processed_threads = 0
-        while request is not None:
-            # Fetch Threads
-            response = request.execute()
-            # Loop thread and classify
-            threads = response.get("threads", [])
-            for thread in threads:
-                thread_id = thread["id"]
-                thread_messages = [ClassifiedEmailData.init(m, personal_label_info) for m in get_thread_messages(service, thread_id)]
-                priority = classifier.calc(thread_messages)
-                result[priority].append(thread_id)
 
-                processed_threads += 1
-                if max_threads is not None and processed_threads >= max_threads:
-                    return result
-                if rate_limit_in_min:
-                    time.sleep(60 / rate_limit_in_min)
-            # Get next page
-            request = service.users().threads().list_next(previous_request=request, previous_response=response)
+        # マルチプロセスのためのプールを作成
+        use_multiprocessing = concurrency > 1
+        pool = Pool(processes=concurrency) if use_multiprocessing else None
+
+        try:
+            while request is not None:
+                # Fetch Threads
+                response = request.execute()
+                threads = response.get("threads", [])
+
+                # スレッドデータを準備
+                thread_data_list = []
+                for thread in threads:
+                    thread_id = thread["id"]
+                    thread_messages = [ClassifiedEmailData.init(m, personal_label_info) for m in get_thread_messages(service, thread_id)]
+                    thread_data_list.append((thread_id, thread_messages))
+
+                # 分類を実行
+                if use_multiprocessing:
+                    # マルチプロセスで並行処理
+                    worker_func = partial(_classify_worker, classifier=classifier)
+
+                    # レート制限を考慮してバッチサイズを調整
+                    batch_size = concurrency
+                    for i in range(0, len(thread_data_list), batch_size):
+                        batch = thread_data_list[i:i + batch_size]
+                        batch_results = pool.map(worker_func, batch)
+
+                        for thread_id, priority in batch_results:
+                            result[priority].append(thread_id)
+                            processed_threads += 1
+
+                            if max_threads is not None and processed_threads >= max_threads:
+                                return result
+
+                        # レート制限: バッチ処理後に待機
+                        # concurrency個のリクエストを並行実行したので、その分の時間を待つ
+                        if rate_limit_in_min and i + batch_size < len(thread_data_list):
+                            time.sleep(60 * len(batch) / rate_limit_in_min)
+                else:
+                    # シングルプロセスで順次処理
+                    for thread_id, thread_messages in thread_data_list:
+                        priority = classifier.calc(thread_messages)
+                        result[priority].append(thread_id)
+                        processed_threads += 1
+
+                        if max_threads is not None and processed_threads >= max_threads:
+                            return result
+                        if rate_limit_in_min:
+                            time.sleep(60 / rate_limit_in_min)
+
+                # Get next page
+                request = service.users().threads().list_next(previous_request=request, previous_response=response)
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
     except Exception as e:
         raise EmailPriorityClassifierGmailAPIException("Some error occurred while listing threads.") from e
@@ -99,7 +149,7 @@ def fetch_personal_label_info(service: Resource) -> dict[str, str]:
             service.users().labels().list(userId="me").execute()["labels"] if label["id"].startswith("Label_")}
 
 
-def main():
+def main(classifier: EmailPriorityClassifier):
     config = load_config(str(CONFIG_FILE))
     service = build("gmail", "v1",
                     credentials=get_credential(str(CLIENT_SECRETS_FILE), str(TOKEN_FILE)),
@@ -108,9 +158,6 @@ def main():
     # ユーザー作成のラベル情報を取得
     personal_labels_info = fetch_personal_label_info(service)
 
-    # Classifierのインスタンスを生成
-    classifier: EmailPriorityClassifier = ClassifierOpenAI()
-
     # PriorityがないメールをP1, P2, P3に分類
     max_threads = int(os.environ["MAX_THREADS"]) if "MAX_THREADS" in os.environ else None
     if max_threads is not None and max_threads <= 0:
@@ -118,8 +165,11 @@ def main():
     rate_limit_in_min = int(os.environ["RATE_LIMIT_REQUESTS_PER_MINUTE"]) if "RATE_LIMIT_REQUESTS_PER_MINUTE" in os.environ else None
     if rate_limit_in_min is not None and rate_limit_in_min <= 0:
         raise ValueError(f"rate_limit_in_min must be positive, got {rate_limit_in_min}")
+    concurrency = int(os.environ.get("CONCURRENCY", "1"))
+    if concurrency <= 0:
+        raise ValueError(f"concurrency must be positive, got {concurrency}")
     classify_result = classify(service, classifier, config.parameter_labels, personal_labels_info,
-                               max_threads=max_threads, rate_limit_in_min=rate_limit_in_min)
+                               max_threads=max_threads, rate_limit_in_min=rate_limit_in_min, concurrency=concurrency)
 
     # Priorityごとにスレッドにラベルを付与
     for priority, thread_ids in classify_result.items():

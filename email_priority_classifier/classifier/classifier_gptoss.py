@@ -45,7 +45,7 @@ class ClassifierGPTOSS(EmailPriorityClassifier):
         logger.debug("GPTOSS ------")
         try:
             request_prompt = self._create_request_prompt(self, self._prompt_info,
-                                                         thread_messages[0].subject, super()._encode_thread_messages(thread_messages))
+                                                         thread_messages[0].subject, super()._encode_thread_messages(thread_messages)[:1000])
             request_input = [
                 {
                     "role": "developer",

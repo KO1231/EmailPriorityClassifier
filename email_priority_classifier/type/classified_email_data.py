@@ -1,3 +1,4 @@
+import base64
 import json
 
 _LABEL_REPLACE_DATA = {
@@ -34,12 +35,46 @@ class ClassifiedEmailData:
                 return header.get("value", "")
         return ""
 
+    @staticmethod
+    def _decode_body(body: str, headers: list[dict]) -> str:
+        return base64.urlsafe_b64decode(body).decode("utf-8")
+        """
+        for header in headers:
+            if header.get("name", "").lower() == 'content-transfer-encoding':
+                encoding = header.get("value").lower()
+                if encoding == "base64":
+                    return base64.urlsafe_b64decode(body).decode("utf-8")
+                elif encoding == "quoted-printable":
+                    return quopri.decodestring(body).decode("utf-8")
+        return body
+        """
+
     def __init__(self, date: int, payload: dict, size_estimate: int, labels: list[str]):
         self.date = date
         self.payload = payload
         self.subject = self._extract_subject_from_payload(payload)
         self.size_estimate = size_estimate
         self.labels = labels
+
+    def get_data(self):
+        payload = self.payload
+        body = payload.get("body", {})
+        if len(body) != 0 and body.get("size", 0) != 0:
+            data = self._decode_body(body["data"], payload.get("headers", []))
+            return json.dumps(data, indent=2)
+
+        text_parts = [part for part in payload.get("parts", []) if part.get("mimeType", "").startswith("text/")]
+        if len(text_parts) == 0:
+            return "parts could not found."
+
+        for text_part in text_parts:
+            mimetype = text_part["mimeType"]
+            if mimetype == "text/plain" or mimetype == "text/html":
+                # 全体のmimetypeがtext/plainかtext/htmlの場合、そのpartを返す
+                data = self._decode_body(text_part["body"]["data"], text_part.get("headers", []))
+                return json.dumps(data, indent=2)
+
+        return json.dumps(text_parts[0], indent=2)
 
     @classmethod
     def init(cls, message: dict, personal_labels_info: dict[str, str]) -> "ClassifiedEmailData":
@@ -59,6 +94,6 @@ class ClassifiedEmailDataEncoder(json.JSONEncoder):
                 "subject": o.subject,
                 "size_estimate": o.size_estimate,
                 "labels": o.labels,
-                "payload": o.payload,
+                "data": o.get_data(),
             }
         return super().default(o)

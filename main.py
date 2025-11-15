@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from functools import partial
@@ -20,7 +21,7 @@ TOKEN_FILE = Path(__file__).resolve().parent / "secrets" / "token.pickle"
 CONFIG_FILE = Path(__file__).resolve().parent / "config.yml"
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
-logger = setup_logger("main")
+logger = setup_logger("main", level=logging.INFO)
 
 
 def _classify_worker(thread_data: tuple[str, list[ClassifiedEmailData]], classifier: EmailPriorityClassifier) -> tuple[str, EmailPriority]:
@@ -55,6 +56,7 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
              max_threads: int | None = None, rate_limit_in_min: int | None = None, concurrency: int = 1) -> dict[
     EmailPriority, list[str]]:
     result = {EmailPriority.P1: [], EmailPriority.P2: [], EmailPriority.P3: []}
+    parameter_label_name_set = set(parameter_label_names)
 
     try:
         request = service.users().threads().list(
@@ -65,13 +67,16 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
             q=f"(in:inbox) AND NOT({" OR ".join([f"label:{label_name}" for label_name in parameter_label_names])})"
         )
 
-        processed_threads = 0
-
         # マルチプロセスのためのプールを作成
         use_multiprocessing = concurrency > 1
-        pool = Pool(processes=concurrency) if use_multiprocessing else None
+        pool = None
+        if use_multiprocessing:
+            logger.info(f"Creating multiprocessing pool with {concurrency} processes...")
+            pool = Pool(processes=concurrency)
+            logger.info(f"Created multiprocessing pool with {concurrency} processes.")
 
         try:
+            processed_threads = 0
             while request is not None:
                 # Fetch Threads
                 logger.info(f"Fetching {min(500, max_threads - processed_threads) if max_threads is not None else 500} threads from Gmail API...")
@@ -82,10 +87,16 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
                 # スレッドデータを準備
                 logger.info("Fetching thread details for classification...")
                 thread_data_list = []
-                for thread in threads:
+                for i, thread in enumerate(threads):
                     thread_id = thread["id"]
                     thread_messages = [ClassifiedEmailData.init(m, personal_label_info) for m in get_thread_messages(service, thread_id)]
+                    if parameter_label_name_set & set(sum([m.labels for m in thread_messages], [])):
+                        logger.warning("Found priority label in thread messages, skipping thread: {thread_id}")
+                        continue
                     thread_data_list.append((thread_id, thread_messages))
+                    if (i != 0) and (i % (max(1, len(threads) // 10)) == 0):
+                        logger.info(f"Prepared {i} / {len(threads)} threads for classification...")
+                logger.info("Fetched thread details for classification.")
 
                 # 分類を実行
                 if use_multiprocessing:

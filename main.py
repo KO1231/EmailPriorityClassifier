@@ -14,6 +14,7 @@ from email_priority_classifier.exception import EmailPriorityClassifierGmailAPIE
 from email_priority_classifier.gmail_credentials import get_credential
 from email_priority_classifier.type.classified_email_data import ClassifiedEmailData
 from email_priority_classifier.type.priority import EmailPriority
+from email_priority_classifier.util.assert_util import assert_positive
 from email_priority_classifier.util.logger_util import setup_logger
 
 CLIENT_SECRETS_FILE = Path(__file__).resolve().parent / "secrets" / "client_secrets.json"
@@ -175,19 +176,34 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, priority_la
     return result
 
 
-def modify_thread_label(service: Resource, thread_id: str, priority_label_id: str):
-    try:
-        service.users().threads().modify(
-            userId="me",
-            id=thread_id,
-            body={
-                "addLabelIds": [priority_label_id],
-                "removeLabelIds": []
-            }
-        ).execute()
-    except Exception as e:
-        raise EmailPriorityClassifierGmailAPIException(
-            f"Some error occurred while modifying thread label. (threadId: {thread_id}, labelId: {priority_label_id})") from e
+def modify_thread_labels(service: Resource, modify_data: dict[EmailPriority, set[str]], priority_label_id: dict[EmailPriority, str]):
+    def modify_thread_label(thread_id: str, priority_label_id: str):
+        try:
+            service.users().threads().modify(
+                userId="me",
+                id=thread_id,
+                body={
+                    "addLabelIds": [priority_label_id],
+                    "removeLabelIds": []
+                }
+            ).execute()
+        except Exception as e:
+            raise EmailPriorityClassifierGmailAPIException(
+                f"Some error occurred while modifying thread label. (threadId: {thread_id}, labelId: {priority_label_id})") from e
+
+    for priority, thread_ids in modify_data.items():
+        label_id = priority_label_id[priority]
+        priority_amount = len(thread_ids)
+        for i, thread_id in enumerate(thread_ids):
+            if os.environ.get("DEV_NOT_MODIFY", "false").lower() == "true":
+                logger.info(f"(DEV MODE) Would modify thread label: {label_id} (Priority: {priority.name} [{i + 1} / {priority_amount}])")
+                continue
+            try:
+                modify_thread_label(thread_id, label_id)
+            except Exception as e:
+                logger.exception(f"Some error occurred while modifying thread label. (threadId: {thread_id}, labelId: {label_id})")
+                continue
+            logger.info(f"Modified thread label: {thread_id} (Priority: {priority.name} [{i + 1} / {priority_amount}])")
 
 
 def fetch_personal_label_info(service: Resource) -> dict[str, str]:
@@ -208,32 +224,14 @@ def main(classifier: EmailPriorityClassifier):
     personal_labels_info = fetch_personal_label_info(service)
 
     # PriorityがないメールをP1, P2, P3に分類
-    max_threads = config.max_threads
-    if max_threads <= 0:
-        raise ValueError(f"max_threads must be positive, got {max_threads}")
-    rate_limit_in_min = config.request_ratelimit_per_minute
-    if rate_limit_in_min <= 0:
-        raise ValueError(f"rate_limit_in_min must be positive, got {rate_limit_in_min}")
-    concurrency = config.concurrency
-    if concurrency <= 0:
-        raise ValueError(f"concurrency must be positive, got {concurrency}")
+    max_threads = assert_positive(config.max_threads, "max_threads")
+    rate_limit_in_min = assert_positive(config.request_ratelimit_per_minute, "rate_limit_in_min")
+    concurrency = assert_positive(config.concurrency, "concurrency")
     classify_result = classify(service, classifier, config.priority_labels, personal_labels_info,
                                max_threads=max_threads, rate_limit_in_min=rate_limit_in_min, concurrency=concurrency)
 
     # Priorityごとにスレッドにラベルを付与
-    for priority, thread_ids in classify_result.items():
-        label_id = config.label_id[priority]
-        priority_amount = len(thread_ids)
-        for i, thread_id in enumerate(thread_ids):
-            if os.environ.get("DEV_NOT_MODIFY", "false").lower() == "true":
-                logger.info(f"(DEV MODE) Would modify thread label: {label_id} (Priority: {priority.name} [{i + 1} / {priority_amount}])")
-                continue
-            try:
-                modify_thread_label(service, thread_id, label_id)
-            except Exception as e:
-                logger.exception(f"Some error occurred while modifying thread label. (threadId: {thread_id}, labelId: {label_id})")
-                continue
-            logger.info(f"Modified thread label: {thread_id} (Priority: {priority.name} [{i + 1} / {priority_amount}])")
+    modify_thread_labels(service, classify_result, config.label_id)
 
 
 if __name__ == "__main__":

@@ -63,7 +63,7 @@ class ClassifierGPTOSS(EmailPriorityClassifier):
                 input=request_input
             )
 
-            logger.debug(f"GPTOSS request_data: {json.dumps(request_input, indent=2)}")
+            logger.debug(f"GPTOSS request_data: {json.dumps(request_input, indent=2, ensure_ascii=False)}")
         except Exception as e:
             raise EmailPriorityClassifierOpenAIException("Some error occurred while calling the GPTOSS API.") from e
 

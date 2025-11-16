@@ -4,9 +4,18 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+google-api-python-client = ">=2.187.0,<3.0.0"
+google-auth-httplib2 = "~=0.2.1"
+google-auth-oauthlib = ">=1.2.3,<2.0.0"
+pyyaml = ">=6.0.3,<7.0.0"
+openai = ">=2.8.0,<3.0.0"
 
 [dev-packages]
 
 [requires]
 python_version = "3.13"
 python_full_version = "3.13.5"
+
+[scripts]
+start = "python main.py"
+login_google = "python email_priority_classifier/gmail_credentials.py"

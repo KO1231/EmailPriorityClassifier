@@ -108,7 +108,7 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
                         logger.warning(f"Skipping thread due to error in message processing. (threadId: {thread_id})")
                         continue
                     if parameter_label_name_set & set(sum([m.labels for m in thread_messages], [])):
-                        logger.warning("Found priority label in thread messages, skipping thread: {thread_id}")
+                        logger.warning(f"Found priority label in thread messages, skipping thread: {thread_id}")
                         continue
                     thread_data_list.append((thread_id, thread_messages))
                     if (i != 0) and (i % (max(1, len(threads) // 10)) == 0):

@@ -18,3 +18,4 @@ python_full_version = "3.13.5"
 
 [scripts]
 start = "python main.py"
+login_google = "python email_priority_classifier/gmail_credentials.py"

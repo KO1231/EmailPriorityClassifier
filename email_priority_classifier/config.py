@@ -11,6 +11,7 @@ class EmailPriorityClassifierConfig(NamedTuple):
     max_threads: int
     concurrency: int
     request_ratelimit_per_minute: int
+    model_name: str
 
 
 # Load Function
@@ -24,6 +25,7 @@ def load_config(path: str) -> EmailPriorityClassifierConfig:
         max_threads=int(raw_config["maxThreads"]),
         concurrency=int(raw_config["concurrency"]),
         request_ratelimit_per_minute=int(raw_config["requestsPerMin"]),
+        model_name=str(raw_config["model"])
     )
 
 

@@ -11,3 +11,5 @@ priorityLabels:
 maxThreads: 1500
 concurrency: 15
 requestsPerMin: 120
+
+model: "openai"

@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 
 _LABEL_REPLACE_DATA = {
     "INBOX": "Inbox",
@@ -37,8 +38,7 @@ class ClassifiedEmailData:
 
     @staticmethod
     def _decode_body(body: str, headers: list[dict]) -> str:
-        return (base64.urlsafe_b64decode(body).decode("utf-8")
-                .replace("\r", " ").replace("\n", " ").replace("\t", " "))
+        return re.sub(r"\s+", " ", base64.urlsafe_b64decode(body).decode("utf-8"))
         """
         for header in headers:
             if header.get("name", "").lower() == 'content-transfer-encoding':

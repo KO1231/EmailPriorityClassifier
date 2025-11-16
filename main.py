@@ -8,8 +8,7 @@ from pathlib import Path
 from googleapiclient.discovery import build, Resource
 
 from email_priority_classifier.classifier import EmailPriorityClassifier
-from email_priority_classifier.classifier.classifier_openai import ClassifierOpenAI
-from email_priority_classifier.config import load_config
+from email_priority_classifier.config import load_config, EmailPriorityClassifierConfig
 from email_priority_classifier.exception import EmailPriorityClassifierGmailAPIException
 from email_priority_classifier.gmail_credentials import get_credential
 from email_priority_classifier.type.classified_email_data import ClassifiedEmailData
@@ -212,10 +211,8 @@ def fetch_personal_label_info(service: Resource) -> dict[str, str]:
             service.users().labels().list(userId="me").execute()["labels"] if label["id"].startswith("Label_")}
 
 
-def main(classifier: EmailPriorityClassifier):
-    logger.info(f"Starting Email Priority Classifier...")
-    config = load_config(str(CONFIG_FILE))
-    logger.info(f"Config loaded from {str(CONFIG_FILE)}")
+def main(classifier: EmailPriorityClassifier, config: EmailPriorityClassifierConfig):
+    logger.info(f"Starting main logic...")
     service = build("gmail", "v1",
                     credentials=get_credential(str(CLIENT_SECRETS_FILE), str(TOKEN_FILE)),
                     cache_discovery=False)
@@ -235,8 +232,29 @@ def main(classifier: EmailPriorityClassifier):
     modify_thread_labels(service, classify_result, config.label_id)
 
 
-if __name__ == "__main__":
+def get_classifier(model_name: str) -> EmailPriorityClassifier:
     # Classifierのインスタンスを生成
-    classifier: EmailPriorityClassifier = ClassifierOpenAI()
-    # classifier: EmailPriorityClassifier = ClassifierGPTOSS(PROMPTS_DIR / "gptoss_system_prompt.txt", PROMPTS_DIR / "gptoss_user_prompt.txt")
-    main(classifier)
+    match model_name:
+        case "openai":
+            from email_priority_classifier.classifier.classifier_openai import ClassifierOpenAI
+            return ClassifierOpenAI()
+        case "gpt-oss":
+            from email_priority_classifier.classifier.classifier_gptoss import ClassifierGPTOSS
+            return ClassifierGPTOSS(PROMPTS_DIR / "gptoss_system_prompt.txt", PROMPTS_DIR / "gptoss_user_prompt.txt")
+        case _:
+            raise ValueError(f"Unsupported model name: {model_name}")
+
+
+if __name__ == "__main__":
+    logger.info(f"Starting Email Priority Classifier...")
+
+    logger.info("Loading config...")
+    config = load_config(str(CONFIG_FILE))
+    logger.info(f"Config loaded from {str(CONFIG_FILE)}")
+
+    logger.info(f"Loading classifier... (Model: {config.model_name})")
+    classifier = get_classifier(config.model_name)
+    logger.info(f"Classifier loaded. (Model: {config.model_name})")
+
+    main(classifier, config)
+    logger.info(f"Finished Email Priority Classifier.")

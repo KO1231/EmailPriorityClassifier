@@ -37,7 +37,8 @@ class ClassifiedEmailData:
 
     @staticmethod
     def _decode_body(body: str, headers: list[dict]) -> str:
-        return base64.urlsafe_b64decode(body).decode("utf-8")
+        return (base64.urlsafe_b64decode(body).decode("utf-8")
+                .replace("\r", "").replace("\n", "").replace("\t", ""))
         """
         for header in headers:
             if header.get("name", "").lower() == 'content-transfer-encoding':

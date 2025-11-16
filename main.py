@@ -17,10 +17,11 @@ from email_priority_classifier.type.priority import EmailPriority
 from email_priority_classifier.util.assert_util import assert_positive
 from email_priority_classifier.util.logger_util import setup_logger
 
-CLIENT_SECRETS_FILE = Path(__file__).resolve().parent / "secrets" / "client_secrets.json"
-TOKEN_FILE = Path(__file__).resolve().parent / "secrets" / "token.pickle"
-CONFIG_FILE = Path(__file__).resolve().parent / "config.yml"
-PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+PARENT_DIR = Path(__file__).resolve().parent
+CLIENT_SECRETS_FILE = PARENT_DIR / "secrets" / "client_secrets.json"
+TOKEN_FILE = PARENT_DIR / "secrets" / "token.pickle"
+CONFIG_FILE = PARENT_DIR / "config.yml"
+PROMPTS_DIR = PARENT_DIR / "prompts"
 
 logger = setup_logger("main", level=logging.INFO)
 

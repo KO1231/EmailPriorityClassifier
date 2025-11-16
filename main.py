@@ -208,13 +208,13 @@ def main(classifier: EmailPriorityClassifier):
     personal_labels_info = fetch_personal_label_info(service)
 
     # PriorityがないメールをP1, P2, P3に分類
-    max_threads = int(os.environ["MAX_THREADS"]) if "MAX_THREADS" in os.environ else None
-    if max_threads is not None and max_threads <= 0:
+    max_threads = config.max_threads
+    if max_threads <= 0:
         raise ValueError(f"max_threads must be positive, got {max_threads}")
-    rate_limit_in_min = int(os.environ["RATE_LIMIT_REQUESTS_PER_MINUTE"]) if "RATE_LIMIT_REQUESTS_PER_MINUTE" in os.environ else None
-    if rate_limit_in_min is not None and rate_limit_in_min <= 0:
+    rate_limit_in_min = config.request_ratelimit_per_minute
+    if rate_limit_in_min <= 0:
         raise ValueError(f"rate_limit_in_min must be positive, got {rate_limit_in_min}")
-    concurrency = int(os.environ.get("CONCURRENCY", "1"))
+    concurrency = config.concurrency
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
     classify_result = classify(service, classifier, config.priority_labels, personal_labels_info,

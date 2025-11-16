@@ -1,7 +1,11 @@
 # EmailPriorityClassifier
-EmailPriorityClassifier intelligently evaluates incoming emails and threads to determine how urgently they require user attention.<br>
-By analyzing subjects, sender, message bodies, Gmail’s native classifications, and user-assigned labels, it generates an priority score and assigns each message a clear Priority label (P1–P3).<br>
-This application supports both OpenAI models and OpenAI-compatible local LLMs such as those running through LM Studio, allowing users to choose between high-efficiency cloud models and fully private, on-device inference. This flexibility enables streamlined inbox triage while meeting diverse performance and privacy requirements.
+EmailPriorityClassifier intelligently evaluates incoming emails and threads to determine how urgently they require user attention.
+
+By analyzing subjects, senders, message bodies, Gmail’s native classifications, and user-assigned labels, it generates a priority score and assigns each message a clear Priority label (P1–P3).
+The ability to freely configure system prompts allows for flexible labeling and priority logic (e.g., always assigning emails from specific topics or senders to P1).
+
+This application supports both OpenAI models and OpenAI-compatible local LLMs such as those running through LM Studio, allowing users to choose between high-efficiency cloud models and fully private, on-device inference.
+This flexibility enables streamlined inbox triage while meeting diverse performance and privacy requirements.
 
 <img width="756" height="411" alt="email_priority_classifier" src="https://github.com/user-attachments/assets/ed5db17a-f8bb-45d2-94da-9ceae2ae6298" />
 

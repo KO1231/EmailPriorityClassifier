@@ -12,7 +12,7 @@ class EmailPriorityClassifier(ABC):
         return json.dumps({
             "labels": list(labels),
             "messages": thread_messages
-        }, cls=ClassifiedEmailDataEncoder)
+        }, cls=ClassifiedEmailDataEncoder, ensure_ascii=False)
 
     @abstractmethod
     def calc(self, thread_messages: list[ClassifiedEmailData]) -> EmailPriority:

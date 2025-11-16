@@ -61,7 +61,7 @@ class ClassifiedEmailData:
         body = payload.get("body", {})
         if len(body) != 0 and body.get("size", 0) != 0:
             data = self._decode_body(body["data"], payload.get("headers", []))
-            return json.dumps(data)
+            return data
 
         text_parts = [part for part in payload.get("parts", []) if part.get("mimeType", "").startswith("text/")]
         if len(text_parts) == 0:
@@ -75,9 +75,9 @@ class ClassifiedEmailData:
                 if body_data is None:
                     return "body data could not found."
                 data = self._decode_body(text_part["body"]["data"], text_part.get("headers", []))
-                return json.dumps(data)
+                return data
 
-        return json.dumps(text_parts[0])
+        return json.dumps(text_parts[0], ensure_ascii=False)
 
     @classmethod
     def init(cls, message: dict, personal_labels_info: dict[str, str]) -> "ClassifiedEmailData":

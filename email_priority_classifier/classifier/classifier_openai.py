@@ -41,7 +41,7 @@ class ClassifierOpenAI(EmailPriorityClassifier):
                 }
             )
 
-            logger.debug(f"OpenAPI request_data: {json.dumps(data, indent=2)}")
+            logger.debug(f"OpenAPI request_data: {json.dumps(data, indent=2, ensure_ascii=False)}")
         except Exception as e:
             raise EmailPriorityClassifierOpenAIException("Some error occurred while calling the OpenAI API.") from e
 

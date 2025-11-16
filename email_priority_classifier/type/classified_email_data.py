@@ -94,9 +94,7 @@ class ClassifiedEmailDataEncoder(json.JSONEncoder):
         if isinstance(o, ClassifiedEmailData):
             return {
                 "date": o.date,
-                "subject": o.subject,
                 "size_estimate": o.size_estimate,
-                "labels": o.labels,
                 "data": o.get_data(),
             }
         return super().default(o)

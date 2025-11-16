@@ -14,7 +14,7 @@ _ERROR_HANDLER = logging.StreamHandler(sys.stderr)
 _ERROR_HANDLER.setLevel(logging.ERROR)
 _ERROR_HANDLER.setFormatter(logging.Formatter(_FORMAT))
 
-_LOG_FILE = os.environ.get("EMAIL_PRIORITY_CLASSIFIER_LOG", Path(__file__).parent.parent.parent / "log" / "application.log")
+_LOG_FILE = Path(os.environ.get("EMAIL_PRIORITY_CLASSIFIER_LOG", str(Path(__file__).parent.parent.parent / "log" / "application.log"))).resolve()
 _LOG_FILE.parent.mkdir(exist_ok=True)
 _LOG_FILE_HANDLER = handlers.RotatingFileHandler(
     _LOG_FILE,

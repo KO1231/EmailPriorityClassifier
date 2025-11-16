@@ -57,11 +57,14 @@ def get_thread_messages(service: Resource, thread_id: str) -> list[dict]:
             f"Some error occurred while getting thread messages. (threadId: {thread_id})") from e
 
 
-def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_label_names: list[str], personal_label_info: dict[str, str], *,
+def classify(service: Resource, classifier: EmailPriorityClassifier, priority_label_name_info: dict[EmailPriority, str],
+             personal_label_info: dict[str, str], *,
              max_threads: int | None = None, rate_limit_in_min: int | None = None, concurrency: int = 1) -> dict[
-    EmailPriority, list[str]]:
-    result = {EmailPriority.P1: [], EmailPriority.P2: [], EmailPriority.P3: []}
-    parameter_label_name_set = set(parameter_label_names)
+    EmailPriority, set[str]]:
+    result = {EmailPriority.P1: set(), EmailPriority.P2: set(), EmailPriority.P3: set()}
+
+    priority_label_name_set = set(priority_label_name_info.values())
+    label_name_priority = {v: k for k, v in priority_label_name_info.items()}
 
     try:
         request = service.users().threads().list(
@@ -69,7 +72,7 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
             fields="threads(id),nextPageToken",
             includeSpamTrash=False,
             maxResults=min(500, max_threads),
-            q=f"(in:inbox) AND NOT({" OR ".join([f"label:{label_name}" for label_name in parameter_label_names])})"
+            q=f"(in:inbox) AND NOT({" OR ".join([f"label:{label_name}" for label_name in priority_label_name_set])})"
         )
 
         # マルチプロセスのためのプールを作成
@@ -107,8 +110,11 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
                     if not succeed_processing:
                         logger.warning(f"Skipping thread due to error in message processing. (threadId: {thread_id})")
                         continue
-                    if parameter_label_name_set & set(sum([m.labels for m in thread_messages], [])):
+                    existed_priority_label_names = (priority_label_name_set & set(sum([m.labels for m in thread_messages], [])))
+                    if existed_priority_label_names:
                         logger.warning(f"Found priority label in thread messages, skipping thread: {thread_id}")
+                        for label_name in existed_priority_label_names:
+                            result[label_name_priority[label_name]].add(thread_id)
                         continue
                     thread_data_list.append((thread_id, thread_messages))
                     if (i != 0) and (i % (max(1, len(threads) // 10)) == 0):
@@ -129,7 +135,7 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
 
                         for thread_id, priority in batch_results:
                             if thread_id is not None and priority is not None:
-                                result[priority].append(thread_id)
+                                result[priority].add(thread_id)
                             processed_threads += 1
 
                             if max_threads is not None and processed_threads >= max_threads:
@@ -148,7 +154,7 @@ def classify(service: Resource, classifier: EmailPriorityClassifier, parameter_l
                     # シングルプロセスで順次処理
                     for thread_id, thread_messages in thread_data_list:
                         priority = classifier.calc(thread_messages)
-                        result[priority].append(thread_id)
+                        result[priority].add(thread_id)
                         processed_threads += 1
 
                         if max_threads is not None and processed_threads >= max_threads:
@@ -211,7 +217,7 @@ def main(classifier: EmailPriorityClassifier):
     concurrency = int(os.environ.get("CONCURRENCY", "1"))
     if concurrency <= 0:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
-    classify_result = classify(service, classifier, config.parameter_labels, personal_labels_info,
+    classify_result = classify(service, classifier, config.priority_labels, personal_labels_info,
                                max_threads=max_threads, rate_limit_in_min=rate_limit_in_min, concurrency=concurrency)
 
     # Priorityごとにスレッドにラベルを付与

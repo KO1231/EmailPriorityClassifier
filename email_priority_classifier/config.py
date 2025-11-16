@@ -7,7 +7,7 @@ from email_priority_classifier.type.priority import EmailPriority
 
 class EmailPriorityClassifierConfig(NamedTuple):
     label_id: dict[EmailPriority, str]
-    parameter_labels: list[str]
+    priority_labels: dict[EmailPriority, str]
 
 
 # Load Function
@@ -17,7 +17,7 @@ def load_config(path: str) -> EmailPriorityClassifierConfig:
 
     return EmailPriorityClassifierConfig(
         label_id={priority: str(raw_config["labelID"][priority.name]) for priority in EmailPriority},
-        parameter_labels=raw_config["parameterLabels"]
+        priority_labels={priority: str(raw_config["priorityLabels"][priority.name]) for priority in EmailPriority}
     )
 
 

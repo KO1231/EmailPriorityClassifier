@@ -13,8 +13,10 @@ _ERROR_HANDLER = logging.StreamHandler(sys.stderr)
 _ERROR_HANDLER.setLevel(logging.ERROR)
 _ERROR_HANDLER.setFormatter(logging.Formatter(_FORMAT))
 
+_LOG_FILE_DIR = Path(__file__).parent.parent.parent / "log"
+_LOG_FILE_DIR.mkdir(exist_ok=True)
 _LOG_FILE_HANDLER = handlers.RotatingFileHandler(
-    Path(__file__).parent.parent.parent / "log" / "application.log",
+    _LOG_FILE_DIR / "application.log",
     encoding='utf-8',
     maxBytes=1 * (2 ** 20),  # 1 MB
     backupCount=5

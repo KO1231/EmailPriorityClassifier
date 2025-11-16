@@ -28,7 +28,7 @@ class ClassifierOpenAI(EmailPriorityClassifier):
         try:
             data = {
                 "thread_subject": thread_messages[0].subject,
-                "thread_messages": super()._encode_thread_messages(thread_messages)[:1000],
+                "thread_messages": super()._encode_thread_messages(thread_messages)[:1500],  # 大体4000前後input-tokenくらい
             }
             response = _CLIENT.responses.create(
                 # model="gpt-5-nano",

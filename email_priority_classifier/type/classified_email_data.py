@@ -2,6 +2,8 @@ import base64
 import json
 import re
 
+from bs4 import BeautifulSoup
+
 _LABEL_REPLACE_DATA = {
     "INBOX": "Inbox",
     "CATEGORY_PERSONAL": "Category: Personal",  # 他のタブに分類されない個人的な会話やメール。
@@ -68,15 +70,17 @@ class ClassifiedEmailData:
         if len(text_parts) == 0:
             return "parts could not found."
 
-        for text_part in text_parts:
+        for text_part in sorted(text_parts, key=lambda part: part["mimeType"], reverse=True):
             mimetype = text_part["mimeType"]
-            if mimetype == "text/plain" or mimetype == "text/html":
-                # 全体のmimetypeがtext/plainかtext/htmlの場合、そのpartを返す
-                body_data = text_part.get("body", {}).get("data")
-                if body_data is None:
-                    return "body data could not found."
-                data = self._decode_body(text_part["body"]["data"], text_part.get("headers", []))
-                return data
+            body_data = text_part.get("body", {}).get("data")
+            if body_data is None:
+                continue
+
+            match mimetype:
+                case "text/plain":
+                    return self._decode_body(text_part["body"]["data"], text_part.get("headers", []))
+                case "text/html":
+                    return self._decode_body(BeautifulSoup(text_part["body"]["data"], 'lxml').get_text(), text_part.get("headers", []))
 
         return json.dumps(text_parts[0], ensure_ascii=False)
 

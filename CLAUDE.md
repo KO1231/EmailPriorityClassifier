@@ -27,6 +27,15 @@ Landed so far:
   decoding, HTML decoded before parsing, RFC 2047 headers, sender and bulk-mail headers preserved,
   raw `labelIds` kept. `tests/fixtures/gmail.py` generates Gmail JSON from synthetic MIME — no real
   mail in the repo, ever.
+- **Config and labels** — `epc.settings` (pydantic-settings; CLI > env > `config.yml` > defaults,
+  unknown keys rejected), `epc.gmail.labels` (names resolved to IDs at startup, `labelID` gone),
+  `epc.gmail.auth` (JSON not pickle, `gmail.modify` only, access token never stored),
+  `epc.gmail.client`. CLI: `epc config validate`, `epc labels`, `epc login`.
+
+  The two implementations both default to `config.yml` during the transition and their schemas
+  are incompatible. The legacy file keeps working for the legacy tool; `epc` detects the old
+  schema and says so rather than emitting a wall of unknown-key errors. Pass `--config` to point
+  the new tool at a new-schema file until the legacy tree is removed.
 
 ### Carried forward — obligations deferred out of a completed phase
 

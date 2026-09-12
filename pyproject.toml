@@ -115,8 +115,21 @@ warn_unreachable = true
 show_error_codes = true
 # Third-party packages that ship no type information.
 [[tool.mypy.overrides]]
-module = ["googleapiclient.*", "google_auth_httplib2.*", "bs4.*"]
+module = [
+    "googleapiclient.*",
+    "google_auth_httplib2.*",
+    "google_auth_oauthlib.*",
+    "bs4.*",
+]
 ignore_missing_imports = true
+
+# google-auth ships *incomplete* type information: its modules resolve, but the
+# methods are unannotated, so every call trips --strict. Relax only the module
+# that touches them rather than losing strictness across the package.
+[[tool.mypy.overrides]]
+module = ["epc.gmail.auth", "tests.unit.gmail.test_auth"]
+disallow_untyped_calls = false
+warn_return_any = false
 
 # --------------------------------------------------------------------------
 # pytest

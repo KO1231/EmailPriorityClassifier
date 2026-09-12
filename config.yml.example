@@ -1,15 +1,61 @@
-labelID:
-  P1: "Label_????"
-  P2: "Label_????"
-  P3: "Label_????"
+# EmailPriorityClassifier configuration.
+#
+# Policy only — no secrets. API keys and OAuth tokens come from the environment
+# or a credential backend, so this file can be read, diffed and reviewed freely.
+#
+# Any value here can be overridden by an EPC__-prefixed environment variable,
+# with __ between levels: EPC__GMAIL__MAX_THREADS=50 overrides gmail.max_threads.
+# Precedence, highest first: command line > environment > this file > defaults.
+#
+# Unknown keys are an error rather than being ignored, so a typo fails loudly.
 
-priorityLabels:
-  P1: "????"
-  P2: "????"
-  P3: "????"
+# The three Gmail labels this tool writes. Display names only: the internal
+# Label_... IDs are resolved from the mailbox at startup, so there is nothing to
+# keep in sync by hand. `epc labels` shows what they resolve to.
+labels:
+  p1: "#/P1"
+  p2: "#/P2"
+  p3: "#/P3"
+  create_if_missing: false
 
-maxThreads: 1500
-concurrency: 15
-requestsPerMin: 120
+gmail:
+  query: "in:inbox"
+  # Appended to `query`. The single largest cost lever available — it stops
+  # every run re-reading the whole inbox.
+  extra_query: "newer_than:14d -in:chats"
+  max_threads: 1500
+  # Resume from a stored historyId when one exists, instead of a full scan.
+  incremental: true
 
-model: "openai"
+credentials:
+  backend: local # local | ssm | secrets_manager | service_account
+  token_file: secrets/token.json
+  client_secrets_file: secrets/client_secrets.json
+  # Required for the ssm and secrets_manager backends: the parameter path or
+  # secret name holding the durable half of the credentials.
+  # parameter_name: /epc/prod/gmail-credentials
+
+llm:
+  backend: openai # openai | bedrock | local
+  # Leave unset for backends that carry the model with the prompt.
+  # model: ...
+  concurrency: 15
+  requests_per_min: 120
+  budget:
+    thread_tokens: 4000
+    message_chars: 2000
+
+security:
+  # What to do with a thread whose content trips the injection heuristics.
+  # downgrade_and_flag records the signal and withholds the high-privilege
+  # actions (starring, moving to Primary) from that thread.
+  on_suspected_injection: downgrade_and_flag # ignore | flag | downgrade_and_flag
+
+run:
+  dry_run: false
+  state_backend: local # local | ssm | s3
+
+# `actions` and `dispatch` arrive with the action planner and the mutation
+# sinks. They are deliberately absent rather than stubbed: a config schema is
+# the expensive thing to change afterwards, so it is written once its consumer
+# exists.

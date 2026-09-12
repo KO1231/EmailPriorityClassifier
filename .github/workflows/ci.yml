@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep CI from silently resolving around the committed lockfile.
+  UV_FROZEN: "1"
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned by commit SHA: a mutable tag is itself a
+      # supply-chain hole. Comments record which release each SHA is.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --all-extras
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Types
+        run: uv run mypy
+
+      - name: Test
+        # The eval suite hits a real LLM API against local golden data; it must
+        # never run here.
+        run: uv run pytest -m "not eval" --cov --cov-report=term-missing
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: Audit dependencies for known vulnerabilities
+        run: |
+          uv export --all-extras --no-emit-project --format requirements.txt > requirements.txt
+          uvx pip-audit --requirement requirements.txt --strict

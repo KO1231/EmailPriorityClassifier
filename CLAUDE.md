@@ -7,18 +7,48 @@ to fall into during a refactor.
 
 ---
 
+## Status: rewrite in progress
+
+`feature/scrap-and-build` is replacing this implementation package by package. Two trees coexist:
+
+| Tree | State |
+|---|---|
+| `src/epc/` | The rewrite. uv + Python 3.14, `ruff`/`mypy --strict`/`pytest` all enforced in CI. |
+| `main.py`, `email_priority_classifier/` | The legacy implementation. Still runnable, still the thing that actually triages mail. Excluded from ruff and mypy; deleted once the new pipeline takes over. |
+
+Everything below the Commands section describes the **legacy** tree unless it says otherwise.
+
+Landed so far:
+
+- **Ground work** — `pyproject.toml` + `uv.lock`, dependencies split into `core` / `classify` /
+  `aws` so the apply worker never pulls an LLM SDK; `[tool.uv] exclude-newer` as a supply-chain
+  cooldown; ruff, mypy strict, pytest, pre-commit with gitleaks, CI with SHA-pinned actions.
+- **MIME core** — `epc.gmail.mime` and `epc.gmail.models`. Recursive payload walk, charset-aware
+  decoding, HTML decoded before parsing, RFC 2047 headers, sender and bulk-mail headers preserved,
+  raw `labelIds` kept. `tests/fixtures/gmail.py` generates Gmail JSON from synthetic MIME — no real
+  mail in the repo, ever.
+
+---
+
 ## Commands
 
 ```bash
-pipenv install                    # Install dependencies (Pipfile.lock is committed)
-pipenv run start                  # python main.py
+# Rewrite (src/epc/)
+make install                      # uv sync --all-extras + install the git hooks
+make check                        # lint + format check + mypy --strict + pytest
+make test                         # pytest, excluding the opt-in eval suite
+make audit                        # pip-audit over the locked dependency set
+
+# Legacy (main.py) — still runs, unaffected by the Python 3.14 bump because
+# pipenv keeps using its existing 3.13.5 virtualenv.
+make legacy-run                   # DEV_NOT_MODIFY=true pipenv run start
 pipenv run login_google           # python email_priority_classifier/gmail_credentials.py
-DEV_NOT_MODIFY=true pipenv run start   # Dry run: classify, log intended writes, write nothing
 ```
 
-There is no test suite, no linter config, and no formatter config in the repo. `.idea/misc.xml`
-references Black via the Pipenv SDK, but Black is not in the `Pipfile` and no formatting is
-enforced anywhere.
+Lint, format, type and test configuration all live in `pyproject.toml` and apply to `src/` and
+`tests/` only; the legacy tree is in ruff's `extend-exclude` and outside mypy's `files`. Linting
+code that is being deleted buys nothing. (`.idea/misc.xml` still references Black via the Pipenv
+SDK — a leftover; Black is not a dependency and ruff does the formatting.)
 
 **`.env` is loaded by pipenv, not by the application.** There is no `python-dotenv` dependency.
 `pipenv run ...` auto-loads `.env` from the project root; a bare `python main.py` will not, and
@@ -330,10 +360,16 @@ sketches lives in `local/improvement_proposals.md` (untracked, local only).
    `"parts could not found."`. Mail with attachments is disproportionately affected, and mail
    with attachments is disproportionately important.
 
-3. **Hardcoded UTF-8 decoding** — `type/classified_email_data.py:43`. ISO-2022-JP and Shift_JIS
-   bodies raise `UnicodeDecodeError`, which propagates to `main.py:106` and **drops the entire
-   thread**. The `charset` parameter is available on each part's `Content-Type` header; combine
-   it with `errors="replace"` so a mislabeled charset degrades instead of skipping.
+3. **Hardcoded UTF-8 decoding** — `type/classified_email_data.py:43`. This fails two different
+   ways, measured against the same fixtures the new parser is tested with:
+   - **Shift_JIS / EUC-JP** raise `UnicodeDecodeError`, which propagates to `main.py:106` and
+     **drops the entire thread**.
+   - **ISO-2022-JP does not raise at all.** It is 7-bit clean, so `.decode("utf-8")` succeeds and
+     hands the model the raw escape sequences — `'\x1b$BK\\F|Cf$K...'`. Silent mojibake, which is
+     worse than the loud failure: nothing in the logs says anything went wrong.
+
+   The `charset` parameter is available on each part's `Content-Type` header; combine it with
+   `errors="replace"` so a mislabeled charset degrades instead of skipping.
 
 4. **Single-process path has no per-thread error handling** — `main.py:157`. `classifier.calc()`
    is called bare; the exception unwinds to `main.py:173` and is re-raised as

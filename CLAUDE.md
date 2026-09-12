@@ -28,6 +28,20 @@ Landed so far:
   raw `labelIds` kept. `tests/fixtures/gmail.py` generates Gmail JSON from synthetic MIME — no real
   mail in the repo, ever.
 
+### Carried forward — obligations deferred out of a completed phase
+
+Deliberate omissions, recorded so they are not mistaken for oversights later.
+Nothing is removed from this list until the work is actually in the tree.
+
+| Owed | Deferred from | Where it must land | Why it was deferred |
+|---|---|---|---|
+| **Untrusted-content neutralisation** — NFKC, zero-width and bidi-override stripping, HTML comments, text hidden by `display:none` / `font-size:0` / foreground≈background, `data:` URIs and long base64 blobs, per-field and total length caps | MIME core | `epc/security/sanitize.py`, applied between `mime.parse_*` and prompt assembly | `mime.py` extracts faithfully; making content *safe* is a separate concern with a separate threat model. Mixing the two would leave neither testable on its own. |
+| Injection-detection signal (`suspicious_injection`) | MIME core | `epc/security/detect.py` | Needs the sanitiser it sits behind. |
+
+`epc.gmail.mime` output is therefore **not yet safe to put in a prompt.** The
+classifier must not be wired to it until `sanitize` exists — the adversarial
+corpus under `tests/injection/` is the gate on that.
+
 ---
 
 ## Commands

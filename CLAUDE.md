@@ -429,6 +429,17 @@ git-ignored, so the `gpt-oss` backend cannot run from a fresh clone.
 
 ## Conventions
 
+**Naming.** `epc` is the abbreviation of *EmailPriorityClassifier*. It is the Python package
+(`src/epc/`, imported as `from epc.gmail.mime import …`), the CLI command (`epc labels`), and the
+environment-variable prefix (`EPC__GMAIL__MAX_THREADS`). The distribution keeps the full name,
+`email-priority-classifier`, because that is what appears in a lockfile and on an index.
+
+The short form exists because the legacy package produced imports like
+`email_priority_classifier.classifier.classifier_openai`, and because the CLI name is typed by
+hand many times a day. Once Terraform lands, `epc` also becomes the prefix for resource names,
+the ECR repository, the SSM parameter paths and the CloudWatch log groups — renaming it after
+that point is no longer a find-and-replace.
+
 **Language.** Code comments and docstrings are Japanese. Log messages, exception messages, and
 all documentation are English. Keep the split.
 

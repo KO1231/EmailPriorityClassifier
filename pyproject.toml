@@ -10,28 +10,28 @@ keywords = ["gmail", "email", "triage", "llm", "classification"]
 # Core = what every entrypoint needs, including the apply worker.
 # The apply worker deliberately depends on neither an LLM SDK nor the MIME parser.
 dependencies = [
-    "google-api-python-client>=2.188,<3",
-    "google-auth-oauthlib>=1.2,<2",
-    "google-auth-httplib2>=0.3,<1",
-    "pydantic>=2.11,<3",
-    "pydantic-settings>=2.7,<3",
+    "google-api-python-client>=2.200.0,<3",
+    "google-auth-oauthlib>=1.4.1,<2",
+    "google-auth-httplib2>=0.4.2,<0.5",
+    "pydantic>=2.13.5,<3",
+    "pydantic-settings>=2.15.0,<3",
     "pyyaml>=6.0.3,<7",
-    "structlog>=25,<27",
+    "structlog>=26.1.0,<27",
 ]
 
 [project.optional-dependencies]
 # Everything the classify path needs on top of core.
 classify = [
-    "openai>=2.8,<4",
-    "beautifulsoup4>=4.14,<5",
-    "lxml>=6,<7",
+    "openai>=3.8.0,<4",
+    "beautifulsoup4>=4.15.0,<5",
+    "lxml>=6.1.3,<7",
 ]
 # Credential/state/dispatch backends on AWS, plus the Bedrock classifier.
 aws = [
-    "boto3>=1.40,<2",
+    "boto3>=1.43.89,<2",
     # The Lambda Runtime Interface Client. Present so that one image can serve
     # both entrypoints: the CLI on Fargate, and the apply handler on Lambda.
-    "awslambdaric>=3,<4",
+    "awslambdaric>=3.1.1,<4",
 ]
 all = ["email-priority-classifier[classify,aws]"]
 
@@ -43,15 +43,15 @@ Repository = "https://github.com/KO1231/EmailPriorityClassifier"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.3",
-    "pytest-cov>=6",
-    "mypy>=1.14",
-    "ruff>=0.9",
-    "types-PyYAML>=6",
-    "pre-commit>=4",
+    "pytest>=9.1.1,<10",
+    "pytest-cov>=7.1.0,<8",
+    "mypy>=2.3.1,<3",
+    "ruff>=0.16.6,<0.17",
+    "types-PyYAML>=6.0.12.20260815,<7",
+    "pre-commit>=4.6.2,<5",
     # Typed boto3. The Converse request body is hand-written JSON; a wrong key
     # name should be a type error, not a runtime ValidationException.
-    "boto3-stubs[bedrock-runtime,sqs,ssm,s3]>=1.40",
+    "boto3-stubs[bedrock-runtime,s3,sqs,ssm]>=1.43.89,<2",
 ]
 
 [build-system]
@@ -71,6 +71,12 @@ packages = ["src/epc"]
 # with a lockfile diff you have read) when pulling in updates.
 exclude-newer = "2026-09-06T00:00:00Z"
 default-groups = ["dev"]
+# `uv add` writes a bare `>=X` by default, so every dependency added after this
+# file was tidied would quietly admit the next major. "major" is semver-aware:
+# `<2` for 1.x, `<0.17` for 0.16.x, where a minor is the breaking line.
+# tests/unit/test_dependency_bounds.py enforces the same rule, because this
+# option is marked preview and a hand-edited requirement bypasses it anyway.
+add-bounds = "major"
 
 # --------------------------------------------------------------------------
 # ruff  (target-version is inferred from requires-python)

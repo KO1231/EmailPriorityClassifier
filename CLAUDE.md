@@ -180,6 +180,16 @@ stays out until someone lists it. `config.yml`, `.env`, `policy.yml`, `secrets/*
 are **generated**, never captured — `tests/fixtures/gmail.py` builds Gmail JSON from
 synthetic MIME, which is also why hostile shapes are cheap to author.
 
+**Every dependency admits exactly one breaking line.** Floored at what `uv.lock` pins,
+capped below the next major — or the next *minor* for 0.x, where `<1` is as loose as no
+ceiling. This is an application with a lockfile: there is no downstream consumer who
+needs a wide range, so the range says what is tested. A range spanning two majors claims
+compatibility nobody checked, and turns a resolver failure into a run-time one.
+`[tool.uv] add-bounds = "major"` makes `uv add` write ranges this way;
+`tests/unit/test_dependency_bounds.py` enforces it anyway, because that option is marked
+preview and a hand-edited requirement never goes through `uv add`. Crossing a major is
+therefore always a deliberate edit to `pyproject.toml`, which is exactly the review point.
+
 **Personal rules go in `policy.yml`, not in `prompts/`.** The committed prompts have to
 stay publishable. A guard test asserts they contain no personal context.
 

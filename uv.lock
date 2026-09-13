@@ -541,31 +541,31 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "awslambdaric", marker = "extra == 'aws'", specifier = ">=3,<4" },
-    { name = "beautifulsoup4", marker = "extra == 'classify'", specifier = ">=4.14,<5" },
-    { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.40,<2" },
+    { name = "awslambdaric", marker = "extra == 'aws'", specifier = ">=3.1.1,<4" },
+    { name = "beautifulsoup4", marker = "extra == 'classify'", specifier = ">=4.15.0,<5" },
+    { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.43.89,<2" },
     { name = "email-priority-classifier", extras = ["classify", "aws"], marker = "extra == 'all'" },
-    { name = "google-api-python-client", specifier = ">=2.188,<3" },
-    { name = "google-auth-httplib2", specifier = ">=0.3,<1" },
-    { name = "google-auth-oauthlib", specifier = ">=1.2,<2" },
-    { name = "lxml", marker = "extra == 'classify'", specifier = ">=6,<7" },
-    { name = "openai", marker = "extra == 'classify'", specifier = ">=2.8,<4" },
-    { name = "pydantic", specifier = ">=2.11,<3" },
-    { name = "pydantic-settings", specifier = ">=2.7,<3" },
+    { name = "google-api-python-client", specifier = ">=2.200.0,<3" },
+    { name = "google-auth-httplib2", specifier = ">=0.4.2,<0.5" },
+    { name = "google-auth-oauthlib", specifier = ">=1.4.1,<2" },
+    { name = "lxml", marker = "extra == 'classify'", specifier = ">=6.1.3,<7" },
+    { name = "openai", marker = "extra == 'classify'", specifier = ">=3.8.0,<4" },
+    { name = "pydantic", specifier = ">=2.13.5,<3" },
+    { name = "pydantic-settings", specifier = ">=2.15.0,<3" },
     { name = "pyyaml", specifier = ">=6.0.3,<7" },
-    { name = "structlog", specifier = ">=25,<27" },
+    { name = "structlog", specifier = ">=26.1.0,<27" },
 ]
 provides-extras = ["classify", "aws", "all"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "boto3-stubs", extras = ["bedrock-runtime", "sqs", "ssm", "s3"], specifier = ">=1.40" },
-    { name = "mypy", specifier = ">=1.14" },
-    { name = "pre-commit", specifier = ">=4" },
-    { name = "pytest", specifier = ">=8.3" },
-    { name = "pytest-cov", specifier = ">=6" },
-    { name = "ruff", specifier = ">=0.9" },
-    { name = "types-pyyaml", specifier = ">=6" },
+    { name = "boto3-stubs", extras = ["bedrock-runtime", "s3", "sqs", "ssm"], specifier = ">=1.43.89,<2" },
+    { name = "mypy", specifier = ">=2.3.1,<3" },
+    { name = "pre-commit", specifier = ">=4.6.2,<5" },
+    { name = "pytest", specifier = ">=9.1.1,<10" },
+    { name = "pytest-cov", specifier = ">=7.1.0,<8" },
+    { name = "ruff", specifier = ">=0.16.6,<0.17" },
+    { name = "types-pyyaml", specifier = ">=6.0.12.20260815,<7" },
 ]
 
 [[package]]

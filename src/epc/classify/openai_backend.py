@@ -1,35 +1,43 @@
-"""OpenAI and OpenAI-compatible backends.
+"""OpenAI, and OpenAI-compatible local servers.
 
-Structured Outputs do the constraining here: a `json_schema` with `strict: true`
-means the response is schema-valid by construction, and the failure mode the old
-implementation had — a markdown fence or a stray preamble losing the thread —
-stops existing.
+These used to be one class. They are two, because they speak different APIs and
+pretending otherwise would cost something real at each end:
 
-A local server behind the same API may or may not implement schema enforcement,
-so :class:`LocalClassifier` asks for it and degrades to plain JSON mode when the
-server rejects it. The shared parser in :mod:`epc.classify.base` is the backstop
-either way.
+* **OpenAI** goes through the **Responses API**. It is the current surface, and
+  an API key scoped to `api.responses.write` can reach it without also being
+  granted `model.request` — which is "call any model, any endpoint". Narrower is
+  better for a key that lives in a secret store and runs unattended.
+* **A local server** goes through **chat completions**. LM Studio, llama.cpp and
+  vLLM implement that; most do not implement Responses.
+
+Both constrain the reply with a strict JSON schema, and both hand the result to
+the shared parser, so the enum stays the boundary either way.
 """
 
 from typing import Any, cast
 
-from openai import APIError, OpenAI
-from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
+from openai import APIError, Omit, OpenAI, omit
+from openai.types.chat import ChatCompletionMessageParam
 from openai.types.chat.completion_create_params import ResponseFormat
+from openai.types.responses.response_text_config_param import ResponseTextConfigParam
+from openai.types.shared_params import Reasoning
 
-from epc.classify.base import Classification, ClassificationResult, Usage, parse_classification
+from epc.classify.base import ClassificationResult, Usage, parse_classification
 from epc.classify.budget import ThreadPayload
-from epc.classify.prompt import PromptRenderer, response_json_schema
-from epc.errors import ClassificationError
+from epc.classify.prompt import PromptRenderer, RenderedPrompt, response_json_schema
 
 SCHEMA_NAME = "email_priority"
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_MAX_OUTPUT_TOKENS = 2048
 
+# Never ask the provider to retain the request. The payload is somebody's mail,
+# and a 30-day retention window is not something to opt out of afterwards.
+STORE_ON_PROVIDER = False
 
-class OpenAIClassifier:
-    """Classify via the OpenAI API."""
+
+class _OpenAICompatibleClassifier:
+    """Shared shape: render, call, parse. Subclasses supply the call."""
 
     backend_name = "openai"
 
@@ -45,15 +53,18 @@ class OpenAIClassifier:
         verbosity: str | None = None,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     ) -> None:
-        # Retries are configured on the client rather than hand-rolled: the SDK
-        # already backs off on 429 and 5xx, and the old implementation's single
-        # attempt lost a thread to every transient error.
-        self._client = client or OpenAI(timeout=timeout, max_retries=max_retries)
+        # Retries live on the client rather than being hand-rolled: the SDK
+        # already backs off on 429 and 5xx, and the previous implementation's
+        # single attempt lost a thread to every transient error.
+        self._client = client if client is not None else self._default_client(timeout, max_retries)
         self._model = model
         self._renderer = renderer
         self._reasoning_effort = reasoning_effort
         self._verbosity = verbosity
         self._max_output_tokens = max_output_tokens
+
+    def _default_client(self, timeout: float, max_retries: int) -> OpenAI:
+        return OpenAI(timeout=timeout, max_retries=max_retries)
 
     @property
     def backend(self) -> str:
@@ -63,7 +74,107 @@ class OpenAIClassifier:
     def model(self) -> str:
         return self._model
 
-    def _response_format(self) -> ResponseFormat:
+    def _complete(self, rendered: RenderedPrompt) -> tuple[str, Usage]:
+        raise NotImplementedError
+
+    def classify(self, payload: ThreadPayload) -> ClassificationResult:
+        rendered = self._renderer.render(payload)
+        try:
+            text, usage = self._complete(rendered)
+        except APIError as exc:
+            raise _as_classification_error(self.backend, exc) from exc
+
+        return ClassificationResult(
+            thread_id=payload.thread_id,
+            classification=parse_classification(text),
+            usage=usage,
+            backend=self.backend,
+            model=self._model,
+            prompt_version=rendered.prompt_version,
+        )
+
+
+class OpenAIClassifier(_OpenAICompatibleClassifier):
+    """Classify through the OpenAI Responses API."""
+
+    backend_name = "openai"
+
+    def _text_config(self) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "format": {
+                "type": "json_schema",
+                "name": SCHEMA_NAME,
+                "strict": True,
+                "schema": response_json_schema(),
+            }
+        }
+        if self._verbosity is not None:
+            config["verbosity"] = self._verbosity
+        return config
+
+    def _complete(self, rendered: RenderedPrompt) -> tuple[str, Usage]:
+        # `omit` rather than None: a model that does not know the parameter
+        # should not be handed it at all.
+        reasoning: Reasoning | Omit = (
+            Reasoning(effort=cast("Any", self._reasoning_effort)) if self._reasoning_effort is not None else omit
+        )
+        response = self._client.responses.create(
+            model=self._model,
+            instructions=rendered.system,
+            input=rendered.user,
+            text=cast("ResponseTextConfigParam", self._text_config()),
+            max_output_tokens=self._max_output_tokens,
+            store=STORE_ON_PROVIDER,
+            reasoning=reasoning,
+        )
+        usage = response.usage
+        return response.output_text or "", Usage(
+            # Reasoning tokens are already counted inside output_tokens.
+            input_tokens=int(usage.input_tokens) if usage else 0,
+            output_tokens=int(usage.output_tokens) if usage else 0,
+        )
+
+
+class LocalClassifier(_OpenAICompatibleClassifier):
+    """Classify through a local OpenAI-compatible server.
+
+    The privacy-maximising option: nothing leaves the machine. Schema support
+    varies between servers, so a rejected `json_schema` falls back to plain JSON
+    mode rather than costing the thread.
+    """
+
+    backend_name = "local"
+
+    def __init__(self, *, base_url: str, **options: Any) -> None:
+        self._base_url = base_url
+        super().__init__(**options)
+
+    def _default_client(self, timeout: float, max_retries: int) -> OpenAI:
+        # A local server needs no credential, but the SDK insists on one.
+        return OpenAI(base_url=self._base_url, api_key="not-used", timeout=timeout, max_retries=max_retries)
+
+    def _request(self, rendered: RenderedPrompt, response_format: dict[str, Any]) -> tuple[str, Usage]:
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": rendered.system},
+            {"role": "user", "content": rendered.user},
+        ]
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            response_format=cast("ResponseFormat", response_format),
+            max_completion_tokens=self._max_output_tokens,
+            reasoning_effort=cast("Any", self._reasoning_effort or omit),
+            verbosity=cast("Any", self._verbosity or omit),
+        )
+        choices = getattr(response, "choices", None) or []
+        content = choices[0].message.content if choices else ""
+        usage = getattr(response, "usage", None)
+        return content or "", Usage(
+            input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+        )
+
+    def _schema_format(self) -> dict[str, Any]:
         return {
             "type": "json_schema",
             "json_schema": {
@@ -73,108 +184,16 @@ class OpenAIClassifier:
             },
         }
 
-    def _request(self, system: str, user: str, response_format: ResponseFormat) -> ChatCompletion:
-        messages: list[ChatCompletionMessageParam] = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        extra: dict[str, Any] = {}
-        # Omitted rather than sent as None: a model that does not know the
-        # parameter should not be handed it at all.
-        if self._reasoning_effort is not None:
-            extra["reasoning_effort"] = self._reasoning_effort
-        if self._verbosity is not None:
-            extra["verbosity"] = self._verbosity
-
-        # `**extra` widens the overload to Any; the call is non-streaming, so
-        # the concrete return type is known.
-        return cast(
-            "ChatCompletion",
-            self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                response_format=response_format,
-                max_completion_tokens=self._max_output_tokens,
-                **extra,
-            ),
-        )
-
-    def _complete(self, system: str, user: str) -> ChatCompletion:
-        return self._request(system, user, self._response_format())
-
-    def classify(self, payload: ThreadPayload) -> ClassificationResult:
-        rendered = self._renderer.render(payload)
+    def _complete(self, rendered: RenderedPrompt) -> tuple[str, Usage]:
         try:
-            response = self._complete(rendered.system, rendered.user)
-        except APIError as exc:
-            raise ClassificationError(f"{self.backend} request failed: {exc}") from exc
-
-        return ClassificationResult(
-            thread_id=payload.thread_id,
-            classification=_parse_choice(response),
-            usage=_usage_of(response),
-            backend=self.backend,
-            model=self._model,
-            prompt_version=rendered.prompt_version,
-        )
-
-
-class LocalClassifier(OpenAIClassifier):
-    """Classify via a local OpenAI-compatible server.
-
-    The privacy-maximising option: nothing leaves the machine. Schema support
-    varies across local servers, so a rejected `json_schema` falls back to plain
-    JSON mode rather than failing the thread.
-    """
-
-    backend_name = "local"
-
-    def __init__(
-        self,
-        *,
-        model: str,
-        renderer: PromptRenderer,
-        base_url: str,
-        client: OpenAI | None = None,
-        timeout: float = DEFAULT_TIMEOUT,
-        max_retries: int = DEFAULT_MAX_RETRIES,
-        reasoning_effort: str | None = None,
-        verbosity: str | None = None,
-        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
-    ) -> None:
-        super().__init__(
-            model=model,
-            renderer=renderer,
-            reasoning_effort=reasoning_effort,
-            verbosity=verbosity,
-            max_output_tokens=max_output_tokens,
-            # A local server needs no credential, but the SDK insists on one.
-            client=client or OpenAI(base_url=base_url, api_key="not-used", timeout=timeout, max_retries=max_retries),
-        )
-        self._base_url = base_url
-
-    def _complete(self, system: str, user: str) -> ChatCompletion:
-        try:
-            return self._request(system, user, self._response_format())
+            return self._request(rendered, self._schema_format())
         except APIError:
             # The server does not implement schema enforcement. Ask for JSON and
-            # let the shared parser and its validation carry the weight.
-            return self._request(system, user, {"type": "json_object"})
+            # let the shared parser carry the weight.
+            return self._request(rendered, {"type": "json_object"})
 
 
-def _parse_choice(response: ChatCompletion) -> Classification:
-    choices = getattr(response, "choices", None) or []
-    if not choices:
-        raise ClassificationError("the model returned no choices")
-    content = getattr(choices[0].message, "content", None)
-    return parse_classification(content or "")
+def _as_classification_error(backend: str, exc: APIError) -> Exception:
+    from epc.errors import ClassificationError
 
-
-def _usage_of(response: ChatCompletion) -> Usage:
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return Usage()
-    return Usage(
-        input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
-        output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
-    )
+    return ClassificationError(f"{backend} request failed: {exc}")

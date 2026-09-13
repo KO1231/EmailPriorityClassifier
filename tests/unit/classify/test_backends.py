@@ -38,8 +38,25 @@ def payload():  # type: ignore[no-untyped-def]
 # --------------------------------------------------------------------------
 
 
-class FakeOpenAI:
-    """Enough of the OpenAI client to record the request and return a reply."""
+class FakeResponses:
+    """Enough of the Responses API to record the request and return a reply."""
+
+    def __init__(self, content: str = ANSWER, error: Exception | None = None) -> None:
+        self._content = content
+        self._error = error
+        self.calls: list[dict[str, Any]] = []
+        self.responses = self
+
+    def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        if self._error is not None and len(self.calls) == 1:
+            raise self._error
+        usage = type("Usage", (), {"input_tokens": 120, "output_tokens": 30})()
+        return type("Response", (), {"output_text": self._content, "usage": usage})()
+
+
+class FakeChatCompletions:
+    """Enough of chat completions for the local backend."""
 
     def __init__(self, content: str = ANSWER, error: Exception | None = None) -> None:
         self._content = content
@@ -48,7 +65,7 @@ class FakeOpenAI:
         self.chat = self
 
     @property
-    def completions(self) -> FakeOpenAI:
+    def completions(self) -> FakeChatCompletions:
         return self
 
     def create(self, **kwargs: Any) -> Any:
@@ -98,7 +115,7 @@ def text_response(text: str) -> dict[str, Any]:
 
 
 def test_openai_classifies_and_reports_provenance(renderer: PromptRenderer, payload: Any) -> None:
-    client = FakeOpenAI()
+    client = FakeResponses()
     result = OpenAIClassifier(model="test-model", renderer=renderer, client=cast(Any, client)).classify(payload)
 
     assert result.classification.priority is Priority.P1
@@ -109,37 +126,35 @@ def test_openai_classifies_and_reports_provenance(renderer: PromptRenderer, payl
 
 
 def test_openai_constrains_the_response_to_the_schema(renderer: PromptRenderer, payload: Any) -> None:
-    client = FakeOpenAI()
+    client = FakeResponses()
     OpenAIClassifier(model="m", renderer=renderer, client=cast(Any, client)).classify(payload)
 
-    response_format = client.calls[0]["response_format"]
-    assert response_format["type"] == "json_schema"
-    assert response_format["json_schema"]["strict"] is True
-    assert response_format["json_schema"]["schema"]["properties"]["priority"]["enum"] == [
-        "P1",
-        "P2",
-        "P3",
-    ]
+    text_config = client.calls[0]["text"]
+    assert text_config["format"]["type"] == "json_schema"
+    assert text_config["format"]["strict"] is True
+    assert text_config["format"]["schema"]["properties"]["priority"]["enum"] == ["P1", "P2", "P3"]
 
 
 def test_openai_sends_the_rendered_prompts(renderer: PromptRenderer, payload: Any) -> None:
-    client = FakeOpenAI()
+    client = FakeResponses()
     OpenAIClassifier(model="m", renderer=renderer, client=cast(Any, client)).classify(payload)
 
-    roles = [message["role"] for message in client.calls[0]["messages"]]
-    assert roles == ["system", "user"]
-    assert "untrusted_email_content" in client.calls[0]["messages"][1]["content"]
+    call = client.calls[0]
+    assert "classify email threads" in call["instructions"].lower()
+    assert "untrusted_email_content" in call["input"]
+    # The payload is somebody's mail; the provider is not asked to keep it.
+    assert call["store"] is False
 
 
 def test_an_api_error_becomes_a_classification_error(renderer: PromptRenderer, payload: Any) -> None:
     """One thread is lost, not the run."""
-    client = FakeOpenAI(error=api_error("boom"))
+    client = FakeResponses(error=api_error("boom"))
     with pytest.raises(ClassificationError, match="openai request failed"):
         OpenAIClassifier(model="m", renderer=renderer, client=cast(Any, client)).classify(payload)
 
 
 def test_an_unusable_reply_is_a_classification_error(renderer: PromptRenderer, payload: Any) -> None:
-    client = FakeOpenAI(content="I would rather not.")
+    client = FakeResponses(content="I would rather not.")
     with pytest.raises(ClassificationError):
         OpenAIClassifier(model="m", renderer=renderer, client=cast(Any, client)).classify(payload)
 
@@ -152,7 +167,7 @@ def test_an_unusable_reply_is_a_classification_error(renderer: PromptRenderer, p
 def test_local_falls_back_when_the_server_rejects_the_schema(renderer: PromptRenderer, payload: Any) -> None:
     """Schema support varies across local servers; a thread should not be lost
     because one of them has not implemented it."""
-    client = FakeOpenAI(error=api_error("unknown response_format"))
+    client = FakeChatCompletions(error=api_error("unknown response_format"))
     result = LocalClassifier(
         model="m", renderer=renderer, base_url="http://localhost:1234/v1", client=cast(Any, client)
     ).classify(payload)
@@ -164,7 +179,7 @@ def test_local_falls_back_when_the_server_rejects_the_schema(renderer: PromptRen
 
 
 def test_local_asks_for_the_schema_first(renderer: PromptRenderer, payload: Any) -> None:
-    client = FakeOpenAI()
+    client = FakeChatCompletions()
     LocalClassifier(
         model="m", renderer=renderer, base_url="http://localhost:1234/v1", client=cast(Any, client)
     ).classify(payload)
@@ -253,7 +268,7 @@ def settings_for(tmp_path: Path, llm: str) -> Any:
 
 
 def test_every_backend_satisfies_the_protocol(renderer: PromptRenderer) -> None:
-    assert isinstance(OpenAIClassifier(model="m", renderer=renderer, client=cast(Any, FakeOpenAI())), Classifier)
+    assert isinstance(OpenAIClassifier(model="m", renderer=renderer, client=cast(Any, FakeResponses())), Classifier)
     assert isinstance(BedrockClassifier(model="m", renderer=renderer, client=cast(Any, FakeBedrock())), Classifier)
 
 

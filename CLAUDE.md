@@ -55,6 +55,13 @@ Landed so far:
   rejection degrades to `toolChoice: auto` (latched, so 1500 threads do not each pay for a doomed
   first attempt) and then to reading plain text. `parse_classification` is the backstop in every
   case, which is what keeps the enum — not the transport — as the security boundary.
+
+  **The OpenAI backend uses the Responses API, the local one uses chat completions.** They are
+  separate classes, not one with a switch, because an API key scoped to `api.responses.write`
+  reaches Responses without also being granted `model.request` — which is "call any model on any
+  endpoint". Local servers (LM Studio, llama.cpp, vLLM) implement chat completions and mostly do
+  not implement Responses, so that end cannot follow. `store=False` on every OpenAI request: the
+  payload is somebody's mail, and provider-side retention is not a thing to opt out of afterwards.
 - **Pipeline and actions** — `epc.pipeline` (ThreadPoolExecutor, not processes; the work is HTTP
   wait end to end), `epc.ratelimit` (a next-slot clock, so one slow response delays only itself),
   `epc.actions` (declarative rules, first match wins), `epc.dispatch` (`DirectSink` applies,

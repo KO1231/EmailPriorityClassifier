@@ -219,6 +219,8 @@ actions:                    # what happens once a priority is known
     - when:   { priority: P1 }
       unless: { any_label: [SPAM, TRASH] }
       do:     [add_star, move_to_primary, mark_important]
+
+dry_run: false              # overrides dispatch: nothing is written to Gmail
 ```
 
 Any value can be overridden by an `EPC__`-prefixed environment variable, with `__`

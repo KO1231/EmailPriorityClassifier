@@ -214,11 +214,12 @@ class ObservabilitySettings(_Section):
     history_dir: Path | None = None
 
 
-class RunSettings(_Section):
-    dry_run: bool = False
-    state_backend: StateBackend = "local"
-    # backend: local — where the historyId checkpoint lives.
-    state_file: Path = Path(".state/run.json")
+class StateSettings(_Section):
+    """Where the checkpoint between runs is kept. Holds no secret."""
+
+    backend: StateBackend = "local"
+    # backend: local — the file holding the Gmail historyId.
+    file: Path = Path(".state/run.json")
 
 
 class Settings(BaseSettings):
@@ -246,7 +247,13 @@ class Settings(BaseSettings):
     dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
-    run: RunSettings = Field(default_factory=RunSettings)
+    state: StateSettings = Field(default_factory=StateSettings)
+
+    # Top level, and not a member of any section, because it overrides one.
+    # Whatever `dispatch` is configured to do — apply now, or hand off to a
+    # queue — this says nothing is written to Gmail. A safety switch that only
+    # worked for some dispatch settings would be worse than none.
+    dry_run: bool = False
 
     @classmethod
     def settings_customise_sources(
@@ -263,6 +270,17 @@ class Settings(BaseSettings):
         credential backend, not to configuration.
         """
         return (init_settings, env_settings, YamlConfigSettingsSource(settings_cls))
+
+    def resolve_sink(self, *, force_dry_run: bool = False) -> SinkKind:
+        """Where mutations actually go, with `dry_run` taking precedence.
+
+        Keeping the precedence here rather than at the call site is the point:
+        every future entry point gets it, and a new sink cannot accidentally
+        become one that writes during a dry run.
+        """
+        if force_dry_run or self.dry_run:
+            return "jsonl"
+        return self.dispatch.sink
 
     @property
     def search_query(self) -> str:

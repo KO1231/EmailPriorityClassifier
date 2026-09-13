@@ -115,6 +115,11 @@ leaks a truncated line instead of a mailbox.
 **The history file records a subject digest and a sender domain, never the mail.** It
 outlives the run, gets copied to S3, and ends up in backups. Default is off.
 
+**`dry_run` is top level, not inside a section.** It overrides `dispatch`, so it is not
+one of dispatch's peers. `Settings.resolve_sink()` holds that precedence in one place:
+every entry point gets it, and a sink added later cannot accidentally become one that
+writes during a dry run.
+
 **The checkpoint only advances on a clean run.** After a partial failure the next run
 re-lists the same window; threads that did succeed are excluded by their labels, so the
 repeat is free.

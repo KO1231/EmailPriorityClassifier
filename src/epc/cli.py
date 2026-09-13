@@ -128,9 +128,9 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
     print(f"  concurrency         {settings.llm.concurrency} at {settings.llm.requests_per_min}/min")
     print(f"  budget              {settings.llm.budget.thread_tokens} tokens/thread")
     print(f"  credentials         {settings.credentials.backend}")
-    print(f"  state backend       {settings.run.state_backend}")
+    print(f"  state backend       {settings.state.backend}")
     print(f"  on injection        {settings.security.on_suspected_injection}")
-    print(f"  dry run             {settings.run.dry_run}")
+    print(f"  dry run             {settings.dry_run}")
     print("\n  labels (names; IDs are resolved from the mailbox at startup)")
     for priority, name in settings.labels.by_priority.items():
         print(f"    {priority.value}  {name}")
@@ -270,16 +270,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     renderer = PromptRenderer.load(args.prompts, args.policy)
     classifier = build_classifier(settings, renderer)
 
-    dry_run = args.dry_run or settings.run.dry_run
+    sink_kind = settings.resolve_sink(force_dry_run=args.dry_run)
+    writes_nothing = sink_kind != "direct"
+
     sink: MutationSink
-    if dry_run or settings.dispatch.sink == "jsonl":
+    if sink_kind == "jsonl":
         sink = JsonlSink(settings.dispatch.jsonl_path)
         print(f"Dry run - planned changes go to {settings.dispatch.jsonl_path}, nothing is applied.")
     else:
         sink = DirectSink(MutationApplier(client), batch_size=settings.dispatch.batch_size)
 
     state: StateStore = (
-        LocalFileStateStore(settings.run.state_file) if settings.run.state_backend == "local" else NullStateStore()
+        LocalFileStateStore(settings.state.file) if settings.state.backend == "local" else NullStateStore()
     )
     history: HistorySink = (
         JsonlHistorySink(settings.observability.history_dir)
@@ -301,7 +303,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print()
     print(summary.render())
 
-    if dry_run:
+    if writes_nothing:
         print(f"\nReplay with:  epc apply {settings.dispatch.jsonl_path}")
     return EXIT_PARTIAL if summary.had_failures else EXIT_OK
 

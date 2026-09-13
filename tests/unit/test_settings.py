@@ -29,7 +29,7 @@ def test_defaults_fill_in_every_omitted_section(config_file: Path) -> None:
     assert settings.llm.backend == "openai"
     assert settings.llm.budget.thread_tokens == 4000
     assert settings.security.on_suspected_injection == "downgrade_and_flag"
-    assert settings.run.dry_run is False
+    assert settings.dry_run is False
 
 
 def test_file_values_override_defaults(tmp_path: Path) -> None:

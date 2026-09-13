@@ -106,12 +106,15 @@ observability:
   # later, and to measure whether a prompt change helped.
   # history_dir: log/history
 
-run:
-  dry_run: false
-  state_backend: local # local | ssm | s3
-  # Where the Gmail historyId checkpoint lives, so the next run can ask "what
-  # changed" instead of re-listing the inbox.
-  state_file: .state/run.json
+# Where the checkpoint between runs is kept, so the next run can ask Gmail
+# "what changed" instead of re-listing the inbox. Holds no secret.
+state:
+  backend: local # local | ssm | s3
+  file: .state/run.json
+
+# Top level, and not inside a section, because it overrides one: whatever
+# `dispatch` is set to, this says nothing is written to Gmail.
+dry_run: false
 
 # `actions` and `dispatch` arrive with the action planner and the mutation
 # sinks. They are deliberately absent rather than stubbed: a config schema is

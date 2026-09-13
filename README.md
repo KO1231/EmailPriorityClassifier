@@ -341,10 +341,12 @@ trashing mail; this tool only does so if you write a rule that says to, and
 
 ## Status
 
-The classification pipeline is complete and runs locally. Still to come: a container
-image, Terraform for AWS, queue-backed dispatch so the apply side can be deployed
-separately, and an evaluation harness so prompt changes can be measured rather than
-guessed at.
+The pipeline runs locally and in a container, and the AWS side is described in
+Terraform: an ECR image, a scheduled Fargate task that classifies, a FIFO queue, and a
+Lambda that applies the resulting label changes.
+
+Not built yet: an evaluation harness, so prompt changes can be measured rather than
+guessed at. It is worth having once the priority criteria are being actively tuned.
 
 ## Contributing
 

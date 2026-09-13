@@ -196,6 +196,24 @@ stay publishable. A guard test asserts they contain no personal context.
 - **Remote credential and state backends.** The protocols exist (`gmail/auth.py`,
   `state.py`); SSM Parameter Store and S3 implementations do not.
 - **Eval harness.** A golden set and `epc eval`, so prompt changes are measured rather
-  than guessed at. `report.py` already writes what it needs.
+  than guessed at. `report.py` already writes what it needs. Deferred by choice — worth
+  building when the priority criteria are still being tuned, not before.
+
+  Three design decisions are already settled, and they came out of noticing that a
+  golden set is not simply built once and reused:
+
+  - **The set is the specification; the prompt is the implementation.** A prompt change
+    has two causes. Either the criteria are unchanged and the prompt expressed them
+    badly — the set is right, the prompt was wrong, and eval measures the fix. Or the
+    criteria themselves changed, in which case editing the set *is* how the new
+    criterion gets stated, and the prompt follows. Framing the edit as overhead gets
+    the order backwards.
+  - **A criteria change touches the affected entries, not the set.** "OTPs are P3 now"
+    moves three rows; how CloudWatch alarms or newsletters are rated has not changed.
+  - **A stale set actively misleads** — it asserts criteria you no longer hold and
+    reports a good change as a regression. So each entry carries a one-line reason for
+    the verdict plus the date and prompt version it was made under, and `epc eval`
+    reports *which cases changed* rather than only a score. Distinguishing an intended
+    flip from collateral damage is the main thing the set is for.
 - **Notification.** Deferred deliberately; revisit once the run summary is something
   worth sending.

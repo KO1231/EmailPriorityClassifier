@@ -308,6 +308,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if summary.interrupted:
         print("\nStopped on request. Everything already classified was flushed;")
         print("the checkpoint was left where it was, so the rest comes back next run.")
+    elif summary.halted:
+        print("\nStopped starting new classifications after too many failures in a row.")
+        print("Everything already classified was flushed; the rest comes back next run.")
 
     if writes_nothing:
         print(f"\nReplay with:  epc apply {settings.dispatch.jsonl_path}")

@@ -103,12 +103,16 @@ class BedrockClassifier:
         try:
             response = self._converse(rendered.system, rendered.user, force=self._can_force_tool)
         except Exception as exc:
-            if self._can_force_tool and _is_unsupported_tool_choice(exc):
-                # This model does not allow a forced tool. Ask, don't insist.
-                self._can_force_tool = False
-                response = self._converse(rendered.system, rendered.user, force=False)
-            else:
+            if not (self._can_force_tool and _is_unsupported_tool_choice(exc)):
                 raise ClassificationError(f"{self.backend} request failed: {exc}") from exc
+            # This model does not allow a forced tool. Ask, don't insist.
+            self._can_force_tool = False
+            try:
+                response = self._converse(rendered.system, rendered.user, force=False)
+            except Exception as retry_exc:
+                # The retry is a request like any other, and fails like one:
+                # throttling, a timeout, a model that is not enabled.
+                raise ClassificationError(f"{self.backend} request failed: {retry_exc}") from retry_exc
 
         return ClassificationResult(
             thread_id=payload.thread_id,

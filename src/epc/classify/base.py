@@ -121,7 +121,9 @@ def parse_classification(text: str) -> Classification:
     candidate = _FENCE_RE.sub("", text.strip())
     try:
         data = json.loads(candidate)
-    except json.JSONDecodeError:
+    except ValueError:
+        # `JSONDecodeError` is one kind of `ValueError`; an integer literal over
+        # Python's digit limit is another, raised from inside the parser.
         data = _extract_first_object(candidate)
 
     if not isinstance(data, dict):
@@ -131,14 +133,25 @@ def parse_classification(text: str) -> Classification:
     if raw_priority not in Priority.__members__:
         # Never coerce. A response that did not name a priority did not make a
         # decision, and inventing one here would hide a broken prompt.
-        raise ClassificationError(f"response did not contain a valid priority: {raw_priority!r}")
+        raise ClassificationError(f"response did not contain a valid priority: {raw_priority[:20]!r}")
 
-    return Classification(
-        priority=Priority[raw_priority],
-        reason=str(data.get("reason") or ""),
-        confidence=_as_float(data.get("confidence"), default=0.5),
-        signals=[str(s) for s in data.get("signals") or [] if isinstance(s, str | int | float)],
-    )
+    # Every optional field is read defensively. The schema asks for a list of
+    # strings; a model that answers `"signals": 5` has still decided a
+    # priority, and iterating an int used to raise a TypeError that no caller
+    # expected — which took the whole run down with it.
+    raw_signals = data.get("signals")
+    signals = [str(s) for s in raw_signals if isinstance(s, str | int | float)] if isinstance(raw_signals, list) else []
+    try:
+        return Classification(
+            priority=Priority[raw_priority],
+            reason=str(data.get("reason") or ""),
+            confidence=_as_float(data.get("confidence"), default=0.5),
+            signals=signals,
+        )
+    except ValueError as exc:
+        # pydantic's ValidationError is a ValueError. Its message quotes the
+        # input, which is model output, so it is not passed on.
+        raise ClassificationError("the model response did not validate") from exc
 
 
 def _extract_first_object(text: str) -> object:
@@ -149,12 +162,13 @@ def _extract_first_object(text: str) -> object:
         raise ClassificationError("no JSON object found in the model response")
     try:
         return json.loads(text[start : end + 1])
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:
         raise ClassificationError(f"the model response was not valid JSON: {exc}") from exc
 
 
 def _as_float(value: object, *, default: float) -> float:
     try:
         return float(value)  # type: ignore[arg-type]
-    except TypeError, ValueError:
+    except TypeError, ValueError, OverflowError:
+        # OverflowError: a JSON integer too large for a float.
         return default

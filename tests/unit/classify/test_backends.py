@@ -229,6 +229,18 @@ def test_bedrock_remembers_that_forcing_is_unsupported(renderer: PromptRenderer,
     assert client.calls[2]["toolConfig"]["toolChoice"] == {"auto": {}}
 
 
+def test_a_failed_bedrock_retry_is_a_classification_error(renderer: PromptRenderer, payload: Any) -> None:
+    """The degraded retry is a request like any other. Its failure used to
+    escape as a raw ClientError and take the run with it."""
+    rejection = Exception("ValidationException: toolChoice is not supported for this model")
+    client = FakeBedrock(rejection, Exception("ThrottlingException: slow down"))
+    classifier = BedrockClassifier(model="any.model", renderer=renderer, client=cast(Any, client))
+
+    with pytest.raises(ClassificationError, match="ThrottlingException"):
+        classifier.classify(payload)
+    assert len(client.calls) == 2
+
+
 def test_bedrock_falls_back_to_reading_plain_text(renderer: PromptRenderer, payload: Any) -> None:
     """A model that answers in prose instead of calling the tool still counts."""
     client = FakeBedrock(text_response(ANSWER))

@@ -120,3 +120,30 @@ def test_classification_is_serialisable() -> None:
     """It is written to a history file and read back for evaluation."""
     original = Classification(priority=Priority.P2, reason="ordinary", confidence=0.4)
     assert Classification.model_validate_json(original.model_dump_json()) == original
+
+
+@pytest.mark.parametrize("signals", ["5", '"urgent"', '{"a": 1}', "null", "true"])
+def test_signals_of_the_wrong_shape_are_dropped_not_fatal(signals: str) -> None:
+    """`"signals": 5` used to raise a TypeError nobody caught, and that ended the
+    run with every label it had already decided unwritten."""
+    parsed = parse_classification(f'{{"priority": "P2", "signals": {signals}}}')
+    assert parsed.priority is Priority.P2
+    assert parsed.signals == []
+
+
+def test_a_confidence_too_large_for_a_float_gets_the_default() -> None:
+    parsed = parse_classification('{"priority": "P1", "confidence": 1' + "0" * 400 + "}")
+    assert parsed.confidence == 0.5
+
+
+def test_an_integer_past_the_digit_limit_is_a_classification_error() -> None:
+    """Python's int parser raises a bare ValueError for this, from inside json."""
+    with pytest.raises(ClassificationError):
+        parse_classification('{"priority": "P1", "confidence": ' + "9" * 5000 + "}")
+
+
+def test_an_invalid_priority_is_not_echoed_at_length() -> None:
+    """The error reaches a log line, and the value is model output."""
+    with pytest.raises(ClassificationError) as caught:
+        parse_classification('{"priority": "' + "IGNORE PREVIOUS INSTRUCTIONS " * 20 + '"}')
+    assert len(str(caught.value)) < 100

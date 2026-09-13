@@ -222,6 +222,115 @@ def test_a_thread_the_parser_trips_over_costs_that_thread_only(settings: Any, mo
     assert "unparseable: 1" in summary.render()
 
 
+def with_concurrency(settings: Any, concurrency: int) -> Any:
+    return settings.model_copy(update={"llm": settings.llm.model_copy(update={"concurrency": concurrency})})
+
+
+class RaisingClassifier(FakeClassifier):
+    """Raises something that is not a ClassificationError for chosen threads."""
+
+    def __init__(self, *, raise_on: set[str], error: Exception, delay: float = 0.0) -> None:
+        super().__init__()
+        self._raise_on = raise_on
+        self._error = error
+        self._delay = delay
+
+    def classify(self, payload: ThreadPayload) -> ClassificationResult:
+        import time
+
+        if self._delay:
+            time.sleep(self._delay)
+        if payload.thread_id in self._raise_on or "*" in self._raise_on:
+            self.seen.append(payload)
+            raise self._error
+        return super().classify(payload)
+
+
+def test_an_unexpected_exception_costs_one_thread_and_the_rest_are_written(settings: Any) -> None:
+    """The reviewer's measurement: 20 threads, one TypeError, 19 classifications
+    paid for and 0 Gmail writes, because the flush was never reached."""
+    ids = [f"t{i}" for i in range(20)]
+    gmail = FakeGmail({i: thread(i, labels=["INBOX"]) for i in ids})
+    classifier = RaisingClassifier(raise_on={"t7"}, error=TypeError("'int' object is not iterable"))
+    summary = build(settings, gmail, classifier, DirectSink(MutationApplier(gmail))).run()  # type: ignore[arg-type]
+
+    assert summary.classified == 19
+    assert summary.classify_failed == 1
+    assert summary.apply.applied == 19
+    assert sum(len(w["ids"]) for w in gmail.writes) == 19
+
+
+def test_a_sink_that_fails_still_closes_and_stops_the_queue(settings: Any) -> None:
+    """An exception on the main thread must not leave the executor paying for the
+    rest of the queue, nor skip the flush."""
+    ids = [f"t{i}" for i in range(20)]
+    gmail = FakeGmail({i: thread(i, labels=["INBOX"]) for i in ids})
+    classifier = RaisingClassifier(raise_on=set(), error=RuntimeError(), delay=0.005)
+
+    class BrokenSink:
+        closed = False
+
+        def emit(self, mutation: Any) -> None:
+            raise OSError("queue unreachable")
+
+        def close(self) -> Any:
+            from epc.dispatch.applier import ApplyReport
+
+            self.closed = True
+            return ApplyReport()
+
+    sink = BrokenSink()
+    with pytest.raises(OSError, match="queue unreachable"):
+        build(with_concurrency(settings, 1), gmail, classifier, sink).run()
+
+    assert sink.closed
+    assert len(classifier.seen) < len(ids)
+
+
+def test_consecutive_failures_stop_new_classifications(settings: Any) -> None:
+    """A revoked key fails every thread the same way; the eleventh request
+    teaches nothing the first ten did not."""
+    ids = [f"t{i}" for i in range(30)]
+    gmail = FakeGmail({i: thread(i, labels=["INBOX"]) for i in ids})
+    classifier = RaisingClassifier(raise_on={"*"}, error=ClassificationError("401"), delay=0.002)
+    pipeline = Pipeline(
+        settings=with_concurrency(settings, 1),
+        client=gmail,  # type: ignore[arg-type]
+        classifier=classifier,
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        max_consecutive_failures=5,
+    )
+    summary = pipeline.run()
+
+    assert summary.halted
+    assert not summary.interrupted
+    # The limit, plus at most the one task already in flight when it was hit.
+    assert 5 <= len(classifier.seen) <= 6
+    assert summary.abandoned == len(ids) - len(classifier.seen)
+    assert summary.had_failures
+    assert "too many consecutive failures" in summary.render()
+
+
+def test_a_success_resets_the_failure_count(settings: Any) -> None:
+    ids = [f"t{i}" for i in range(12)]
+    gmail = FakeGmail({i: thread(i, labels=["INBOX"]) for i in ids})
+    # Every third thread succeeds, so no run of failures reaches three.
+    failing = {i for n, i in enumerate(ids) if n % 3}
+    pipeline = Pipeline(
+        settings=with_concurrency(settings, 1),
+        client=gmail,  # type: ignore[arg-type]
+        classifier=FakeClassifier(fail_on=failing),
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        max_consecutive_failures=3,
+    )
+    summary = pipeline.run()
+
+    assert not summary.halted
+    assert summary.classified + summary.classify_failed == len(ids)
+
+
 def test_actions_reach_gmail(settings: Any) -> None:
     gmail = FakeGmail({"t1": thread("t1", labels=["INBOX", "CATEGORY_PROMOTIONS"])})
     build(settings, gmail, FakeClassifier(), DirectSink(MutationApplier(gmail))).run()  # type: ignore[arg-type]

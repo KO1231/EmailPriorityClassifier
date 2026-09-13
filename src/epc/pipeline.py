@@ -7,11 +7,18 @@ spawn workers; and every child opened the same rotating log file.
 
 Rate limiting paces individual requests rather than sleeping between blocks, so
 one slow response no longer stalls every worker.
+
+**Every classification is isolated from the others.** Whatever a worker raises
+costs that thread and nothing else. An exception left to escape a future used to
+end the loop while the executor went on paying for every queued request, and
+skipped the flush — so one malformed model reply threw away every label the run
+had already decided.
 """
 
 import logging
 import threading
 import time
+import traceback
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -36,6 +43,12 @@ from epc.state import NullStateStore, RunState, StateStore
 
 logger = logging.getLogger(__name__)
 
+# Failures in a row, in completion order, after which no new classification is
+# started. Past this point the cause is almost never the threads: a revoked key,
+# a model that no longer exists, a bug. Each further request costs money or
+# quota and teaches nothing the first ten did not.
+MAX_CONSECUTIVE_FAILURES = 10
+
 
 @dataclass
 class RunSummary:
@@ -55,6 +68,9 @@ class RunSummary:
     # nothing went wrong, and the checkpoint stays put so they come back.
     abandoned: int = 0
     interrupted: bool = False
+    # Set when too many classifications failed in a row and the rest were not
+    # started. A failure, unlike an interruption: something is wrong.
+    halted: bool = False
     suspicious: int = 0
     by_priority: dict[Priority, int] = field(default_factory=lambda: dict.fromkeys(Priority, 0))
     usage: Usage = field(default_factory=Usage)
@@ -80,7 +96,7 @@ class RunSummary:
             f"  (failed: {self.classify_failed}, unfetchable: {self.fetch_failed}, unparseable: {self.parse_failed})",
             "    " + "  ".join(f"{p.value}: {self.by_priority[p]}" for p in Priority),
             f"  suspicious        {self.suspicious}",
-            *([f"  abandoned         {self.abandoned}  (stop requested)"] if self.abandoned else []),
+            *([f"  not started       {self.abandoned}  ({self._stop_reason})"] if self.abandoned else []),
             f"  tokens            in {self.usage.input_tokens:,} / out {self.usage.output_tokens:,}",
             f"  applied           {self.apply.applied}"
             f"  (no-op: {self.apply.skipped_noop}, failed: {self.apply.failed})",
@@ -89,6 +105,10 @@ class RunSummary:
         ]
         lines.extend(f"  ! {failure}" for failure in self.apply.failures)
         return "\n".join(lines)
+
+    @property
+    def _stop_reason(self) -> str:
+        return "too many consecutive failures" if self.halted else "stop requested"
 
 
 class Pipeline:
@@ -105,6 +125,7 @@ class Pipeline:
         state_store: StateStore | None = None,
         history: HistorySink | None = None,
         shutdown: threading.Event | None = None,
+        max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -116,6 +137,10 @@ class Pipeline:
         self._state_store = state_store or NullStateStore()
         self._history = history or NullHistorySink()
         self._shutdown = shutdown or threading.Event()
+        # Kept apart from `shutdown`: that one means "asked to stop", and this
+        # one means "stopping because something is broken".
+        self._halt = threading.Event()
+        self._max_consecutive_failures = max_consecutive_failures
 
     def search_query(self) -> str:
         return build_search_query(
@@ -131,8 +156,31 @@ class Pipeline:
         thread_ids, checkpoint, mailbox = self._thread_ids_to_consider(summary)
         threads = self._hydrate(thread_ids, summary)
 
-        concurrency = self._settings.llm.concurrency
-        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="epc") as pool:
+        try:
+            self._classify_all(threads, summary)
+        finally:
+            # Reached on every path out — a stop request, a halt, an exception
+            # from the sink itself. Whatever was classified is already paid for.
+            summary.interrupted = self._shutdown.is_set()
+            summary.halted = self._halt.is_set()
+            try:
+                summary.apply = self._sink.close()
+            finally:
+                self._history.close()
+            summary.elapsed_seconds = time.monotonic() - started
+
+        # Only advance the checkpoint on a clean run. After a partial failure the
+        # next run re-lists the same window, and the label-based exclusion makes
+        # the threads that did succeed free to skip.
+        if checkpoint and summary.checkpoint_may_advance:
+            self._state_store.save(RunState().advanced_to(checkpoint, mailbox=mailbox))
+
+        return summary
+
+    def _classify_all(self, threads: list[EmailThread], summary: RunSummary) -> None:
+        pool = ThreadPoolExecutor(max_workers=self._settings.llm.concurrency, thread_name_prefix="epc")
+        consecutive_failures = 0
+        try:
             futures = {pool.submit(self._classify, thread): thread for thread in threads}
             for future in as_completed(futures):
                 thread = futures[future]
@@ -140,16 +188,32 @@ class Pipeline:
                     mutation, usage = future.result()
                 except ShutdownRequestedError:
                     # Never started. Left for the next run, and not counted as
-                    # a failure, because nothing went wrong.
+                    # a failure: the failures that caused a halt are counted
+                    # already, and a stop request is not one.
                     summary.abandoned += 1
                     continue
                 except ClassificationError as exc:
-                    # One thread, not the run. This is the guarantee the old
-                    # single-process path silently did not provide.
                     summary.classify_failed += 1
                     logger.warning("classification failed for %s: %s", thread.thread_id, exc)
+                    consecutive_failures = self._note_failure(consecutive_failures)
+                    continue
+                except Exception as exc:
+                    # A bug, or a library raising something undocumented. Still
+                    # one thread. The message is left out on purpose: a pydantic
+                    # error quotes its input, and the input here is mail or
+                    # model output. The type and the stack are what debugging
+                    # needs, and neither carries content.
+                    summary.classify_failed += 1
+                    logger.error(
+                        "unexpected %s while classifying %s\n%s",
+                        type(exc).__name__,
+                        thread.thread_id,
+                        "".join(traceback.format_tb(exc.__traceback__)).rstrip(),
+                    )
+                    consecutive_failures = self._note_failure(consecutive_failures)
                     continue
 
+                consecutive_failures = 0
                 summary.classified += 1
                 summary.by_priority[mutation.priority] += 1
                 summary.usage = summary.usage + usage
@@ -167,20 +231,25 @@ class Pipeline:
                         applied=not isinstance(self._sink, JsonlSink),
                     )
                 )
+        finally:
+            # On a normal exit every future is done and this cancels nothing.
+            # On the way out through an exception it is what stops the executor
+            # working through — and paying for — the rest of the queue.
+            pool.shutdown(wait=True, cancel_futures=True)
 
-        summary.interrupted = self._shutdown.is_set()
-        # Flushed even when stopping: these classifications are already paid for.
-        summary.apply = self._sink.close()
-        self._history.close()
-        summary.elapsed_seconds = time.monotonic() - started
+    def _note_failure(self, consecutive_failures: int) -> int:
+        consecutive_failures += 1
+        if consecutive_failures >= self._max_consecutive_failures and not self._halt.is_set():
+            logger.error(
+                "%d classifications failed in a row; starting no more this run",
+                consecutive_failures,
+            )
+            self._halt.set()
+        return consecutive_failures
 
-        # Only advance the checkpoint on a clean run. After a partial failure the
-        # next run re-lists the same window, and the label-based exclusion makes
-        # the threads that did succeed free to skip.
-        if checkpoint and summary.checkpoint_may_advance:
-            self._state_store.save(RunState().advanced_to(checkpoint, mailbox=mailbox))
-
-        return summary
+    def _raise_if_stopping(self, thread: EmailThread) -> None:
+        if self._shutdown.is_set() or self._halt.is_set():
+            raise ShutdownRequestedError(thread.thread_id)
 
     def _thread_ids_to_consider(self, summary: RunSummary) -> tuple[Iterable[str], str, str]:
         """Which threads to look at, and the checkpoint to store afterwards."""
@@ -242,11 +311,12 @@ class Pipeline:
     def _classify(self, thread: EmailThread) -> tuple[ThreadMutation, Usage]:
         # Checked before the expensive part rather than after: a queued task
         # that has not started should cost nothing once a stop is requested.
-        if self._shutdown.is_set():
-            raise ShutdownRequestedError(thread.thread_id)
-
+        # Checked again after the rate limiter, which can hold a task for a
+        # while — long enough for a halt to have happened in the meantime.
+        self._raise_if_stopping(thread)
         payload = build_payload(thread, self._settings.llm.budget)
         self._limiter.acquire()
+        self._raise_if_stopping(thread)
         result = self._classifier.classify(payload)
 
         suspicious = payload.injection.suspicious and (self._settings.security.on_suspected_injection != "ignore")

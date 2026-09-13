@@ -43,6 +43,16 @@ lock-refresh: ## Move the supply-chain cooldown window forward, then re-lock
 	@echo "Set [tool.uv] exclude-newer in pyproject.toml to a date at least 7 days old,"
 	@echo "then run 'uv lock' and read the uv.lock diff before committing."
 
+# --- Container ------------------------------------------------------------
+
+.PHONY: docker-build
+docker-build: ## Build the container image
+	docker build -t epc:local .
+
+.PHONY: docker-run
+docker-run: ## Dry run inside the container, with the local config mounted
+	docker compose run --rm epc run --dry-run
+
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \

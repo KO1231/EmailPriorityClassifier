@@ -400,3 +400,67 @@ def test_history_is_recorded_without_the_mail(settings: Any, tmp_path: Path) -> 
     assert record.sender_domain == "example.com"
     assert record.priority is Priority.P1
     assert record.applied is True
+
+
+# --------------------------------------------------------------------------
+# Stopping on request
+# --------------------------------------------------------------------------
+
+
+def test_a_stop_request_flushes_what_was_already_decided(settings: Any, tmp_path: Path) -> None:
+    """ECS sends SIGTERM then SIGKILL. Classifications already paid for must not
+    die with the process."""
+    import threading
+
+    from epc.state import LocalFileStateStore, RunState
+
+    ids = [f"t{i}" for i in range(5)]
+    gmail = FakeGmail({i: thread(i, labels=["INBOX"]) for i in ids}, history_id="5000", changed=ids)
+    stopping = threading.Event()
+
+    class StopAfterOne(FakeClassifier):
+        def classify(self, payload: ThreadPayload) -> ClassificationResult:
+            result = super().classify(payload)
+            stopping.set()  # a SIGTERM arrives mid-run
+            return result
+
+    store = LocalFileStateStore(tmp_path / "state.json")
+    store.save(RunState(history_id="4000", mailbox="someone@example.com"))
+
+    summary = Pipeline(
+        settings=settings,
+        client=gmail,  # type: ignore[arg-type]
+        classifier=StopAfterOne(),
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        state_store=store,
+        shutdown=stopping,
+    ).run()
+
+    assert summary.interrupted is True
+    assert summary.classified >= 1
+    assert summary.abandoned >= 1
+    # What was decided reached Gmail rather than dying with the process.
+    assert summary.apply.applied == summary.classified
+    # And the abandoned threads come back: the checkpoint did not move.
+    assert store.load().history_id == "4000"
+
+
+def test_abandoned_threads_are_not_counted_as_failures(settings: Any) -> None:
+    import threading
+
+    stopping = threading.Event()
+    stopping.set()
+
+    gmail = FakeGmail({f"t{i}": thread(f"t{i}", labels=["INBOX"]) for i in range(3)})
+    summary = Pipeline(
+        settings=settings,
+        client=gmail,  # type: ignore[arg-type]
+        classifier=FakeClassifier(),
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        shutdown=stopping,
+    ).run()
+
+    assert summary.classify_failed == 0
+    assert summary.checkpoint_may_advance is False

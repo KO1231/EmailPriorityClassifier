@@ -120,6 +120,13 @@ one of dispatch's peers. `Settings.resolve_sink()` holds that precedence in one 
 every entry point gets it, and a sink added later cannot accidentally become one that
 writes during a dry run.
 
+**A stop request means "stop starting work", not "stop".** ECS sends `SIGTERM` and
+`SIGKILL` thirty seconds later. `shutdown.py` sets a flag; the pipeline stops beginning
+new classifications, lets running ones finish, flushes the sink, and reports
+`interrupted`. Classifications already paid for must not die with the process.
+Abandoned threads are counted separately from failures — nothing went wrong — but they
+do hold the checkpoint back, so they come round again.
+
 **The checkpoint only advances on a clean run.** After a partial failure the next run
 re-lists the same window; threads that did succeed are excluded by their labels, so the
 repeat is free.

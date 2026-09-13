@@ -1,0 +1,65 @@
+name: Container
+
+on:
+  pull_request:
+    paths: [Dockerfile, .dockerignore, compose.yaml, pyproject.toml, uv.lock, "src/**"]
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions pinned by commit SHA; a mutable tag is itself a supply-chain hole.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Lint the Dockerfile
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build
+        run: docker build --load -t epc:ci .
+
+      - name: The entrypoint runs and the package is importable
+        run: |
+          docker run --rm epc:ci --version
+          docker run --rm --entrypoint python epc:ci -c "import epc.pipeline, epc.classify.factory"
+
+      - name: It runs as a non-root user
+        run: |
+          uid=$(docker run --rm --entrypoint id epc:ci -u)
+          test "$uid" = "10001" || { echo "expected uid 10001, got $uid"; exit 1; }
+
+      - name: No build toolchain reached the runtime image
+        run: |
+          if docker run --rm --entrypoint sh epc:ci -c "command -v gcc cc make uv" 2>/dev/null; then
+            echo "a build tool survived into the runtime layer"; exit 1
+          fi
+
+      - name: Nothing personal was baked in
+        # The .dockerignore is the last thing between a secret and a pushed
+        # layer, so its failure is checked rather than assumed.
+        run: |
+          if docker run --rm --entrypoint sh epc:ci -c \
+             "ls /app/config.yml /app/policy.yml /app/.env /app/secrets 2>/dev/null"; then
+            echo "personal files were copied into the image"; exit 1
+          fi
+
+      - name: Scan for known vulnerabilities
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: epc:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

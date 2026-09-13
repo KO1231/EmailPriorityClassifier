@@ -1,0 +1,17 @@
+# Only what the image needs: the package, its lockfile, and the generic prompts.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!prompts/
+
+# Belt and braces. The patterns above already exclude these, but this file is
+# the last thing standing between a secret and a layer that gets pushed.
+**/.env
+**/config.yml
+**/policy.yml
+**/secrets/
+**/log/
+**/.state/
+**/__pycache__/

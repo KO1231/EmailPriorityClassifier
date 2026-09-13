@@ -250,6 +250,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     from epc.logging import configure_logging
     from epc.pipeline import Pipeline
     from epc.report import HistorySink, JsonlHistorySink, NullHistorySink
+    from epc.shutdown import shutdown_on_signal
     from epc.state import LocalFileStateStore, NullStateStore, StateStore
 
     settings = _load(args.config)
@@ -289,19 +290,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         else NullHistorySink()
     )
 
-    pipeline = Pipeline(
-        settings=settings,
-        client=client,
-        classifier=classifier,
-        sink=sink,
-        priority_label_ids=priority_label_ids,
-        state_store=state,
-        history=history,
-    )
-    print(f"Query: {pipeline.search_query()}")
-    summary = pipeline.run()
+    with shutdown_on_signal() as stopping:
+        pipeline = Pipeline(
+            settings=settings,
+            client=client,
+            classifier=classifier,
+            sink=sink,
+            priority_label_ids=priority_label_ids,
+            state_store=state,
+            history=history,
+            shutdown=stopping,
+        )
+        print(f"Query: {pipeline.search_query()}")
+        summary = pipeline.run()
+
     print()
     print(summary.render())
+    if summary.interrupted:
+        print("\nStopped on request. Everything already classified was flushed;")
+        print("the checkpoint was left where it was, so the rest comes back next run.")
 
     if writes_nothing:
         print(f"\nReplay with:  epc apply {settings.dispatch.jsonl_path}")

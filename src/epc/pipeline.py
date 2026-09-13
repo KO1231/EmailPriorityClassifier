@@ -10,6 +10,7 @@ one slow response no longer stalls every worker.
 """
 
 import logging
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,7 @@ from epc.priority import Priority
 from epc.ratelimit import RateLimiter
 from epc.report import HistorySink, NullHistorySink, record_for
 from epc.settings import Settings
+from epc.shutdown import ShutdownRequestedError
 from epc.state import NullStateStore, RunState, StateStore
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,10 @@ class RunSummary:
     fetch_failed: int = 0
     classified: int = 0
     classify_failed: int = 0
+    # Threads left for the next run because a stop was requested. Not failures:
+    # nothing went wrong, and the checkpoint stays put so they come back.
+    abandoned: int = 0
+    interrupted: bool = False
     suspicious: int = 0
     by_priority: dict[Priority, int] = field(default_factory=lambda: dict.fromkeys(Priority, 0))
     usage: Usage = field(default_factory=Usage)
@@ -54,6 +60,11 @@ class RunSummary:
     @property
     def had_failures(self) -> bool:
         return bool(self.fetch_failed or self.classify_failed or self.apply.had_failures)
+
+    @property
+    def checkpoint_may_advance(self) -> bool:
+        """Only a run that got through everything may move the checkpoint on."""
+        return not self.had_failures and not self.interrupted
 
     def render(self) -> str:
         mode = "incremental" if self.incremental else "full scan"
@@ -65,6 +76,7 @@ class RunSummary:
             f"  (failed: {self.classify_failed}, unfetchable: {self.fetch_failed})",
             "    " + "  ".join(f"{p.value}: {self.by_priority[p]}" for p in Priority),
             f"  suspicious        {self.suspicious}",
+            *([f"  abandoned         {self.abandoned}  (stop requested)"] if self.abandoned else []),
             f"  tokens            in {self.usage.input_tokens:,} / out {self.usage.output_tokens:,}",
             f"  applied           {self.apply.applied}"
             f"  (no-op: {self.apply.skipped_noop}, failed: {self.apply.failed})",
@@ -88,6 +100,7 @@ class Pipeline:
         priority_label_ids: dict[Priority, str],
         state_store: StateStore | None = None,
         history: HistorySink | None = None,
+        shutdown: threading.Event | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -98,6 +111,7 @@ class Pipeline:
         self._priority_label_id_set = set(priority_label_ids.values())
         self._state_store = state_store or NullStateStore()
         self._history = history or NullHistorySink()
+        self._shutdown = shutdown or threading.Event()
 
     def search_query(self) -> str:
         return build_search_query(
@@ -120,6 +134,11 @@ class Pipeline:
                 thread = futures[future]
                 try:
                     mutation, usage = future.result()
+                except ShutdownRequestedError:
+                    # Never started. Left for the next run, and not counted as
+                    # a failure, because nothing went wrong.
+                    summary.abandoned += 1
+                    continue
                 except ClassificationError as exc:
                     # One thread, not the run. This is the guarantee the old
                     # single-process path silently did not provide.
@@ -145,6 +164,8 @@ class Pipeline:
                     )
                 )
 
+        summary.interrupted = self._shutdown.is_set()
+        # Flushed even when stopping: these classifications are already paid for.
         summary.apply = self._sink.close()
         self._history.close()
         summary.elapsed_seconds = time.monotonic() - started
@@ -152,7 +173,7 @@ class Pipeline:
         # Only advance the checkpoint on a clean run. After a partial failure the
         # next run re-lists the same window, and the label-based exclusion makes
         # the threads that did succeed free to skip.
-        if checkpoint and not summary.had_failures:
+        if checkpoint and summary.checkpoint_may_advance:
             self._state_store.save(RunState().advanced_to(checkpoint, mailbox=mailbox))
 
         return summary
@@ -206,6 +227,11 @@ class Pipeline:
         return self._client.list_thread_ids(self.search_query(), limit=self._settings.gmail.max_threads)
 
     def _classify(self, thread: EmailThread) -> tuple[ThreadMutation, Usage]:
+        # Checked before the expensive part rather than after: a queued task
+        # that has not started should cost nothing once a stop is requested.
+        if self._shutdown.is_set():
+            raise ShutdownRequestedError(thread.thread_id)
+
         payload = build_payload(thread, self._settings.llm.budget)
         self._limiter.acquire()
         result = self._classifier.classify(payload)

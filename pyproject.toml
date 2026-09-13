@@ -73,9 +73,8 @@ default-groups = ["dev"]
 [tool.ruff]
 line-length = 120
 src = ["src", "tests"]
-# The legacy implementation is deleted when the new pipeline takes over; linting
-# code that is on its way out buys nothing. Remove these entries with the files.
-extend-exclude = ["main.py", "test.py", "email_priority_classifier/", "*.md"]
+# Ruff formats Python inside Markdown; the prose here is not ours to reflow.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = [

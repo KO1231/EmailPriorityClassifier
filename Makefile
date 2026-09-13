@@ -43,14 +43,6 @@ lock-refresh: ## Move the supply-chain cooldown window forward, then re-lock
 	@echo "Set [tool.uv] exclude-newer in pyproject.toml to a date at least 7 days old,"
 	@echo "then run 'uv lock' and read the uv.lock diff before committing."
 
-# --- Legacy ---------------------------------------------------------------
-# The previous implementation still runs while the rewrite is in progress.
-# It is deleted once the new pipeline takes over.
-
-.PHONY: legacy-run
-legacy-run: ## Run the legacy classifier (dry run; drop DEV_NOT_MODIFY to write labels)
-	DEV_NOT_MODIFY=true pipenv run start
-
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \

@@ -1,1 +1,0 @@
-from email_priority_classifier.classifier.email_priority_classifier import EmailPriorityClassifier

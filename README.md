@@ -144,21 +144,21 @@ the model return one of the three names.
 
 ## Requirements
 
-- Python 3.13.5
-    - pyenv (recommended)
-    - pipenv
+- Python 3.14 (pyenv recommended)
+- [uv](https://docs.astral.sh/uv/)
 - A Google Cloud project with the Gmail API enabled and an OAuth client of type **Desktop app**
 - One of:
     - An OpenAI API key, or
+    - AWS credentials with Bedrock access, or
     - A local OpenAI-compatible server (e.g. LM Studio) serving an open-weight model
 
 ---
 
 ## Installation
 
-1. (If you use pyenv, and did not install Python 3.13.5 yet)
+1. (If you use pyenv, and do not have Python 3.14 yet)
    ```bash
-   pyenv install 3.13.5
+   pyenv install 3.14.5
    ```
 
 2. Clone this repository
@@ -167,167 +167,162 @@ the model return one of the three names.
    cd EmailPriorityClassifier
    ```
 
-3. Install dependencies using pipenv
+3. Install
    ```bash
-   pip3 install pipenv
-   pipenv install
+   make install
    ```
 
-4. Prepare secrets and configuration
-    - Create a `.env` file in the project root, based on `.env.example`.
-    - Create a `config.yml` file in the project root, based on `config.yml.example`.
-    - Place your Gmail API OAuth client credentials (Desktop application) at
+4. Prepare configuration
+    - Copy `config.yml.example` to `config.yml` and fill it in.
+    - Copy `policy.yml.example` to `policy.yml` if you have rules of your own — it is
+      git-ignored, which is what lets the prompts in `prompts/` stay publishable.
+    - Put your Gmail OAuth client credentials (Desktop application) at
       **`secrets/client_secrets.json`**.
+    - Put your model credentials in `.env`, based on `.env.example`.
 
-5. Create the three priority labels in Gmail (for example `#/P1`, `#/P2`, `#/P3`), then put
-   both their display names and their internal label IDs into `config.yml`. See
-   [Configuration](#configuration) for how to look the IDs up.
+5. Create the three priority labels in Gmail (for example `#/P1`, `#/P2`, `#/P3`) and
+   put their **names** in `config.yml`. The internal IDs are resolved from the mailbox
+   at startup, so there is nothing to keep in sync by hand.
 
-6. Create OAuth2 tokens
+6. Authorise
    ```bash
-   pipenv run login_google
+   uv run epc login
+   uv run epc labels   # confirms the configured names resolve
    ```
-   A browser window opens for consent. The resulting token is cached at `secrets/token.pickle`
-   and refreshed automatically on later runs.
-
----
 
 ## Configuration
 
-### `config.yml`
+`config.yml` holds policy and no secrets, so it can be read, diffed and reviewed
+freely. `config.yml.example` is the annotated reference; the shape is:
 
 ```yaml
-labelID:                      # Gmail internal label IDs (Label_...)
-  P1: "Label_????"
-  P2: "Label_????"
-  P3: "Label_????"
+labels:                     # display names only — IDs are resolved at startup
+  p1: "#/P1"
+  p2: "#/P2"
+  p3: "#/P3"
 
-priorityLabels:               # Display names of the same three labels
-  P1: "#/P1"
-  P2: "#/P2"
-  P3: "#/P3"
+gmail:
+  query: "in:inbox"
+  extra_query: "newer_than:14d -in:chats"   # the largest single cost lever
+  max_threads: 1500
+  incremental: true                          # resume from the stored checkpoint
 
-maxThreads: 1500              # Hard cap on threads classified per run
-concurrency: 15               # Parallel LLM requests
-requestsPerMin: 120           # LLM request rate limit
-model: "openai"               # "openai" | "gpt-oss"
+llm:
+  backend: openai           # openai | bedrock | local
+  model: gpt-5.4-mini
+  reasoning_effort: low
+  concurrency: 15
+  requests_per_min: 120
+
+actions:                    # what happens once a priority is known
+  rules:
+    - when:   { priority: P1 }
+      unless: { any_label: [SPAM, TRASH] }
+      do:     [add_star, move_to_primary, mark_important]
 ```
 
-| Key | Purpose |
-|---|---|
-| `labelID` | Used when **writing** labels back to Gmail. Must be the internal `Label_...` IDs. |
-| `priorityLabels` | Used when **reading** — both to exclude already-classified threads from the search query and to detect existing labels after fetching. Must be the display names of the same three labels. |
-| `maxThreads` | Upper bound on threads processed in one invocation. Also bounds the cost of a run. |
-| `concurrency` | Number of classification requests in flight at once. Set to `1` to disable parallelism. |
-| `requestsPerMin` | Throttle applied between batches, to stay inside your provider's rate limit. |
-| `model` | Which classifier backend to load. |
+Any value can be overridden by an `EPC__`-prefixed environment variable, with `__`
+between levels: `EPC__GMAIL__MAX_THREADS=50`. Precedence, highest first: command line,
+environment, file, defaults. Unknown keys are an error rather than being ignored, so a
+typo fails loudly instead of doing nothing.
 
-> **Both `labelID` and `priorityLabels` must describe the same three labels.** They are not
-> cross-checked at startup — a mismatch results in threads being classified as one priority
-> and labeled as another. To look up your label IDs, run
-> `pipenv run python -c "from googleapiclient.discovery import build; from email_priority_classifier.gmail_credentials import get_credential; import json; print(json.dumps({l['name']: l['id'] for l in build('gmail','v1',credentials=get_credential('secrets/client_secrets.json','secrets/token.pickle')).users().labels().list(userId='me').execute()['labels']}, indent=2, ensure_ascii=False))"`.
+### Secrets
 
-### `.env`
+Never in `config.yml`. `OPENAI_API_KEY` and friends come from the environment (see
+`.env.example`); Gmail credentials are stored by the credential backend — a local JSON
+file today, a secret store on AWS.
 
-```bash
-# Required when model: "openai"
-OPENAI_API_KEY=sk-????
-OPENAI_PROMPT_ID=pmpt_????          # A saved prompt in the OpenAI dashboard
-OPENAI_PROMPT_VERSION=????
+An OpenAI key scoped to `api.responses.write` and `api.responses.read` is sufficient.
+The broader `model.request` scope is not needed.
 
-# Required when model: "gpt-oss"
-LOCAL_LM_PORT=1234                  # Port of your local OpenAI-compatible server
+### Prompts and personal rules
 
-# Optional
-DEV_NOT_MODIFY=true                 # Dry run: classify but never write labels to Gmail
-EMAIL_PRIORITY_CLASSIFIER_LOG=...   # Override the log file path (default: log/application.log)
+The priority policy is the prompt, so it lives in the repository where it can be
+reviewed and diffed. Your *own* rules do not belong in a public repository, so they go
+in `policy.yml` (git-ignored) and are rendered into the system prompt at run time:
+
+```yaml
+guidance:
+  - "Mail from university or government domains is never P3."
+  - "Newsletters from example-vendor.com are P3 even when the subject says URGENT."
 ```
 
-`.env` is loaded automatically by `pipenv run`. If you invoke `python main.py` outside pipenv,
-you must export these variables yourself.
-
-### Prompts
-
-The two backends source their prompt differently:
-
-- **`openai`** — the prompt is stored server-side in the OpenAI dashboard and referenced by
-  `OPENAI_PROMPT_ID` / `OPENAI_PROMPT_VERSION`. It must accept the variables
-  `thread_subject` and `thread_messages`, and must return a JSON object containing a
-  `priority` field whose value is `"P1"`, `"P2"`, or `"P3"`.
-- **`gpt-oss`** — the prompt is read from `prompts/gptoss_system_prompt.txt` and
-  `prompts/gptoss_user_prompt.txt`, with `{{thread_subject}}` and `{{thread_messages}}`
-  substituted at request time.
-
-> The `prompts/` directory is git-ignored, so it is **not** present in a fresh clone. The
-> `gpt-oss` backend will fail with `FileNotFoundError` until you supply your own templates.
-
----
+`epc prompt render` prints the result, so you can see exactly what is sent.
 
 ## Usage
 
-Dry run first — classify everything, write nothing:
+Plan a run without touching anything:
 
 ```bash
-DEV_NOT_MODIFY=true pipenv run start
+uv run --env-file .env epc run --dry-run
 ```
 
-Then, once the results look right:
+That writes every intended change to `log/mutations.jsonl` and applies none of them.
+Read it, and when you are happy, apply exactly what you read:
 
 ```bash
-pipenv run start
+uv run epc apply log/mutations.jsonl
 ```
 
-Progress, per-thread failures, and a line per label written are logged to stdout and to
-`log/application.log` (rotating, 1 MB × 5 backups).
+Or, once you trust the configuration, run it directly:
 
-The tool is a batch job, not a daemon. For continuous triage, schedule it with cron, launchd,
-or a systemd timer.
+```bash
+uv run --env-file .env epc run
+```
 
----
+Useful along the way:
+
+```bash
+uv run epc config validate    # parse and print the configuration; no network
+uv run epc prompt render      # the exact prompt a thread produces, policy included
+uv run epc run --limit 20     # cap a run while trying things out
+```
+
+Exit codes are `0` clean, `1` fatal (configuration, credentials), `2` partial — some
+threads were lost but the run completed. Schedule it with cron, launchd or a systemd
+timer; it is a batch job, not a daemon.
 
 ## Project Layout
 
 ```
-main.py                                   Entry point: fetch → classify → label
-config.yml                                Runtime configuration (git-ignored)
-.env                                      Secrets and environment (git-ignored)
-prompts/                                  Prompt templates for the local backend (git-ignored)
-secrets/                                  OAuth client secrets and cached token (git-ignored)
-log/                                      Rotating application log (git-ignored)
+config.yml            Runtime configuration (git-ignored)
+policy.yml            Your own classification rules (git-ignored)
+prompts/              Generic, committed prompt templates
+secrets/              OAuth client secrets and cached token (git-ignored)
 
-email_priority_classifier/
-├── config.py                             config.yml → typed config object
-├── gmail_credentials.py                  OAuth flow and token caching
-├── exception.py                          Exception hierarchy
-├── classifier/
-│   ├── email_priority_classifier.py      Abstract classifier interface
-│   ├── classifier_openai.py              Hosted OpenAI backend
-│   └── classifier_gptoss.py              Local OpenAI-compatible backend
-├── type/
-│   ├── priority.py                       P1 / P2 / P3 enum
-│   └── classified_email_data.py          Gmail message → LLM-ready representation
-└── util/
-    ├── logger_util.py                    Shared logging setup
-    └── assert_util.py                    Small validation helpers
+src/epc/
+├── cli.py            Entry point
+├── settings.py       Configuration schema and layering
+├── pipeline.py       The run: list, fetch, classify, plan, dispatch
+├── ratelimit.py      Request pacing
+├── state.py          The historyId checkpoint between runs
+├── report.py         Classification history
+├── gmail/            auth · client · query · mime · labels · models
+├── classify/         budget · prompt · base · openai/bedrock/local backends
+├── security/         sanitize · detect
+├── actions/          model · rules · planner
+└── dispatch/         sink · applier
+
+tests/                unit · integration · injection · fixtures (synthetic only)
 ```
-
----
 
 ## Privacy and Data Handling
 
-**What leaves your machine.** With `model: "openai"`, the subject line and a truncated
-extract of the thread body are sent to the OpenAI API, along with the thread's Gmail label
-names. With `model: "gpt-oss"`, nothing leaves the machine — the request goes to a local
-server over loopback.
+**What leaves your machine.** With `backend: openai`, a budgeted extract of each thread
+— headers, and body text trimmed of quoted history — is sent to the OpenAI API with
+`store: false`, so the provider is not asked to retain it. With `backend: bedrock` it
+goes to AWS instead. With `backend: local`, nothing leaves the machine at all.
 
-**What is stored.** Nothing but the OAuth token (`secrets/token.pickle`) and the application
-log. No message bodies are persisted; the log records thread IDs and priorities, not content.
+**What is stored.** The OAuth token (`secrets/token.json`, user-readable only, holding
+the durable credential fields and not the short-lived access token), the application
+log, and — only if you turn it on — a classification history. That history records a
+*digest* of each subject and the sender's *domain*, never message content: it outlives
+the run and is the kind of file that ends up in a backup.
 
-**Gmail permissions requested.** `gmail.readonly`, `gmail.labels`, and `gmail.modify`. The
-`modify` scope is what allows labels to be applied. Note that this scope technically permits
-deleting and archiving mail — this tool never does either, but you are granting the capability.
-
----
+**Gmail permissions requested.** `gmail.modify`, and nothing else. It subsumes read
+access and label management. Note that the scope technically permits archiving and
+trashing mail; this tool only does so if you write a rule that says to, and
+`allow_destructive` is off by default.
 
 ## Operational Notes
 
@@ -342,28 +337,12 @@ deleting and archiving mail — this tool never does either, but you are grantin
 
 ---
 
-## Known Limitations
+## Status
 
-The project is in active development, and the following are known gaps rather than
-intentional design:
-
-- **Sender headers are not sent to the model.** Only subject, body text, and label names are.
-  "Who sent this" — arguably the strongest signal available — is currently invisible to the
-  classifier unless it appears in the body.
-- **HTML-only mail is sent with markup intact.** Bodies without a `text/plain` alternative
-  are not reliably stripped, which wastes the character budget on tags and scripts.
-- **Nested MIME structures are not traversed.** Mail with attachments often nests the real
-  body one level deeper than the parser looks, and can end up classified with no body at all.
-- **Non-UTF-8 bodies fail.** Legacy Japanese encodings (ISO-2022-JP, Shift_JIS) cause the
-  thread to be skipped.
-- **Truncation drops the newest messages.** Long threads are cut from the end, which is where
-  the most decision-relevant content lives.
-- **No retries.** A transient Gmail or LLM error costs that thread for the run.
-- **No tests.**
-
-A detailed remediation plan exists in `local/improvement_proposals.md` (not committed).
-
----
+The classification pipeline is complete and runs locally. Still to come: a container
+image, Terraform for AWS, queue-backed dispatch so the apply side can be deployed
+separately, and an evaluation harness so prompt changes can be measured rather than
+guessed at.
 
 ## Contributing
 

@@ -17,14 +17,6 @@ gmail:
   max_threads: 250
 """
 
-LEGACY_CONFIG = """
-labelID:
-  P1: "Label_1"
-priorityLabels:
-  P1: "#/P1"
-maxThreads: 1500
-"""
-
 
 def test_version_is_populated() -> None:
     assert __version__
@@ -66,21 +58,6 @@ def test_config_validate_rejects_an_invalid_file(tmp_path: Path, capsys: pytest.
 def test_a_missing_config_file_points_at_the_example(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["config", "validate", "--config", str(tmp_path / "absent.yml")]) == EXIT_FATAL
     assert "config.yml.example" in capsys.readouterr().err
-
-
-def test_the_legacy_config_schema_is_named_rather_than_dumped_as_field_errors(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Both implementations default to config.yml during the transition, so the
-    old schema has to produce an explanation rather than a wall of unknown-key
-    validation errors."""
-    path = tmp_path / "config.yml"
-    path.write_text(LEGACY_CONFIG, encoding="utf-8")
-
-    assert main(["config", "validate", "--config", str(path)]) == EXIT_FATAL
-    err = capsys.readouterr().err
-    assert "legacy config schema" in err
-    assert "labelID" in err
 
 
 def test_the_shipped_example_config_is_valid(capsys: pytest.CaptureFixture[str]) -> None:

@@ -111,25 +111,9 @@ def _add_prompt_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--policy", type=Path, default=Path("policy.yml"), metavar="PATH", help="personal policy")
 
 
-# Keys that only ever appeared in the previous config schema.
-_LEGACY_KEYS = ("labelID", "priorityLabels", "maxThreads", "requestsPerMin")
-
-
 def _load(path: Path) -> Settings:
     if not path.is_file():
         raise EpcError(f"configuration file not found: {path}\nCopy {DEFAULT_CONFIG_FILENAME}.example and fill it in.")
-
-    # The legacy implementation still reads its own config from the same default
-    # path while the rewrite is in progress. Say so plainly instead of emitting
-    # a validation error about a dozen unknown keys.
-    text = path.read_text(encoding="utf-8")
-    if any(f"{key}:" in text for key in _LEGACY_KEYS):
-        raise EpcError(
-            f"{path} is in the legacy config schema, which this command does not read.\n"
-            f"The rewrite uses the schema in {DEFAULT_CONFIG_FILENAME}.example — notably there is no\n"
-            "labelID section, because label IDs are now resolved from the mailbox by name.\n"
-            "Write the new config elsewhere and pass --config until the legacy implementation is removed."
-        )
 
     return load_settings(path)
 

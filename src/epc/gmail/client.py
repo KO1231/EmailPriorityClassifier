@@ -9,7 +9,12 @@ Two properties this wrapper is responsible for:
   `execute(num_retries=…)`. The previous implementation passed nothing, so a
   single 429 during a 1500-thread run cost that thread outright.
 * **Errors that name the operation.** An `HttpError` becomes a
-  :class:`~epc.errors.GmailError` that says what was being attempted.
+  :class:`~epc.errors.GmailError` that says what was being attempted — and so
+  does a failure below HTTP. `execute(num_retries=…)` retries a dropped
+  connection or a socket timeout, then re-raises it as whatever the transport
+  raised: `TimeoutError`, `ssl.SSLError`, `httplib2.ServerNotFoundError`, a
+  token refresh that could not reach Google. Callers catch `GmailError` to lose
+  one thread rather than the run, so every one of those has to arrive as one.
 
 .. warning::
    The ``http`` object inside a built service is **not thread-safe**. Build one
@@ -19,6 +24,8 @@ Two properties this wrapper is responsible for:
 from collections.abc import Iterator, Sequence
 from typing import Any
 
+import httplib2
+from google.auth.exceptions import GoogleAuthError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -37,6 +44,11 @@ THREAD_PAGE_LIMIT = 500
 # usually this tool's own work, and re-reading it would be a loop.
 HISTORY_TYPES = ("messageAdded",)
 
+# What the transport raises once `execute`'s own retries are spent. `OSError`
+# covers sockets, timeouts and TLS; the other two are the HTTP library's and
+# google-auth's own hierarchies.
+_TRANSPORT_ERRORS = (OSError, httplib2.HttpLib2Error, GoogleAuthError)
+
 
 class GmailClient:
     """Gmail operations for a single authenticated user."""
@@ -50,6 +62,8 @@ class GmailClient:
             result = request.execute(num_retries=self._num_retries)
         except HttpError as exc:
             raise GmailError(f"{operation} failed: {exc}") from exc
+        except _TRANSPORT_ERRORS as exc:
+            raise GmailError(f"{operation} failed: {type(exc).__name__}: {exc}") from exc
         return result if isinstance(result, dict) else {}
 
     def list_labels(self) -> list[GmailLabel]:
@@ -198,6 +212,8 @@ class GmailClient:
                 if exc.resp.status == 404:
                     raise HistoryExpiredError(f"history since {start_history_id} is no longer available") from exc
                 raise GmailError(f"listing history failed: {exc}") from exc
+            except _TRANSPORT_ERRORS as exc:
+                raise GmailError(f"listing history failed: {type(exc).__name__}: {exc}") from exc
 
             latest = str(response.get("historyId") or latest)
             for entry in response.get("history") or []:

@@ -18,6 +18,7 @@ import pytest
 
 from epc.gmail.mime import (
     decode_body_data,
+    decode_header_value,
     html_to_text,
     normalise_text,
     parse_message,
@@ -222,6 +223,33 @@ def test_rfc2047_encoded_subject_and_display_name_are_decoded() -> None:
     parsed = parse_message(fx.message(fx.text_part("body"), headers=[("Subject", subject), ("From", sender)]))
     assert parsed.subject == "【重要】ご請求のご案内"
     assert parsed.sender_name == "田中 明"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Base64 with bad padding: `HeaderParseError`, which is not a ValueError.
+        "=?utf-8?B?abcde?=",
+        # A charset token Python cannot even parse: `CharsetError`.
+        "?==?日本 ?Q?=?utf-8*ja?B?YQ==?=",
+    ],
+)
+def test_an_undecodable_header_falls_back_to_its_raw_value(raw: str) -> None:
+    """Anyone can send one, and it used to end the whole run before anything
+    was classified — every run, since the thread never got a label."""
+    assert decode_header_value(raw) == raw
+
+
+def test_a_message_with_an_undecodable_subject_still_parses() -> None:
+    parsed = parse_message(
+        fx.message(
+            fx.text_part("Please review."),
+            headers=[("Subject", "=?utf-8?B?abcde?="), ("From", "=?utf-8?B?abcde?= <a@example.com>")],
+        )
+    )
+    assert parsed.subject == "=?utf-8?B?abcde?="
+    assert parsed.sender == "a@example.com"
+    assert parsed.body == "Please review."
 
 
 def test_bulk_mail_headers_are_captured() -> None:

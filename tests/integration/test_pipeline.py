@@ -184,6 +184,44 @@ def test_one_bad_thread_does_not_end_the_run(settings: Any) -> None:
     assert summary.had_failures
 
 
+def test_a_thread_with_an_undecodable_header_is_classified_not_fatal(settings: Any) -> None:
+    """The reviewer's reproduction: one hostile Subject used to end every run."""
+    hostile = fx.thread(
+        fx.message(
+            fx.text_part("Please review."),
+            message_id="t1-m1",
+            thread_id="t1",
+            label_ids=["INBOX"],
+            headers=[("From", "a@example.com"), ("Subject", "=?utf-8?B?abcde?=")],
+        ),
+        thread_id="t1",
+    )
+    gmail = FakeGmail({"t1": hostile, "t2": thread("t2", labels=["INBOX"])})
+    summary = build(settings, gmail, FakeClassifier(), DirectSink(MutationApplier(gmail))).run()  # type: ignore[arg-type]
+
+    assert summary.classified == 2
+    assert not summary.had_failures
+
+
+def test_a_thread_the_parser_trips_over_costs_that_thread_only(settings: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The backstop for parser failures nobody has named yet."""
+    from epc.gmail.mime import parse_thread
+
+    def fragile_parse(raw: Any) -> Any:
+        if raw["id"] == "t2":
+            raise RuntimeError("a shape nobody anticipated")
+        return parse_thread(raw)
+
+    monkeypatch.setattr("epc.pipeline.parse_thread", fragile_parse)
+    gmail = FakeGmail({f"t{i}": thread(f"t{i}", labels=["INBOX"]) for i in range(3)})
+    summary = build(settings, gmail, FakeClassifier(), DirectSink(MutationApplier(gmail))).run()  # type: ignore[arg-type]
+
+    assert summary.classified == 2
+    assert summary.parse_failed == 1
+    assert summary.had_failures
+    assert "unparseable: 1" in summary.render()
+
+
 def test_actions_reach_gmail(settings: Any) -> None:
     gmail = FakeGmail({"t1": thread("t1", labels=["INBOX", "CATEGORY_PROMOTIONS"])})
     build(settings, gmail, FakeClassifier(), DirectSink(MutationApplier(gmail))).run()  # type: ignore[arg-type]

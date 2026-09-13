@@ -45,6 +45,10 @@ class RunSummary:
     incremental: bool = False
     already_labelled: int = 0
     fetch_failed: int = 0
+    # Fetched, but the message could not be turned into something to classify.
+    # Kept apart from fetch failures: those are Gmail's, and pass; these belong
+    # to the mail itself, and will happen again on the next run.
+    parse_failed: int = 0
     classified: int = 0
     classify_failed: int = 0
     # Threads left for the next run because a stop was requested. Not failures:
@@ -59,7 +63,7 @@ class RunSummary:
 
     @property
     def had_failures(self) -> bool:
-        return bool(self.fetch_failed or self.classify_failed or self.apply.had_failures)
+        return bool(self.fetch_failed or self.parse_failed or self.classify_failed or self.apply.had_failures)
 
     @property
     def checkpoint_may_advance(self) -> bool:
@@ -73,7 +77,7 @@ class RunSummary:
             f"  listed            {self.listed}  ({mode})",
             f"  already labelled  {self.already_labelled}  (skipped, no LLM call)",
             f"  classified        {self.classified}"
-            f"  (failed: {self.classify_failed}, unfetchable: {self.fetch_failed})",
+            f"  (failed: {self.classify_failed}, unfetchable: {self.fetch_failed}, unparseable: {self.parse_failed})",
             "    " + "  ".join(f"{p.value}: {self.by_priority[p]}" for p in Priority),
             f"  suspicious        {self.suspicious}",
             *([f"  abandoned         {self.abandoned}  (stop requested)"] if self.abandoned else []),
@@ -212,7 +216,16 @@ class Pipeline:
                 logger.warning("could not fetch thread %s: %s", thread_id, exc)
                 continue
 
-            thread = parse_thread(raw)
+            try:
+                thread = parse_thread(raw)
+            except Exception as exc:
+                # Anyone can send mail, so anything the parser trips over is
+                # something an outsider can put in every run's path. Named
+                # decoding failures are handled where they occur; this is the
+                # backstop for the ones nobody has thought of yet.
+                summary.parse_failed += 1
+                logger.warning("could not parse thread %s: %s", thread_id, type(exc).__name__)
+                continue
             # Second half of idempotency: a label can appear between the search
             # and the fetch. Such a thread is counted and left alone — never
             # re-planned, because the user may have set that label by hand and

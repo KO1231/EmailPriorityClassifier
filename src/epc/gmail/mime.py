@@ -24,6 +24,7 @@ import binascii
 import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from email.errors import MessageError
 from email.header import decode_header, make_header
 from email.utils import getaddresses, parseaddr
 from typing import Any
@@ -95,12 +96,21 @@ def header_map(part: GmailPayload) -> dict[str, str]:
 
 
 def decode_header_value(raw: str) -> str:
-    """Decode an RFC 2047 encoded-word header, e.g. ``=?ISO-2022-JP?B?...?=``."""
+    """Decode an RFC 2047 encoded-word header, e.g. ``=?ISO-2022-JP?B?...?=``.
+
+    Falls back to the raw value rather than raising. Anyone can send a header
+    that does not decode. ``=?utf-8?B?abcde?=`` is a base64 payload with bad
+    padding, and an encoded-word naming a malformed charset is another; the
+    `email` package raises `HeaderParseError` and `CharsetError` for those,
+    neither of which is a `ValueError`. Their common base is named instead, so
+    the next sibling is covered too. A header that failed to decode costs
+    legibility, never the thread.
+    """
     if not raw:
         return ""
     try:
         return str(make_header(decode_header(raw)))
-    except UnicodeDecodeError, LookupError, ValueError:
+    except UnicodeDecodeError, LookupError, ValueError, MessageError:
         return raw
 
 

@@ -137,6 +137,8 @@ module = [
     "google_auth_httplib2.*",
     "google_auth_oauthlib.*",
     "bs4.*",
+    # Only its exception hierarchy is named, in an `except` tuple.
+    "httplib2.*",
 ]
 ignore_missing_imports = true
 
@@ -144,7 +146,7 @@ ignore_missing_imports = true
 # methods are unannotated, so every call trips --strict. Relax only the module
 # that touches them rather than losing strictness across the package.
 [[tool.mypy.overrides]]
-module = ["epc.gmail.auth", "tests.unit.gmail.test_auth"]
+module = ["epc.gmail.auth", "tests.unit.gmail.test_auth", "tests.unit.gmail.test_client"]
 disallow_untyped_calls = false
 warn_return_any = false
 

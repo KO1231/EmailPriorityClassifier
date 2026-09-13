@@ -2,7 +2,9 @@
 
 from typing import Any
 
+import httplib2
 import pytest
+from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
 from epc.errors import GmailError
@@ -98,6 +100,24 @@ def test_the_retry_count_is_configurable(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_an_http_error_names_the_operation(make_client: Any) -> None:
     client, _ = make_client(error=http_error(429, "Too Many Requests"))
     with pytest.raises(GmailError, match="listing labels failed"):
+        client.list_labels()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("timed out"),
+        ConnectionResetError("reset by peer"),
+        httplib2.ServerNotFoundError("Unable to find the server at gmail.googleapis.com"),
+        RefreshError("token refresh failed"),
+    ],
+    ids=["timeout", "reset", "dns", "refresh"],
+)
+def test_a_failure_below_http_is_a_gmail_error_too(make_client: Any, error: Exception) -> None:
+    """`execute` retries these and then re-raises them raw. Callers catch
+    `GmailError` to lose one thread instead of the run, so a raw one ended it."""
+    client, _ = make_client(error=error)
+    with pytest.raises(GmailError, match=f"listing labels failed: {type(error).__name__}"):
         client.list_labels()
 
 

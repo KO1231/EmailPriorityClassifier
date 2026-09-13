@@ -13,7 +13,7 @@ no special handling — just somewhere durable.
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -83,3 +83,66 @@ class NullStateStore:
 
     def save(self, state: RunState) -> None:  # noqa: ARG002 - protocol shape
         return None
+
+
+class SsmStateStore:
+    """Checkpoint in an SSM Parameter Store parameter.
+
+    A plain `String`, not a `SecureString`: a Gmail `historyId` is an opaque
+    counter, not a secret, and encrypting it would only add a `kms:Decrypt` to
+    the task role for nothing.
+    """
+
+    def __init__(self, name: str, client: Any = None, *, region: str | None = None) -> None:
+        if client is None:
+            import boto3
+
+            client = boto3.client("ssm", region_name=region)
+        self._client = client
+        self._name = name
+
+    def load(self) -> RunState:
+        """A missing or unreadable checkpoint means "start over", never a crash."""
+        try:
+            response = self._client.get_parameter(Name=self._name)
+            return RunState.model_validate_json(str(response["Parameter"]["Value"]))
+        except Exception:
+            # Absent, malformed, or momentarily unreachable. The cost of being
+            # wrong here is one full scan; the cost of raising is a run that
+            # does nothing at all.
+            return RunState()
+
+    def save(self, state: RunState) -> None:
+        self._client.put_parameter(Name=self._name, Value=state.model_dump_json(), Type="String", Overwrite=True)
+
+
+class S3StateStore:
+    """Checkpoint as an object in S3.
+
+    For when the checkpoint shares a bucket with the classification history and
+    one place for run artefacts is simpler than two.
+    """
+
+    def __init__(self, bucket: str, key: str, client: Any = None, *, region: str | None = None) -> None:
+        if client is None:
+            import boto3
+
+            client = boto3.client("s3", region_name=region)
+        self._client = client
+        self._bucket = bucket
+        self._key = key
+
+    def load(self) -> RunState:
+        try:
+            response = self._client.get_object(Bucket=self._bucket, Key=self._key)
+            return RunState.model_validate_json(response["Body"].read().decode("utf-8"))
+        except Exception:
+            return RunState()
+
+    def save(self, state: RunState) -> None:
+        self._client.put_object(
+            Bucket=self._bucket,
+            Key=self._key,
+            Body=state.model_dump_json().encode("utf-8"),
+            ContentType="application/json",
+        )

@@ -140,13 +140,10 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
 def cmd_labels(args: argparse.Namespace) -> int:
     # Imported here so `config validate` stays importable without the Google
     # client libraries present.
-    from epc.gmail.auth import LocalFileCredentialStore, get_credentials
-    from epc.gmail.client import GmailClient
     from epc.gmail.labels import resolve_priority_labels
 
     settings = _load(args.config)
-    store = LocalFileCredentialStore(settings.credentials.token_file)
-    client = GmailClient(get_credentials(store))
+    client = _gmail_client(settings)
 
     available = client.list_labels()
     resolved = resolve_priority_labels(available, settings.labels.by_priority)
@@ -158,12 +155,20 @@ def cmd_labels(args: argparse.Namespace) -> int:
 
 
 def cmd_login(args: argparse.Namespace) -> int:
-    from epc.gmail.auth import SCOPES, LocalFileCredentialStore, get_credentials
+    from epc.backends import build_credential_store
+    from epc.gmail.auth import SCOPES, get_credentials
 
     settings = _load(args.config)
-    store = LocalFileCredentialStore(settings.credentials.token_file)
+    # Authorise here, store wherever the backend says — so the browser flow can
+    # run on a laptop and the credential land in a parameter the task reads.
+    store = build_credential_store(settings)
     get_credentials(store, client_secrets_file=settings.credentials.client_secrets_file)
-    print(f"Authorised. Credentials stored at {settings.credentials.token_file}")
+    where = (
+        settings.credentials.token_file
+        if settings.credentials.backend == "local"
+        else settings.credentials.parameter_name
+    )
+    print(f"Authorised. Credentials stored at {where}")
     print(f"Scope granted: {' '.join(SCOPES)}")
     return EXIT_OK
 
@@ -234,24 +239,22 @@ def cmd_prompt_render(args: argparse.Namespace) -> int:
 
 
 def _gmail_client(settings: Settings) -> GmailClient:
-    from epc.gmail.auth import LocalFileCredentialStore, get_credentials
+    from epc.backends import build_credential_store
+    from epc.gmail.auth import get_credentials
     from epc.gmail.client import GmailClient
 
-    store = LocalFileCredentialStore(settings.credentials.token_file)
-    return GmailClient(get_credentials(store))
+    return GmailClient(get_credentials(build_credential_store(settings)))
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    from epc.backends import build_sink, build_state_store
     from epc.classify.factory import build_classifier
     from epc.classify.prompt import PromptRenderer
-    from epc.dispatch.applier import MutationApplier
-    from epc.dispatch.sink import DirectSink, JsonlSink, MutationSink
     from epc.gmail.labels import resolve_priority_labels
     from epc.logging import configure_logging
     from epc.pipeline import Pipeline
     from epc.report import HistorySink, JsonlHistorySink, NullHistorySink
     from epc.shutdown import shutdown_on_signal
-    from epc.state import LocalFileStateStore, NullStateStore, StateStore
 
     settings = _load(args.config)
     if args.limit is not None:
@@ -272,18 +275,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     classifier = build_classifier(settings, renderer)
 
     sink_kind = settings.resolve_sink(force_dry_run=args.dry_run)
-    writes_nothing = sink_kind != "direct"
-
-    sink: MutationSink
-    if sink_kind == "jsonl":
-        sink = JsonlSink(settings.dispatch.jsonl_path)
+    writes_nothing = sink_kind == "jsonl"
+    sink = build_sink(settings, gmail_client=client, force_dry_run=args.dry_run)
+    if writes_nothing:
         print(f"Dry run - planned changes go to {settings.dispatch.jsonl_path}, nothing is applied.")
-    else:
-        sink = DirectSink(MutationApplier(client), batch_size=settings.dispatch.batch_size)
+    elif sink_kind == "sqs":
+        print(f"Dispatching to {settings.dispatch.queue_url}; another process applies them.")
 
-    state: StateStore = (
-        LocalFileStateStore(settings.state.file) if settings.state.backend == "local" else NullStateStore()
-    )
+    state = build_state_store(settings)
     history: HistorySink = (
         JsonlHistorySink(settings.observability.history_dir)
         if settings.observability.history_dir is not None

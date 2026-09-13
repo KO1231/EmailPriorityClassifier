@@ -40,7 +40,7 @@ DEFAULT_CONFIG_FILENAME = "config.yml"
 StateBackend = Literal["local", "ssm", "s3"]
 CredentialsBackend = Literal["local", "ssm", "secrets_manager", "service_account"]
 LlmBackend = Literal["openai", "bedrock", "local"]
-SinkKind = Literal["direct", "jsonl"]
+SinkKind = Literal["direct", "jsonl", "sqs"]
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 Verbosity = Literal["low", "medium", "high"]
 InjectionResponse = Literal["ignore", "flag", "downgrade_and_flag"]
@@ -168,9 +168,20 @@ class DispatchSettings(_Section):
 
     sink: SinkKind = "direct"
     jsonl_path: Path = Path("log/mutations.jsonl")
+
+    # sink: sqs — a FIFO queue. Ordering per thread is what protects
+    # correctness once a rule can remove a label; the dedup window is a cost
+    # optimisation on top of idempotency that already holds without it.
+    queue_url: str | None = None
     # Threads buffered before a write. `batchModify` takes 1000 message IDs per
     # call, so buffering is what turns 1500 round trips into two.
     batch_size: int = Field(default=1000, gt=0, le=1000)
+
+    @model_validator(mode="after")
+    def _sqs_needs_a_queue(self) -> Self:
+        if self.sink == "sqs" and not self.queue_url:
+            raise ValueError("dispatch.queue_url is required when dispatch.sink is 'sqs'")
+        return self
 
 
 class SecuritySettings(_Section):
@@ -220,6 +231,20 @@ class StateSettings(_Section):
     backend: StateBackend = "local"
     # backend: local — the file holding the Gmail historyId.
     file: Path = Path(".state/run.json")
+    # backend: ssm — the parameter name. A plain String: a historyId is an
+    # opaque counter, and encrypting it would add a kms:Decrypt for nothing.
+    parameter_name: str | None = None
+    # backend: s3
+    bucket: str | None = None
+    key: str = "epc/state.json"
+
+    @model_validator(mode="after")
+    def _remote_backends_need_a_location(self) -> Self:
+        if self.backend == "ssm" and not self.parameter_name:
+            raise ValueError("state.parameter_name is required when state.backend is 'ssm'")
+        if self.backend == "s3" and not self.bucket:
+            raise ValueError("state.bucket is required when state.backend is 's3'")
+        return self
 
 
 class Settings(BaseSettings):
@@ -248,6 +273,10 @@ class Settings(BaseSettings):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     state: StateSettings = Field(default_factory=StateSettings)
+
+    # Region for every AWS backend that does not name its own. Falls back to
+    # the usual boto3 resolution when unset.
+    aws_region: str | None = None
 
     # Top level, and not a member of any section, because it overrides one.
     # Whatever `dispatch` is configured to do — apply now, or hand off to a

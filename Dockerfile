@@ -10,16 +10,19 @@
 # Pinned by digest: a tag is mutable, and a base image that changes under a
 # build is a supply-chain hole of exactly the kind the lockfile closes.
 ARG PYTHON_IMAGE=python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.12.5@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1
-
-FROM ${UV_IMAGE} AS uv
+# uv is installed from PyPI rather than copied from its own image. That keeps
+# the build to one registry and one credential path — and uv is a build-time
+# tool that never reaches the runtime layer, while the supply chain that
+# actually ships is pinned by uv.lock's per-package hashes.
+ARG UV_VERSION=0.12.5
 
 # ---------------------------------------------------------------------------
 # builder — resolves and installs into a virtualenv that is copied out whole
 # ---------------------------------------------------------------------------
 FROM ${PYTHON_IMAGE} AS builder
 
-COPY --from=uv /uv /usr/local/bin/uv
+ARG UV_VERSION
+RUN pip install --no-cache-dir "uv==${UV_VERSION}"
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
@@ -37,8 +40,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY src/ ./src/
 COPY README.md ./
+# `--no-editable`: uv installs the project as an editable link by default, which
+# would point the runtime layer at a /build/src that does not exist there.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --extra classify --extra aws
+    uv sync --frozen --no-dev --no-editable --extra classify --extra aws
 
 # ---------------------------------------------------------------------------
 # runtime — no compiler, no uv, no build cache

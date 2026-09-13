@@ -133,6 +133,32 @@ repeat is free.
 
 ---
 
+## Container
+
+One image for every deployment; only environment variables and mounts differ.
+`make docker-build`, then `make docker-run` (compose, with the local config mounted).
+
+Baked in: the package and the generic prompts. Mounted: `config.yml`, `policy.yml`,
+`secrets/`, `log/`, `.state/`.
+
+- **Base images are pinned by digest.** A tag is mutable, and a base that changes under
+  a build is the same hole `uv.lock` closes on the dependency side.
+- **uv is installed from PyPI, not copied from `ghcr.io/astral-sh/uv`.** One registry,
+  one credential path. uv never reaches the runtime layer anyway, and what actually
+  ships is pinned by `uv.lock`'s per-package hashes.
+- **`uv sync --no-editable`.** The default editable install points the runtime layer at
+  a `/build/src` that only exists in the builder — the image builds and then fails to
+  import.
+- **`secrets/` is mounted read-only.** A consequence of storing only the durable
+  credential fields: a token refresh needs no write, and `epc login` runs on the host.
+  Storing the access token would change that.
+- The root filesystem is read-only, `/tmp` is tmpfs, and the process runs as UID 10001
+  so a bind-mounted `log/` has predictable ownership.
+
+`.github/workflows/docker.yml` checks these rather than assuming them: non-root, no
+build toolchain in the runtime layer, and — because `.dockerignore` is the last thing
+between a secret and a pushed layer — that no personal file was copied in.
+
 ## Conventions
 
 **Language.** Code comments and docstrings are Japanese. Log messages, exception

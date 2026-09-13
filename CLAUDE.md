@@ -42,6 +42,19 @@ Landed so far:
   CSS is dropped during HTML extraction instead, because that is a question of what is *visible*;
   the count is carried on `EmailMessage.hidden_elements_removed` so the detector can use it.
   `tests/injection/` is the adversarial corpus.
+- **Classification** — `epc.classify`. `budget` (quote stripping, newest-first budgeting, and the
+  sanitisation gate), `prompt` (committed prompts + git-ignored `policy.yml`, nonce-wrapped
+  untrusted content), `base` (the `Classifier` protocol and the shared response parser), and three
+  backends behind `factory.build_classifier`: `openai`, `local` (OpenAI-compatible), `bedrock`.
+
+  **Bedrock uses boto3's Converse API, not an Anthropic-specific client.** Converse is the
+  provider-agnostic surface — the same request reaches Claude, Nova, Llama, Mistral and the OpenAI
+  open-weight models on Bedrock. A vendor client would fit one family and dead-end the rest, which
+  is the opposite of what a swappable backend is for. Structured output is *requested* through a
+  tool definition and never depended upon: forcing a tool is unsupported on some models, so a
+  rejection degrades to `toolChoice: auto` (latched, so 1500 threads do not each pay for a doomed
+  first attempt) and then to reading plain text. `parse_classification` is the backstop in every
+  case, which is what keeps the enum — not the transport — as the security boundary.
 
 ### Carried forward — obligations deferred out of a completed phase
 

@@ -95,12 +95,29 @@ class BudgetSettings(_Section):
 
 class LlmSettings(_Section):
     backend: LlmBackend = "openai"
-    # Left unset for backends that carry the model with the prompt (OpenAI's
-    # stored prompts do). Required by the ones that do not.
+
+    # Required to classify, but not to validate a config or resolve labels, so
+    # it is checked when the classifier is built rather than here. That is still
+    # startup — just the startup of the command that needs it.
     model: str | None = None
+
+    # backend: local — where the OpenAI-compatible server is listening. Not a
+    # hardcoded localhost, so the same image can reach a server outside its
+    # own container.
+    base_url: str | None = None
+
+    # backend: bedrock — falls back to the usual AWS region resolution.
+    region: str | None = None
+
     concurrency: int = Field(default=15, gt=0)
     requests_per_min: int = Field(default=120, gt=0)
     budget: BudgetSettings = Field(default_factory=BudgetSettings)
+
+    @model_validator(mode="after")
+    def _local_backend_needs_a_base_url(self) -> Self:
+        if self.backend == "local" and not self.base_url:
+            raise ValueError("llm.base_url is required when llm.backend is 'local'")
+        return self
 
 
 class SecuritySettings(_Section):

@@ -37,8 +37,18 @@ credentials:
 
 llm:
   backend: openai # openai | bedrock | local
-  # Leave unset for backends that carry the model with the prompt.
-  # model: ...
+  model: gpt-5-mini
+
+  # backend: local — an OpenAI-compatible server (LM Studio, llama.cpp, vLLM).
+  # Nothing leaves the machine. Not hardcoded to localhost, so the same image
+  # can reach a server outside its own container.
+  # base_url: http://host.docker.internal:1234/v1
+
+  # backend: bedrock — Converse is provider-agnostic, so `model` can name any
+  # Bedrock model, not only Anthropic's. Region falls back to the usual AWS
+  # resolution when unset.
+  # region: ap-northeast-1
+
   concurrency: 15
   requests_per_min: 120
   budget:

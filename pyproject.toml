@@ -44,6 +44,9 @@ dev = [
     "ruff>=0.9",
     "types-PyYAML>=6",
     "pre-commit>=4",
+    # Typed boto3. The Converse request body is hand-written JSON; a wrong key
+    # name should be a type error, not a runtime ValidationException.
+    "boto3-stubs[bedrock-runtime]>=1.40",
 ]
 
 [build-system]

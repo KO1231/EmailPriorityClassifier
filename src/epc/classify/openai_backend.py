@@ -11,6 +11,8 @@ server rejects it. The shared parser in :mod:`epc.classify.base` is the backstop
 either way.
 """
 
+from typing import Any, cast
+
 from openai import APIError, OpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 from openai.types.chat.completion_create_params import ResponseFormat
@@ -23,8 +25,7 @@ from epc.errors import ClassificationError
 SCHEMA_NAME = "email_priority"
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_RETRIES = 5
-# The answer is four short fields; anything longer is the model going astray.
-MAX_OUTPUT_TOKENS = 512
+DEFAULT_MAX_OUTPUT_TOKENS = 2048
 
 
 class OpenAIClassifier:
@@ -40,6 +41,9 @@ class OpenAIClassifier:
         client: OpenAI | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        reasoning_effort: str | None = None,
+        verbosity: str | None = None,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     ) -> None:
         # Retries are configured on the client rather than hand-rolled: the SDK
         # already backs off on 429 and 5xx, and the old implementation's single
@@ -47,6 +51,9 @@ class OpenAIClassifier:
         self._client = client or OpenAI(timeout=timeout, max_retries=max_retries)
         self._model = model
         self._renderer = renderer
+        self._reasoning_effort = reasoning_effort
+        self._verbosity = verbosity
+        self._max_output_tokens = max_output_tokens
 
     @property
     def backend(self) -> str:
@@ -71,11 +78,25 @@ class OpenAIClassifier:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        return self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            response_format=response_format,
-            max_completion_tokens=MAX_OUTPUT_TOKENS,
+        extra: dict[str, Any] = {}
+        # Omitted rather than sent as None: a model that does not know the
+        # parameter should not be handed it at all.
+        if self._reasoning_effort is not None:
+            extra["reasoning_effort"] = self._reasoning_effort
+        if self._verbosity is not None:
+            extra["verbosity"] = self._verbosity
+
+        # `**extra` widens the overload to Any; the call is non-streaming, so
+        # the concrete return type is known.
+        return cast(
+            "ChatCompletion",
+            self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                response_format=response_format,
+                max_completion_tokens=self._max_output_tokens,
+                **extra,
+            ),
         )
 
     def _complete(self, system: str, user: str) -> ChatCompletion:
@@ -117,10 +138,16 @@ class LocalClassifier(OpenAIClassifier):
         client: OpenAI | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        reasoning_effort: str | None = None,
+        verbosity: str | None = None,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     ) -> None:
         super().__init__(
             model=model,
             renderer=renderer,
+            reasoning_effort=reasoning_effort,
+            verbosity=verbosity,
+            max_output_tokens=max_output_tokens,
             # A local server needs no credential, but the SDK insists on one.
             client=client or OpenAI(base_url=base_url, api_key="not-used", timeout=timeout, max_retries=max_retries),
         )

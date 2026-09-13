@@ -24,7 +24,13 @@ def build_classifier(settings: Settings, renderer: PromptRenderer) -> Classifier
         case "openai":
             from epc.classify.openai_backend import OpenAIClassifier
 
-            return OpenAIClassifier(model=llm.model, renderer=renderer)
+            return OpenAIClassifier(
+                model=llm.model,
+                renderer=renderer,
+                reasoning_effort=llm.reasoning_effort,
+                verbosity=llm.verbosity,
+                max_output_tokens=llm.max_output_tokens,
+            )
 
         case "local":
             from epc.classify.openai_backend import LocalClassifier
@@ -32,7 +38,14 @@ def build_classifier(settings: Settings, renderer: PromptRenderer) -> Classifier
             # Validated by LlmSettings, restated so the type checker agrees.
             if not llm.base_url:  # pragma: no cover - unreachable via settings
                 raise ConfigError("llm.base_url is required when llm.backend is 'local'")
-            return LocalClassifier(model=llm.model, renderer=renderer, base_url=llm.base_url)
+            return LocalClassifier(
+                model=llm.model,
+                renderer=renderer,
+                base_url=llm.base_url,
+                reasoning_effort=llm.reasoning_effort,
+                verbosity=llm.verbosity,
+                max_output_tokens=llm.max_output_tokens,
+            )
 
         case "bedrock":
             try:

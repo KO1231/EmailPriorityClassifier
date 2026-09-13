@@ -41,6 +41,8 @@ StateBackend = Literal["local", "ssm", "s3"]
 CredentialsBackend = Literal["local", "ssm", "secrets_manager", "service_account"]
 LlmBackend = Literal["openai", "bedrock", "local"]
 SinkKind = Literal["direct", "jsonl"]
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+Verbosity = Literal["low", "medium", "high"]
 InjectionResponse = Literal["ignore", "flag", "downgrade_and_flag"]
 
 
@@ -111,6 +113,17 @@ class LlmSettings(_Section):
 
     # backend: bedrock — falls back to the usual AWS region resolution.
     region: str | None = None
+
+    # OpenAI-compatible backends only; ignored elsewhere. Classification is a
+    # short, well-specified judgement, so the low end is usually right — and on
+    # a reasoning model the thinking is billed as output.
+    reasoning_effort: ReasoningEffort | None = None
+    verbosity: Verbosity | None = None
+
+    # Reasoning tokens count against this too, so it is not simply "how long is
+    # the answer". Four short fields need very little; the headroom is for the
+    # thinking in front of them.
+    max_output_tokens: int = Field(default=2048, gt=0)
 
     concurrency: int = Field(default=15, gt=0)
     requests_per_min: int = Field(default=120, gt=0)

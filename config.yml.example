@@ -37,7 +37,16 @@ credentials:
 
 llm:
   backend: openai # openai | bedrock | local
-  model: gpt-5-mini
+  model: gpt-5.4-mini
+
+  # OpenAI-compatible backends only. Classification is a short, well-specified
+  # judgement, so the low end is usually right — and on a reasoning model the
+  # thinking is billed as output tokens.
+  reasoning_effort: low # none | minimal | low | medium | high | xhigh | max
+  verbosity: low # low | medium | high
+  # Reasoning tokens count against this too, so it is not simply "how long is
+  # the answer".
+  max_output_tokens: 2048
 
   # backend: local — an OpenAI-compatible server (LM Studio, llama.cpp, vLLM).
   # Nothing leaves the machine. Not hardcoded to localhost, so the same image

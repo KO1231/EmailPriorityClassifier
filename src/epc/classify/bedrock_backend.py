@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, cast
 from epc.classify.base import Classification, ClassificationResult, Usage, parse_classification
 from epc.classify.budget import ThreadPayload
 from epc.classify.prompt import PromptRenderer, response_json_schema
-from epc.errors import ClassificationError
+from epc.errors import ClassificationError, RejectedByProviderError, UnusableResponseError
 
 if TYPE_CHECKING:  # pragma: no cover - stubs are a dev dependency, not a runtime one
     from mypy_boto3_bedrock_runtime.client import BedrockRuntimeClient
@@ -104,7 +104,7 @@ class BedrockClassifier:
             response = self._converse(rendered.system, rendered.user, force=self._can_force_tool)
         except Exception as exc:
             if not (self._can_force_tool and _is_unsupported_tool_choice(exc)):
-                raise ClassificationError(f"{self.backend} request failed: {exc}") from exc
+                raise _as_classification_error(self.backend, exc) from exc
             # This model does not allow a forced tool. Ask, don't insist.
             self._can_force_tool = False
             try:
@@ -112,7 +112,7 @@ class BedrockClassifier:
             except Exception as retry_exc:
                 # The retry is a request like any other, and fails like one:
                 # throttling, a timeout, a model that is not enabled.
-                raise ClassificationError(f"{self.backend} request failed: {retry_exc}") from retry_exc
+                raise _as_classification_error(self.backend, retry_exc) from retry_exc
 
         return ClassificationResult(
             thread_id=payload.thread_id,
@@ -135,6 +135,17 @@ def _is_unsupported_tool_choice(exc: Exception) -> bool:
     return "validationexception" in message and "toolchoice" in message
 
 
+def _as_classification_error(backend: str, exc: Exception) -> ClassificationError:
+    """Name the failure for what it says about the thread.
+
+    `ValidationException` is Bedrock's refusal of the request itself: content
+    it will not process, an input too long for the model. Throttling, access
+    and availability errors say nothing about the thread.
+    """
+    kind = RejectedByProviderError if "validationexception" in str(exc).lower() else ClassificationError
+    return kind(f"{backend} request failed: {exc}")
+
+
 def _parse_converse(response: Mapping[str, Any]) -> Classification:
     """Read the answer out of whichever shape the model chose to reply in."""
     content = response.get("output", {}).get("message", {}).get("content") or []
@@ -148,7 +159,7 @@ def _parse_converse(response: Mapping[str, Any]) -> Classification:
 
     text = "\n".join(block["text"] for block in content if "text" in block)
     if not text.strip():
-        raise ClassificationError("the model returned neither a tool call nor any text")
+        raise UnusableResponseError("the model returned neither a tool call nor any text")
     return parse_classification(text)
 
 

@@ -86,6 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--limit", type=int, metavar="N", help="classify at most N threads (overrides the config)")
 
+    failures = subcommands.add_parser("failures", help="inspect or forget threads that keep failing")
+    failures_actions = failures.add_subparsers(dest="failures_command", required=True)
+    failures_list = failures_actions.add_parser("list", help="show the recorded failures")
+    _add_config_option(failures_list)
+    failures_clear = failures_actions.add_parser("clear", help="forget recorded failures so they are retried")
+    _add_config_option(failures_clear)
+    failures_clear.add_argument("thread_ids", nargs="*", metavar="THREAD_ID", help="only these; omit for all")
+
     apply_command = subcommands.add_parser("apply", help="apply a file of planned changes")
     _add_config_option(apply_command)
     apply_command.add_argument("file", type=Path, help="a JSONL file written by --dry-run")
@@ -123,7 +131,6 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
     print(f"{args.config}: valid\n")
     print(f"  search query        {settings.search_query}")
     print(f"  max threads         {settings.gmail.max_threads}")
-    print(f"  incremental         {settings.gmail.incremental}")
     print(f"  llm backend         {settings.llm.backend}")
     print(f"  concurrency         {settings.llm.concurrency} at {settings.llm.requests_per_min}/min")
     print(f"  budget              {settings.llm.budget.thread_tokens} tokens/thread")
@@ -299,6 +306,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             state_store=state,
             history=history,
             shutdown=stopping,
+            classifier_version=f"{settings.llm.backend}/{settings.llm.model}/{renderer.fingerprint}",
+            dry_run=writes_nothing,
         )
         print(f"Query: {pipeline.search_query()}")
         summary = pipeline.run()
@@ -307,7 +316,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(summary.render())
     if summary.interrupted:
         print("\nStopped on request. Everything already classified was flushed;")
-        print("the checkpoint was left where it was, so the rest comes back next run.")
+        print("the rest still has no label, so it comes back next run.")
     elif summary.halted:
         print("\nStopped starting new classifications after too many failures in a row.")
         print("Everything already classified was flushed; the rest comes back next run.")
@@ -315,6 +324,40 @@ def cmd_run(args: argparse.Namespace) -> int:
     if writes_nothing:
         print(f"\nReplay with:  epc apply {settings.dispatch.jsonl_path}")
     return EXIT_PARTIAL if summary.had_failures else EXIT_OK
+
+
+def cmd_failures_list(args: argparse.Namespace) -> int:
+    from epc.backends import build_state_store
+    from epc.state import SKIP_AFTER_ATTEMPTS
+
+    state = build_state_store(_load(args.config)).load()
+    if not state.failures:
+        print("No recorded failures.")
+        return EXIT_OK
+
+    skipped = set(state.skipped())
+    print(f"{len(state.failures)} recorded failure(s), recorded under {state.classifier or 'an unknown classifier'}:\n")
+    for thread_id, record in sorted(state.failures.items(), key=lambda item: item[1].first_failed_at):
+        status = "skipped" if thread_id in skipped else f"retrying ({record.attempts}/{SKIP_AFTER_ATTEMPTS})"
+        print(f"  {thread_id}  since {record.first_failed_at:%Y-%m-%d}  {status}")
+    print("\nA thread comes back when it changes in Gmail, when the model or prompt changes, or after 30 days.")
+    return EXIT_OK
+
+
+def cmd_failures_clear(args: argparse.Namespace) -> int:
+    from epc.backends import build_state_store
+
+    store = build_state_store(_load(args.config))
+    state = store.load()
+    targets = set(args.thread_ids) if args.thread_ids else set(state.failures)
+    unknown = sorted(set(args.thread_ids) - set(state.failures))
+    remaining = {tid: record for tid, record in state.failures.items() if tid not in targets}
+
+    store.save(state.model_copy(update={"failures": remaining}))
+    print(f"Forgot {len(state.failures) - len(remaining)} recorded failure(s); they are retried on the next run.")
+    for thread_id in unknown:
+        print(f"  (no record for {thread_id})", file=sys.stderr)
+    return EXIT_OK
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
@@ -345,6 +388,8 @@ _COMMANDS = {
     ("login", None): cmd_login,
     ("prompt", "render"): cmd_prompt_render,
     ("run", None): cmd_run,
+    ("failures", "list"): cmd_failures_list,
+    ("failures", "clear"): cmd_failures_clear,
     ("apply", None): cmd_apply,
 }
 
@@ -357,7 +402,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return EXIT_OK
 
-    subcommand = getattr(args, "config_command", None) or getattr(args, "prompt_command", None)
+    subcommand = (
+        getattr(args, "config_command", None)
+        or getattr(args, "prompt_command", None)
+        or getattr(args, "failures_command", None)
+    )
     handler = _COMMANDS[(args.command, subcommand)]
     try:
         return handler(args)

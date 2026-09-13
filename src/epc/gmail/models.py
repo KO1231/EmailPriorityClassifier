@@ -6,6 +6,7 @@ recipients, the bulk-mail headers, the raw label IDs — is preserved here.
 """
 
 from datetime import datetime
+from typing import NamedTuple
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +20,15 @@ NON_PRIMARY_CATEGORIES = frozenset(
         "CATEGORY_FORUMS",
     }
 )
+
+
+class ThreadRef(NamedTuple):
+    """A thread as a search lists it: before anything has been fetched."""
+
+    id: str
+    # Moves whenever anything about the thread changes. Enough to tell whether
+    # a thread that failed before is still the same thread, without fetching it.
+    history_id: str
 
 
 class Attachment(BaseModel):

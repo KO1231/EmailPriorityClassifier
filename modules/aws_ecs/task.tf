@@ -48,7 +48,7 @@ resource "aws_ecs_task_definition" "classify" {
 
       readonlyRootFilesystem = true
       # The container writes to /tmp only; log/ and .state/ are not used on AWS,
-      # where logs go to CloudWatch and the checkpoint to Parameter Store.
+      # where logs go to CloudWatch and run state to Parameter Store.
       mountPoints = []
     }
   ])

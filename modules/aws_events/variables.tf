@@ -1,6 +1,6 @@
 variable "environment" { type = string }
 variable "schedule_expression" {
-  description = "When to classify. Hourly is usually enough: incremental sync makes a run cheap, but each one still costs model calls."
+  description = "When to classify. Hourly is usually enough: a run with no new mail costs one listing, but each new thread costs a model call."
   type        = string
   default     = "rate(1 hour)"
 }

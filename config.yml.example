@@ -20,12 +20,16 @@ labels:
 
 gmail:
   query: "in:inbox"
-  # Appended to `query`. The single largest cost lever available — it stops
-  # every run re-reading the whole inbox.
-  extra_query: "newer_than:14d -in:chats"
+  # Appended to `query`. Every run already leaves out threads that carry a
+  # priority label, so the search returns only what still needs one.
+  #
+  # Think twice before adding a time limit such as `newer_than:14d`. It saves
+  # little, and it means that removing a label from anything older — the way
+  # to have old mail re-classified after changing your criteria — does nothing.
+  extra_query: ""
+  # Threads classified per run, newest first. Whatever does not fit is still
+  # unlabelled, so the next run takes it up.
   max_threads: 1500
-  # Resume from a stored historyId when one exists, instead of a full scan.
-  incremental: true
 
 credentials:
   backend: local # local | ssm | secrets_manager | service_account
@@ -106,8 +110,12 @@ observability:
   # later, and to measure whether a prompt change helped.
   # history_dir: log/history
 
-# Where the checkpoint between runs is kept, so the next run can ask Gmail
-# "what changed" instead of re-listing the inbox. Holds no secret.
+# Where run state is kept: the threads that keep failing for reasons of their
+# own (content a provider refuses, say), so they stop being retried every run.
+# A thread is only skipped after failing twice with other mail classifying
+# fine in between, and comes back when it changes, when the model or prompt
+# changes, or after 30 days. `epc failures list` shows them. Holds thread IDs,
+# never content, and no secret.
 state:
   backend: local # local | ssm | s3
   file: .state/run.json

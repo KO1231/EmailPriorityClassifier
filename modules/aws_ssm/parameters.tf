@@ -36,12 +36,12 @@ resource "aws_ssm_parameter" "openai_api_key" {
   }
 }
 
-# A Gmail historyId is an opaque counter, not a secret. Encrypting it would add
-# a kms:Decrypt to the task role for nothing. Written by the task on every
-# clean run, so its value is ignored here too.
+# Thread IDs of mail that keeps failing, and counters. Not secret, and holding
+# no content; encrypting it would add a kms:Decrypt to the task role for
+# nothing. Written by the task after every run, so its value is ignored here too.
 resource "aws_ssm_parameter" "state" {
   name        = "${local.prefix}/state"
-  description = "Gmail historyId checkpoint between runs."
+  description = "Threads that keep failing, so runs stop retrying them."
   type        = "String"
   value       = jsonencode({})
 

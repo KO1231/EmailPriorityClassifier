@@ -55,9 +55,9 @@ data "aws_iam_policy_document" "ecs_task" {
     }
   }
 
-  # The checkpoint is written back on every clean run.
+  # Run state — the threads that keep failing — is written back after each run.
   statement {
-    sid       = "WriteCheckpoint"
+    sid       = "WriteRunState"
     actions   = ["ssm:PutParameter"]
     resources = [var.state_parameter.arn]
   }

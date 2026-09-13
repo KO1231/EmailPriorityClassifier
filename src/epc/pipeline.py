@@ -29,10 +29,10 @@ from epc.classify.base import Classifier, Usage
 from epc.classify.budget import build_payload
 from epc.dispatch.applier import ApplyReport
 from epc.dispatch.sink import JsonlSink, MutationSink
-from epc.errors import ClassificationError, GmailError, HistoryExpiredError
+from epc.errors import ClassificationError, GmailError, RejectedByProviderError, UnusableResponseError
 from epc.gmail.client import GmailClient
 from epc.gmail.mime import parse_thread
-from epc.gmail.models import EmailThread
+from epc.gmail.models import EmailThread, ThreadRef
 from epc.gmail.query import build_search_query
 from epc.priority import Priority
 from epc.ratelimit import RateLimiter
@@ -49,14 +49,20 @@ logger = logging.getLogger(__name__)
 # quota and teaches nothing the first ten did not.
 MAX_CONSECUTIVE_FAILURES = 10
 
+# The summary names skipped threads so they can be looked up, up to a point.
+_SKIPPED_IDS_SHOWN = 10
+
 
 @dataclass
 class RunSummary:
     """What a run did. Printed at the end and used to pick an exit code."""
 
     listed: int = 0
-    incremental: bool = False
     already_labelled: int = 0
+    # Left out because they failed on earlier runs for reasons of their own.
+    # Not failures of this run: see `epc.state` for when they come back.
+    skipped_known_failures: int = 0
+    skipped_thread_ids: list[str] = field(default_factory=list)
     fetch_failed: int = 0
     # Fetched, but the message could not be turned into something to classify.
     # Kept apart from fetch failures: those are Gmail's, and pass; these belong
@@ -65,7 +71,7 @@ class RunSummary:
     classified: int = 0
     classify_failed: int = 0
     # Threads left for the next run because a stop was requested. Not failures:
-    # nothing went wrong, and the checkpoint stays put so they come back.
+    # nothing went wrong, and still lacking a label, they come back next run.
     abandoned: int = 0
     interrupted: bool = False
     # Set when too many classifications failed in a row and the rest were not
@@ -75,23 +81,35 @@ class RunSummary:
     by_priority: dict[Priority, int] = field(default_factory=lambda: dict.fromkeys(Priority, 0))
     usage: Usage = field(default_factory=Usage)
     apply: ApplyReport = field(default_factory=ApplyReport)
+    # The failure records could not be written. Nothing is lost this run, but
+    # the next one will retry what it should have skipped — and if it keeps
+    # happening, someone should hear about it.
+    state_not_saved: bool = False
     elapsed_seconds: float = 0.0
 
     @property
     def had_failures(self) -> bool:
-        return bool(self.fetch_failed or self.parse_failed or self.classify_failed or self.apply.had_failures)
-
-    @property
-    def checkpoint_may_advance(self) -> bool:
-        """Only a run that got through everything may move the checkpoint on."""
-        return not self.had_failures and not self.interrupted
+        return bool(
+            self.fetch_failed
+            or self.parse_failed
+            or self.classify_failed
+            or self.apply.had_failures
+            or self.state_not_saved
+        )
 
     def render(self) -> str:
-        mode = "incremental" if self.incremental else "full scan"
+        shown = ", ".join(self.skipped_thread_ids[:_SKIPPED_IDS_SHOWN])
+        if len(self.skipped_thread_ids) > _SKIPPED_IDS_SHOWN:
+            shown += f" +{len(self.skipped_thread_ids) - _SKIPPED_IDS_SHOWN}"
         lines = [
             "=== Summary ===",
-            f"  listed            {self.listed}  ({mode})",
+            f"  listed            {self.listed}",
             f"  already labelled  {self.already_labelled}  (skipped, no LLM call)",
+            *(
+                [f"  known failures    {self.skipped_known_failures}  (skipped: {shown})"]
+                if self.skipped_known_failures
+                else []
+            ),
             f"  classified        {self.classified}"
             f"  (failed: {self.classify_failed}, unfetchable: {self.fetch_failed}, unparseable: {self.parse_failed})",
             "    " + "  ".join(f"{p.value}: {self.by_priority[p]}" for p in Priority),
@@ -102,6 +120,7 @@ class RunSummary:
             f"  (no-op: {self.apply.skipped_noop}, failed: {self.apply.failed})",
             f"  gmail write calls {self.apply.api_calls}",
             f"  elapsed           {self.elapsed_seconds:.1f}s",
+            *(["  ! run state could not be saved"] if self.state_not_saved else []),
         ]
         lines.extend(f"  ! {failure}" for failure in self.apply.failures)
         return "\n".join(lines)
@@ -126,6 +145,8 @@ class Pipeline:
         history: HistorySink | None = None,
         shutdown: threading.Event | None = None,
         max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
+        classifier_version: str = "",
+        dry_run: bool = False,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -141,6 +162,16 @@ class Pipeline:
         # one means "stopping because something is broken".
         self._halt = threading.Event()
         self._max_consecutive_failures = max_consecutive_failures
+        # What failure records are valid for; a change retries every one.
+        self._classifier_version = classifier_version
+        # A dry run reads the records, so it lists what a real run would, and
+        # writes none — it must not change what the next real run does.
+        self._dry_run = dry_run
+
+        # One run's outcome, for the failure records.
+        self._history_ids: dict[str, str] = {}
+        self._failed_threads: dict[str, str] = {}
+        self._succeeded: set[str] = set()
 
     def search_query(self) -> str:
         return build_search_query(
@@ -153,8 +184,11 @@ class Pipeline:
         started = time.monotonic()
         summary = RunSummary()
 
-        thread_ids, checkpoint, mailbox = self._thread_ids_to_consider(summary)
-        threads = self._hydrate(thread_ids, summary)
+        state = self._state_store.load().for_run(
+            mailbox=self._client.mailbox_address(),
+            classifier=self._classifier_version,
+        )
+        threads = self._hydrate(self._threads_to_consider(state, summary), summary)
 
         try:
             self._classify_all(threads, summary)
@@ -169,12 +203,7 @@ class Pipeline:
                 self._history.close()
             summary.elapsed_seconds = time.monotonic() - started
 
-        # Only advance the checkpoint on a clean run. After a partial failure the
-        # next run re-lists the same window, and the label-based exclusion makes
-        # the threads that did succeed free to skip.
-        if checkpoint and summary.checkpoint_may_advance:
-            self._state_store.save(RunState().advanced_to(checkpoint, mailbox=mailbox))
-
+        self._save_state(state, summary)
         return summary
 
     def _classify_all(self, threads: list[EmailThread], summary: RunSummary) -> None:
@@ -191,6 +220,13 @@ class Pipeline:
                     # a failure: the failures that caused a halt are counted
                     # already, and a stop request is not one.
                     summary.abandoned += 1
+                    continue
+                except (RejectedByProviderError, UnusableResponseError) as exc:
+                    # About this thread: remembered, so it can stop being retried.
+                    summary.classify_failed += 1
+                    self._failed_threads[thread.thread_id] = self._history_ids.get(thread.thread_id, "")
+                    logger.warning("classification failed for %s: %s", thread.thread_id, exc)
+                    consecutive_failures = self._note_failure(consecutive_failures)
                     continue
                 except ClassificationError as exc:
                     summary.classify_failed += 1
@@ -214,6 +250,7 @@ class Pipeline:
                     continue
 
                 consecutive_failures = 0
+                self._succeeded.add(thread.thread_id)
                 summary.classified += 1
                 summary.by_priority[mutation.priority] += 1
                 summary.usage = summary.usage + usage
@@ -251,38 +288,36 @@ class Pipeline:
         if self._shutdown.is_set() or self._halt.is_set():
             raise ShutdownRequestedError(thread.thread_id)
 
-    def _thread_ids_to_consider(self, summary: RunSummary) -> tuple[Iterable[str], str, str]:
-        """Which threads to look at, and the checkpoint to store afterwards."""
-        if not self._settings.gmail.incremental:
-            return self._list_thread_ids(), "", ""
+    def _threads_to_consider(self, state: RunState, summary: RunSummary) -> Iterator[ThreadRef]:
+        """The query's threads, less those that have earned a skip.
 
-        mailbox, current_history_id = self._client.mailbox_profile()
-        state = self._state_store.load()
+        Skipped threads do not use up `max_threads`: a handful of permanently
+        failing threads must not crowd out new mail. The listing asks for that
+        many extra to make room.
+        """
+        limit = self._settings.gmail.max_threads
+        taken = 0
+        for ref in self._client.list_threads(self.search_query(), limit=limit + len(state.failures)):
+            if state.should_skip(ref.id, ref.history_id):
+                summary.skipped_known_failures += 1
+                summary.skipped_thread_ids.append(ref.id)
+                continue
+            if taken >= limit:
+                return
+            taken += 1
+            yield ref
 
-        if state.usable_for(mailbox) and state.history_id:
-            try:
-                changed, checkpoint = self._client.list_changed_thread_ids(state.history_id)
-            except HistoryExpiredError:
-                # Routine after an idle period: Gmail keeps about a week.
-                logger.info("history checkpoint expired; falling back to a full scan")
-            else:
-                summary.incremental = True
-                return changed[: self._settings.gmail.max_threads], checkpoint, mailbox
-
-        # No usable checkpoint. Scan, and store where the mailbox is now so the
-        # next run can be incremental.
-        return self._list_thread_ids(), current_history_id, mailbox
-
-    def _hydrate(self, thread_ids: Iterable[str], summary: RunSummary) -> list[EmailThread]:
+    def _hydrate(self, refs: Iterable[ThreadRef], summary: RunSummary) -> list[EmailThread]:
         """Fetch and parse the threads that still need a priority."""
         threads: list[EmailThread] = []
-        for thread_id in thread_ids:
+        for ref in refs:
             summary.listed += 1
+            self._history_ids[ref.id] = ref.history_id
             try:
-                raw = self._client.get_thread(thread_id)
+                raw = self._client.get_thread(ref.id)
             except GmailError as exc:
                 summary.fetch_failed += 1
-                logger.warning("could not fetch thread %s: %s", thread_id, exc)
+                logger.warning("could not fetch thread %s: %s", ref.id, exc)
                 continue
 
             try:
@@ -291,9 +326,11 @@ class Pipeline:
                 # Anyone can send mail, so anything the parser trips over is
                 # something an outsider can put in every run's path. Named
                 # decoding failures are handled where they occur; this is the
-                # backstop for the ones nobody has thought of yet.
+                # backstop for the ones nobody has thought of yet. It is the
+                # mail's own doing, so it is remembered like one.
                 summary.parse_failed += 1
-                logger.warning("could not parse thread %s: %s", thread_id, type(exc).__name__)
+                self._failed_threads[ref.id] = ref.history_id
+                logger.warning("could not parse thread %s: %s", ref.id, type(exc).__name__)
                 continue
             # Second half of idempotency: a label can appear between the search
             # and the fetch. Such a thread is counted and left alone — never
@@ -305,8 +342,15 @@ class Pipeline:
             threads.append(thread)
         return threads
 
-    def _list_thread_ids(self) -> Iterator[str]:
-        return self._client.list_thread_ids(self.search_query(), limit=self._settings.gmail.max_threads)
+    def _save_state(self, state: RunState, summary: RunSummary) -> None:
+        if self._dry_run:
+            return
+        updated = state.after_run(failed=self._failed_threads, succeeded=self._succeeded)
+        try:
+            self._state_store.save(updated)
+        except Exception as exc:
+            summary.state_not_saved = True
+            logger.error("could not save run state: %s", type(exc).__name__)
 
     def _classify(self, thread: EmailThread) -> tuple[ThreadMutation, Usage]:
         # Checked before the expensive part rather than after: a queued task
@@ -317,7 +361,15 @@ class Pipeline:
         payload = build_payload(thread, self._settings.llm.budget)
         self._limiter.acquire()
         self._raise_if_stopping(thread)
-        result = self._classifier.classify(payload)
+        try:
+            result = self._classifier.classify(payload)
+        except UnusableResponseError:
+            # Once more before it counts. A model that returns something
+            # unusable for a thread once may well not do it twice, and a
+            # thread is only ever skipped for failing again.
+            self._limiter.acquire()
+            self._raise_if_stopping(thread)
+            result = self._classifier.classify(payload)
 
         suspicious = payload.injection.suspicious and (self._settings.security.on_suspected_injection != "ignore")
         mutation = plan_mutation(

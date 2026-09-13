@@ -9,7 +9,8 @@ from epc.classify.base import Classification, ClassificationResult, Usage
 from epc.classify.budget import ThreadPayload
 from epc.dispatch.applier import MutationApplier
 from epc.dispatch.sink import DirectSink, JsonlSink, read_mutations
-from epc.errors import ClassificationError, GmailError, HistoryExpiredError
+from epc.errors import ClassificationError, GmailError, RejectedByProviderError, UnusableResponseError
+from epc.gmail.models import ThreadRef
 from epc.pipeline import Pipeline
 from epc.priority import Priority
 from epc.settings import load_settings
@@ -32,38 +33,39 @@ actions:
 
 
 class FakeGmail:
-    """A mailbox that answers the three calls the pipeline makes."""
+    """A mailbox that answers the calls the pipeline makes.
+
+    Writes land on the stored threads. With `exclude_labelled`, listing leaves
+    out threads that carry a priority label, as the real query does, so that
+    consecutive runs see what they would against a real mailbox.
+    """
 
     def __init__(
         self,
         threads: dict[str, Any],
         *,
         unfetchable: set[str] | None = None,
-        history_id: str = "1000",
-        changed: list[str] | None = None,
-        history_expired: bool = False,
+        exclude_labelled: bool = False,
     ) -> None:
         self._threads = threads
         self._unfetchable = unfetchable or set()
-        self._history_id = history_id
-        self._changed = changed
-        self._history_expired = history_expired
+        self._exclude_labelled = exclude_labelled
+        # A thread's historyId moves whenever it changes; tests move it by hand.
+        self.history_ids: dict[str, str] = dict.fromkeys(threads, "100")
         self.queries: list[str] = []
         self.writes: list[dict[str, Any]] = []
-        self.history_calls: list[str] = []
 
-    def mailbox_profile(self) -> tuple[str, str]:
-        return "someone@example.com", self._history_id
+    def mailbox_address(self) -> str:
+        return "someone@example.com"
 
-    def list_changed_thread_ids(self, start_history_id: str, *, label_id: str = "INBOX") -> Any:
-        self.history_calls.append(start_history_id)
-        if self._history_expired:
-            raise HistoryExpiredError("too old")
-        return list(self._changed or []), self._history_id
-
-    def list_thread_ids(self, query: str, *, limit: int) -> Any:
+    def list_threads(self, query: str, *, limit: int) -> Any:
         self.queries.append(query)
-        return list(self._threads)[:limit]
+        refs = [
+            ThreadRef(id=thread_id, history_id=self.history_ids.get(thread_id, "100"))
+            for thread_id in self._threads
+            if not (self._exclude_labelled and self.labels_of(thread_id) & set(LABEL_IDS.values()))
+        ]
+        return refs[:limit]
 
     def get_thread(self, thread_id: str) -> Any:
         if thread_id in self._unfetchable:
@@ -72,6 +74,20 @@ class FakeGmail:
 
     def batch_modify(self, message_ids: Any, *, add_label_ids: Any = (), remove_label_ids: Any = ()) -> None:
         self.writes.append({"ids": list(message_ids), "add": list(add_label_ids), "remove": list(remove_label_ids)})
+        for raw in self._threads.values():
+            for message in raw["messages"]:
+                if message["id"] in message_ids:
+                    labels = set(message.get("labelIds") or []) | set(add_label_ids)
+                    message["labelIds"] = sorted(labels - set(remove_label_ids))
+
+    def labels_of(self, thread_id: str) -> set[str]:
+        return {label for message in self._threads[thread_id]["messages"] for label in message.get("labelIds") or []}
+
+    def remove_label(self, thread_id: str, label_id: str) -> None:
+        """What a person does in Gmail to ask for a thread to be classified again."""
+        for message in self._threads[thread_id]["messages"]:
+            message["labelIds"] = [label for label in message.get("labelIds") or [] if label != label_id]
+        self.history_ids[thread_id] = str(int(self.history_ids.get(thread_id, "100")) + 1)
 
 
 class FakeClassifier:
@@ -407,123 +423,6 @@ def _normalise(writes: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
     return sorted((tuple(sorted(w["ids"])), tuple(w["add"]), tuple(w["remove"])) for w in writes)
 
 
-# --------------------------------------------------------------------------
-# Incremental sync
-# --------------------------------------------------------------------------
-
-
-def test_the_first_run_scans_and_stores_a_checkpoint(settings: Any, tmp_path: Path) -> None:
-    from epc.state import LocalFileStateStore
-
-    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, history_id="5000")
-    store = LocalFileStateStore(tmp_path / "state.json")
-
-    pipeline = Pipeline(
-        settings=settings,
-        client=gmail,  # type: ignore[arg-type]
-        classifier=FakeClassifier(),
-        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
-        priority_label_ids=LABEL_IDS,
-        state_store=store,
-    )
-    summary = pipeline.run()
-
-    assert summary.incremental is False
-    assert gmail.queries, "a full scan was performed"
-    assert store.load().history_id == "5000"
-    assert store.load().mailbox == "someone@example.com"
-
-
-def test_a_later_run_asks_only_what_changed(settings: Any, tmp_path: Path) -> None:
-    """The difference between a scheduled run costing a few calls and a full scan."""
-    from epc.state import LocalFileStateStore, RunState
-
-    store = LocalFileStateStore(tmp_path / "state.json")
-    store.save(RunState(history_id="4000", mailbox="someone@example.com"))
-
-    gmail = FakeGmail(
-        {"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])},
-        history_id="5000",
-        changed=["t2"],
-    )
-    summary = Pipeline(
-        settings=settings,
-        client=gmail,  # type: ignore[arg-type]
-        classifier=FakeClassifier(),
-        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
-        priority_label_ids=LABEL_IDS,
-        state_store=store,
-    ).run()
-
-    assert summary.incremental is True
-    assert gmail.history_calls == ["4000"]
-    assert gmail.queries == []  # no full listing at all
-    assert summary.classified == 1
-    assert store.load().history_id == "5000"
-
-
-def test_an_expired_checkpoint_falls_back_to_a_full_scan(settings: Any, tmp_path: Path) -> None:
-    """Routine after an idle period — Gmail keeps about a week of history."""
-    from epc.state import LocalFileStateStore, RunState
-
-    store = LocalFileStateStore(tmp_path / "state.json")
-    store.save(RunState(history_id="1", mailbox="someone@example.com"))
-
-    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, history_id="9000", history_expired=True)
-    summary = Pipeline(
-        settings=settings,
-        client=gmail,  # type: ignore[arg-type]
-        classifier=FakeClassifier(),
-        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
-        priority_label_ids=LABEL_IDS,
-        state_store=store,
-    ).run()
-
-    assert summary.incremental is False
-    assert summary.classified == 1
-    assert store.load().history_id == "9000"
-
-
-def test_a_checkpoint_from_another_mailbox_is_not_used(settings: Any, tmp_path: Path) -> None:
-    from epc.state import LocalFileStateStore, RunState
-
-    store = LocalFileStateStore(tmp_path / "state.json")
-    store.save(RunState(history_id="4000", mailbox="someone-else@example.com"))
-
-    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, history_id="5000", changed=[])
-    summary = Pipeline(
-        settings=settings,
-        client=gmail,  # type: ignore[arg-type]
-        classifier=FakeClassifier(),
-        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
-        priority_label_ids=LABEL_IDS,
-        state_store=store,
-    ).run()
-
-    assert summary.incremental is False
-    assert gmail.history_calls == []
-
-
-def test_a_partial_failure_leaves_the_checkpoint_alone(settings: Any, tmp_path: Path) -> None:
-    """Otherwise the failed threads are skipped forever."""
-    from epc.state import LocalFileStateStore, RunState
-
-    store = LocalFileStateStore(tmp_path / "state.json")
-    store.save(RunState(history_id="4000", mailbox="someone@example.com"))
-
-    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, history_id="5000", changed=["t1"])
-    Pipeline(
-        settings=settings,
-        client=gmail,  # type: ignore[arg-type]
-        classifier=FakeClassifier(fail_on={"t1"}),
-        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
-        priority_label_ids=LABEL_IDS,
-        state_store=store,
-    ).run()
-
-    assert store.load().history_id == "4000"
-
-
 def test_history_is_recorded_without_the_mail(settings: Any, tmp_path: Path) -> None:
     from epc.report import JsonlHistorySink, read_records
 
@@ -559,10 +458,10 @@ def test_a_stop_request_flushes_what_was_already_decided(settings: Any, tmp_path
     die with the process."""
     import threading
 
-    from epc.state import LocalFileStateStore, RunState
+    from epc.state import LocalFileStateStore
 
     ids = [f"t{i}" for i in range(5)]
-    gmail = FakeGmail({i: thread(i, labels=["INBOX"]) for i in ids}, history_id="5000", changed=ids)
+    gmail = FakeGmail({i: thread(i, labels=["INBOX"]) for i in ids}, exclude_labelled=True)
     stopping = threading.Event()
 
     class StopAfterOne(FakeClassifier):
@@ -572,7 +471,6 @@ def test_a_stop_request_flushes_what_was_already_decided(settings: Any, tmp_path
             return result
 
     store = LocalFileStateStore(tmp_path / "state.json")
-    store.save(RunState(history_id="4000", mailbox="someone@example.com"))
 
     summary = Pipeline(
         settings=settings,
@@ -589,8 +487,10 @@ def test_a_stop_request_flushes_what_was_already_decided(settings: Any, tmp_path
     assert summary.abandoned >= 1
     # What was decided reached Gmail rather than dying with the process.
     assert summary.apply.applied == summary.classified
-    # And the abandoned threads come back: the checkpoint did not move.
-    assert store.load().history_id == "4000"
+    # And the abandoned threads come back: still unlabelled, and not recorded
+    # as failures, the next run lists exactly them.
+    assert store.load().failures == {}
+    assert len(gmail.list_threads("", limit=50)) == summary.abandoned
 
 
 def test_abandoned_threads_are_not_counted_as_failures(settings: Any) -> None:
@@ -610,4 +510,252 @@ def test_abandoned_threads_are_not_counted_as_failures(settings: Any) -> None:
     ).run()
 
     assert summary.classify_failed == 0
-    assert summary.checkpoint_may_advance is False
+    assert not summary.had_failures
+
+
+# --------------------------------------------------------------------------
+# No checkpoint: every run searches, and failures are remembered instead
+# --------------------------------------------------------------------------
+
+
+class ScriptedClassifier(FakeClassifier):
+    """Raises a chosen error for chosen threads, a chosen number of times."""
+
+    def __init__(self, errors: dict[str, Exception], *, times: int | None = None) -> None:
+        super().__init__()
+        self._errors = errors
+        self._remaining = dict.fromkeys(errors, times)
+
+    def classify(self, payload: ThreadPayload) -> ClassificationResult:
+        remaining = self._remaining.get(payload.thread_id)
+        if payload.thread_id in self._errors and remaining != 0:
+            self.seen.append(payload)
+            if remaining is not None:
+                self._remaining[payload.thread_id] = remaining - 1
+            raise self._errors[payload.thread_id]
+        return super().classify(payload)
+
+
+def run_once(
+    settings: Any,
+    gmail: FakeGmail,
+    classifier: Any,
+    store: Any,
+    *,
+    classifier_version: str = "fake/fake-model/abc",
+    dry_run: bool = False,
+    sink: Any = None,
+) -> Any:
+    return Pipeline(
+        settings=settings,
+        client=gmail,  # type: ignore[arg-type]
+        classifier=classifier,
+        sink=sink or DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        state_store=store,
+        classifier_version=classifier_version,
+        dry_run=dry_run,
+    ).run()
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> Any:
+    from epc.state import LocalFileStateStore
+
+    return LocalFileStateStore(tmp_path / "state.json")
+
+
+def refused() -> Exception:
+    return RejectedByProviderError("openai request failed: 400 content policy")
+
+
+def test_every_run_searches_the_configured_query(settings: Any, store: Any) -> None:
+    """The incremental path ignored `gmail.query` and `extra_query` altogether."""
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, exclude_labelled=True)
+    run_once(settings, gmail, FakeClassifier(), store)
+    run_once(settings, gmail, FakeClassifier(), store)
+
+    assert len(gmail.queries) == 2
+    assert all("newer_than:14d" in query and "-label:#/P1" in query for query in gmail.queries)
+
+
+def test_removing_a_label_in_gmail_asks_for_the_thread_again(settings: Any, store: Any) -> None:
+    """How a changed judgement gets applied to old mail: strip the label, and the
+    next run classifies the thread afresh. The checkpoint made this impossible."""
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, exclude_labelled=True)
+    run_once(settings, gmail, FakeClassifier(Priority.P3), store)
+    assert LABEL_IDS[Priority.P3] in gmail.labels_of("t1")
+
+    gmail.remove_label("t1", LABEL_IDS[Priority.P3])
+    summary = run_once(settings, gmail, FakeClassifier(Priority.P1), store)
+
+    assert summary.classified == 1
+    assert LABEL_IDS[Priority.P1] in gmail.labels_of("t1")
+
+
+def test_threads_past_the_limit_are_taken_up_by_the_next_run(settings: Any, store: Any) -> None:
+    """A capped run used to move the checkpoint past the threads it cut off."""
+    limited = settings.model_copy(update={"gmail": settings.gmail.model_copy(update={"max_threads": 2})})
+    gmail = FakeGmail({f"t{i}": thread(f"t{i}", labels=["INBOX"]) for i in range(3)}, exclude_labelled=True)
+
+    first = run_once(limited, gmail, FakeClassifier(), store)
+    second = run_once(limited, gmail, FakeClassifier(), store)
+
+    assert (first.classified, second.classified) == (2, 1)
+    assert all(gmail.labels_of(f"t{i}") & set(LABEL_IDS.values()) for i in range(3))
+
+
+def test_a_dry_run_leaves_the_state_untouched(settings: Any, store: Any, tmp_path: Path) -> None:
+    """A dry run must not change what the next real run does. It used to store a
+    checkpoint, after which everything it had looked at was never seen again."""
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])})
+    run_once(
+        settings,
+        gmail,
+        ScriptedClassifier({"t1": refused()}),
+        store,
+        dry_run=True,
+        sink=JsonlSink(tmp_path / "mutations.jsonl"),
+    )
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_a_thread_refused_on_two_runs_is_then_skipped(settings: Any, store: Any) -> None:
+    gmail = FakeGmail(
+        {"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])},
+        exclude_labelled=True,
+    )
+    classifier = ScriptedClassifier({"t1": refused()})
+
+    first = run_once(settings, gmail, classifier, store)
+    second = run_once(settings, gmail, classifier, store)
+    third = run_once(settings, gmail, classifier, store)
+
+    assert first.had_failures and second.had_failures
+    assert len(classifier.seen) == 3  # t2 once, t1 on the first two runs only
+    assert third.skipped_known_failures == 1
+    assert third.skipped_thread_ids == ["t1"]
+    assert not third.had_failures  # an alarm on the exit code finally stops
+    assert "known failures" in third.render()
+
+
+def test_nothing_is_skipped_while_nothing_succeeds(settings: Any, store: Any) -> None:
+    """Every thread refused the same way is a fault, not a run of bad threads."""
+    gmail = FakeGmail({f"t{i}": thread(f"t{i}", labels=["INBOX"]) for i in range(3)}, exclude_labelled=True)
+    classifier = ScriptedClassifier({f"t{i}": refused() for i in range(3)})
+
+    for _ in range(4):
+        summary = run_once(settings, gmail, classifier, store)
+
+    assert summary.skipped_known_failures == 0
+    assert summary.classify_failed == 3
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ClassificationError("503 service unavailable"), TypeError("a bug")],
+    ids=["transient", "unexpected"],
+)
+def test_failures_that_say_nothing_about_the_thread_are_not_recorded(
+    settings: Any, store: Any, error: Exception
+) -> None:
+    """No outage and no bug can ever cause mail to be skipped."""
+    gmail = FakeGmail(
+        {"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])},
+        exclude_labelled=True,
+    )
+    run_once(settings, gmail, ScriptedClassifier({"t1": error}), store)
+    assert store.load().failures == {}
+
+
+def test_a_thread_the_parser_cannot_read_is_recorded(
+    settings: Any, store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from epc.gmail.mime import parse_thread
+
+    def fragile_parse(raw: Any) -> Any:
+        if raw["id"] == "t1":
+            raise RuntimeError("a shape nobody anticipated")
+        return parse_thread(raw)
+
+    monkeypatch.setattr("epc.pipeline.parse_thread", fragile_parse)
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])})
+    run_once(settings, gmail, FakeClassifier(), store)
+    assert set(store.load().failures) == {"t1"}
+
+
+def test_a_skipped_thread_that_changes_is_tried_again(settings: Any, store: Any) -> None:
+    gmail = FakeGmail(
+        {"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])},
+        exclude_labelled=True,
+    )
+    classifier = ScriptedClassifier({"t1": refused()}, times=2)
+    run_once(settings, gmail, classifier, store)
+    run_once(settings, gmail, classifier, store)
+
+    gmail.history_ids["t1"] = "101"  # a reply arrived, or it was read
+    summary = run_once(settings, gmail, classifier, store)
+
+    assert summary.skipped_known_failures == 0
+    assert summary.classified == 1
+    assert "t1" not in store.load().failures
+
+
+def test_a_new_prompt_or_model_tries_skipped_threads_again(settings: Any, store: Any) -> None:
+    gmail = FakeGmail(
+        {"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])},
+        exclude_labelled=True,
+    )
+    classifier = ScriptedClassifier({"t1": refused()}, times=2)
+    run_once(settings, gmail, classifier, store, classifier_version="openai/model-a/abc")
+    run_once(settings, gmail, classifier, store, classifier_version="openai/model-a/abc")
+
+    summary = run_once(settings, gmail, classifier, store, classifier_version="openai/model-a/def")
+    assert summary.classified == 1
+
+
+def test_skipped_threads_do_not_use_up_the_limit(settings: Any, store: Any) -> None:
+    """A handful of permanently failing threads must not crowd out new mail."""
+    limited = settings.model_copy(update={"gmail": settings.gmail.model_copy(update={"max_threads": 1})})
+    gmail = FakeGmail(
+        {"bad": thread("bad", labels=["INBOX"]), "ok": thread("ok", labels=["INBOX"])},
+        exclude_labelled=True,
+    )
+    classifier = ScriptedClassifier({"bad": refused()})
+    run_once(settings, gmail, classifier, store)  # bad fails, ok succeeds
+    gmail._threads["new"] = thread("new", labels=["INBOX"])
+    run_once(settings, gmail, classifier, store)  # bad fails again, new succeeds
+    gmail._threads["newer"] = thread("newer", labels=["INBOX"])
+    gmail.history_ids["newer"] = "100"
+
+    summary = run_once(limited, gmail, classifier, store)
+    assert summary.skipped_known_failures == 1
+    assert summary.classified == 1
+
+
+def test_an_unusable_answer_is_asked_for_once_more_within_the_run(settings: Any, store: Any) -> None:
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])})
+    classifier = ScriptedClassifier({"t1": UnusableResponseError("not JSON")}, times=1)
+    summary = run_once(settings, gmail, classifier, store)
+
+    assert summary.classified == 1
+    assert summary.classify_failed == 0
+    assert store.load().failures == {}
+
+
+def test_state_that_cannot_be_saved_is_reported(settings: Any) -> None:
+    class ReadOnlyStore:
+        def load(self) -> Any:
+            from epc.state import RunState
+
+            return RunState()
+
+        def save(self, state: Any) -> None:
+            raise PermissionError("ssm:PutParameter denied")
+
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])})
+    summary = run_once(settings, gmail, FakeClassifier(), ReadOnlyStore())
+
+    assert summary.classified == 1
+    assert summary.state_not_saved
+    assert summary.had_failures

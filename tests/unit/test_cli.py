@@ -65,3 +65,62 @@ def test_the_shipped_example_config_is_valid(capsys: pytest.CaptureFixture[str])
     example = Path(__file__).resolve().parents[2] / "config.yml.example"
     assert main(["config", "validate", "--config", str(example)]) == EXIT_OK
     assert "valid" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# epc failures
+# --------------------------------------------------------------------------
+
+
+def config_with_state(tmp_path: Path) -> Path:
+    path = tmp_path / "config.yml"
+    state = tmp_path / "state.json"
+    path.write_text(VALID_CONFIG + f"state:\n  backend: local\n  file: {state}\n", encoding="utf-8")
+    return path
+
+
+def seed_failures(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from epc.state import LocalFileStateStore, RunState
+
+    now = datetime(2026, 9, 1, tzinfo=UTC)
+    state = RunState().after_run(failed={"t1": "1", "t2": "1"}, succeeded={"ok"}, now=now)
+    state = state.after_run(failed={"t1": "1"}, succeeded=set(), now=now)
+    LocalFileStateStore(tmp_path / "state.json").save(state)
+
+
+def test_failures_list_shows_what_is_skipped(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = config_with_state(tmp_path)
+    seed_failures(tmp_path)
+
+    assert main(["failures", "list", "--config", str(config)]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "t1" in out and "skipped" in out
+    assert "t2" in out and "retrying (1/2)" in out
+
+
+def test_failures_list_with_nothing_recorded(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["failures", "list", "--config", str(config_with_state(tmp_path))]) == EXIT_OK
+    assert "No recorded failures" in capsys.readouterr().out
+
+
+def test_failures_clear_forgets_the_named_threads(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from epc.state import LocalFileStateStore
+
+    config = config_with_state(tmp_path)
+    seed_failures(tmp_path)
+
+    assert main(["failures", "clear", "t1", "--config", str(config)]) == EXIT_OK
+    assert set(LocalFileStateStore(tmp_path / "state.json").load().failures) == {"t2"}
+    assert "Forgot 1" in capsys.readouterr().out
+
+
+def test_failures_clear_with_no_ids_forgets_everything(tmp_path: Path) -> None:
+    from epc.state import LocalFileStateStore
+
+    config = config_with_state(tmp_path)
+    seed_failures(tmp_path)
+
+    assert main(["failures", "clear", "--config", str(config)]) == EXIT_OK
+    assert LocalFileStateStore(tmp_path / "state.json").load().failures == {}

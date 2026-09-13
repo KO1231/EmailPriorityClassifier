@@ -9,6 +9,7 @@ from googleapiclient.errors import HttpError
 
 from epc.errors import GmailError
 from epc.gmail.client import DEFAULT_RETRIES, GmailClient
+from epc.gmail.models import ThreadRef
 
 
 class FakeRequest:
@@ -41,15 +42,32 @@ class FakeLabels:
         return self._request
 
 
+class FakeThreads:
+    def __init__(self, request: FakeRequest) -> None:
+        self._request = request
+        self.list_kwargs: dict[str, Any] | None = None
+
+    def list(self, **kwargs: Any) -> FakeRequest:
+        self.list_kwargs = kwargs
+        return self._request
+
+    def list_next(self, _request: Any, _response: Any) -> None:
+        return None
+
+
 class FakeService:
     def __init__(self, request: FakeRequest) -> None:
         self.labels_resource = FakeLabels(request)
+        self.threads_resource = FakeThreads(request)
 
     def users(self) -> FakeService:
         return self
 
     def labels(self) -> FakeLabels:
         return self.labels_resource
+
+    def threads(self) -> FakeThreads:
+        return self.threads_resource
 
 
 @pytest.fixture
@@ -135,3 +153,13 @@ def test_a_failed_creation_names_the_label(make_client: Any) -> None:
     client, _ = make_client(error=http_error(409, "Conflict"))
     with pytest.raises(GmailError, match=r"creating label '#/P1' failed"):
         client.create_label("#/P1")
+
+
+def test_listing_carries_each_threads_history_id(make_client: Any) -> None:
+    """Enough to tell a thread that failed before from one that has changed,
+    without fetching it."""
+    client, service = make_client({"threads": [{"id": "t1", "historyId": "42"}, {"id": "t2"}]})
+    refs = list(client.list_threads("in:inbox", limit=10))
+
+    assert refs == [ThreadRef(id="t1", history_id="42"), ThreadRef(id="t2", history_id="")]
+    assert "historyId" in service.threads_resource.list_kwargs["fields"]

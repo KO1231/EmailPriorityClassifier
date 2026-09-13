@@ -17,6 +17,7 @@ two placeholders; a dependency that can execute arbitrary expressions inside a
 string built partly from untrusted input is not a trade worth making.
 """
 
+import hashlib
 import json
 import secrets
 from pathlib import Path
@@ -142,6 +143,17 @@ class PromptRenderer:
     @property
     def version(self) -> str:
         return self._system.metadata.version
+
+    @property
+    def fingerprint(self) -> str:
+        """A digest of everything this renderer puts in front of the model.
+
+        Unlike `version`, which a person bumps in the prompt's front matter,
+        this changes on any edit — including one to `policy.yml` — and is what
+        tells a failure recorded under the old prompt apart from the new.
+        """
+        material = "\x00".join([self._system.body, self._user.body, self._policy.render()])
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
 
     def render(self, payload: ThreadPayload) -> RenderedPrompt:
         """Build one request.

@@ -33,13 +33,23 @@ class GmailError(EpcError):
 
 
 class ClassificationError(EpcError):
-    """A thread could not be classified. Costs that thread, not the run."""
+    """A thread could not be classified. Costs that thread, not the run.
 
-
-class HistoryExpiredError(GmailError):
-    """The stored `historyId` is older than Gmail's retention window.
-
-    Recoverable rather than fatal: the caller falls back to a full scan and
-    stores a fresh checkpoint. Gmail keeps roughly a week of history, so a tool
-    that has not run for a while lands here as a matter of course.
+    Raised as-is for failures that say nothing about the thread — a timeout,
+    throttling, an outage. The two subclasses below are the failures that do,
+    and only they are remembered between runs.
     """
+
+
+class RejectedByProviderError(ClassificationError):
+    """The provider refused this request as unacceptable (HTTP 400, 413, 422).
+
+    Usually the content: a policy refusal, an input too long for the model. A
+    misconfiguration produces the same statuses for *every* thread, which is why
+    being refused is never enough on its own to skip a thread — see
+    :mod:`epc.state`.
+    """
+
+
+class UnusableResponseError(ClassificationError):
+    """The model answered, but not with a usable decision."""

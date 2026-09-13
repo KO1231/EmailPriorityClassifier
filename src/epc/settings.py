@@ -77,13 +77,11 @@ class GmailSettings(_Section):
     """What to fetch."""
 
     query: str = "in:inbox"
-    # Appended to `query`. `newer_than:14d -in:chats` is the single largest cost
-    # lever available: it stops a run re-reading the whole inbox every time.
+    # Appended to `query`. Mind what a time limit such as `newer_than:14d` costs:
+    # every run already excludes labelled threads, so it saves little, and it
+    # stops anything older being re-classified when its label is removed.
     extra_query: str = ""
     max_threads: int = Field(default=1500, gt=0)
-    # Use the History API from a stored checkpoint when one exists, falling back
-    # to a full scan when Gmail has expired it.
-    incremental: bool = True
 
 
 class BudgetSettings(_Section):
@@ -226,13 +224,16 @@ class ObservabilitySettings(_Section):
 
 
 class StateSettings(_Section):
-    """Where the checkpoint between runs is kept. Holds no secret."""
+    """Where run state — the record of threads that keep failing — is kept.
+
+    Holds thread IDs, never content, and no secret.
+    """
 
     backend: StateBackend = "local"
-    # backend: local — the file holding the Gmail historyId.
+    # backend: local
     file: Path = Path(".state/run.json")
-    # backend: ssm — the parameter name. A plain String: a historyId is an
-    # opaque counter, and encrypting it would add a kms:Decrypt for nothing.
+    # backend: ssm — the parameter name. A plain String: thread IDs are not
+    # secrets, and encrypting them would add a kms:Decrypt for nothing.
     parameter_name: str | None = None
     # backend: s3
     bucket: str | None = None

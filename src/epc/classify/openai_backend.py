@@ -193,7 +193,15 @@ class LocalClassifier(_OpenAICompatibleClassifier):
             return self._request(rendered, {"type": "json_object"})
 
 
-def _as_classification_error(backend: str, exc: APIError) -> Exception:
-    from epc.errors import ClassificationError
+# Statuses that describe the request rather than the service. Everything else —
+# 401/403 credentials, 404 an unknown model, 408/429/5xx transient — says
+# nothing about the thread and must not be remembered against it.
+_REJECTED_STATUSES = frozenset({400, 413, 422})
 
-    return ClassificationError(f"{backend} request failed: {exc}")
+
+def _as_classification_error(backend: str, exc: APIError) -> Exception:
+    from epc.errors import ClassificationError, RejectedByProviderError
+
+    status = getattr(exc, "status_code", None)
+    kind = RejectedByProviderError if status in _REJECTED_STATUSES else ClassificationError
+    return kind(f"{backend} request failed: {exc}")

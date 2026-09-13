@@ -18,7 +18,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, Field, field_validator
 
 from epc.classify.budget import ThreadPayload
-from epc.errors import ClassificationError
+from epc.errors import UnusableResponseError
 from epc.priority import Priority
 
 # The model's output is untrusted text. These bound what a hostile response can
@@ -116,7 +116,7 @@ def parse_classification(text: str) -> Classification:
     the security boundary, the fence is not.
     """
     if not text or not text.strip():
-        raise ClassificationError("the model returned an empty response")
+        raise UnusableResponseError("the model returned an empty response")
 
     candidate = _FENCE_RE.sub("", text.strip())
     try:
@@ -127,13 +127,13 @@ def parse_classification(text: str) -> Classification:
         data = _extract_first_object(candidate)
 
     if not isinstance(data, dict):
-        raise ClassificationError("the model response was not a JSON object")
+        raise UnusableResponseError("the model response was not a JSON object")
 
     raw_priority = str(data.get("priority", "")).strip().upper()
     if raw_priority not in Priority.__members__:
         # Never coerce. A response that did not name a priority did not make a
         # decision, and inventing one here would hide a broken prompt.
-        raise ClassificationError(f"response did not contain a valid priority: {raw_priority[:20]!r}")
+        raise UnusableResponseError(f"response did not contain a valid priority: {raw_priority[:20]!r}")
 
     # Every optional field is read defensively. The schema asks for a list of
     # strings; a model that answers `"signals": 5` has still decided a
@@ -151,7 +151,7 @@ def parse_classification(text: str) -> Classification:
     except ValueError as exc:
         # pydantic's ValidationError is a ValueError. Its message quotes the
         # input, which is model output, so it is not passed on.
-        raise ClassificationError("the model response did not validate") from exc
+        raise UnusableResponseError("the model response did not validate") from exc
 
 
 def _extract_first_object(text: str) -> object:
@@ -159,11 +159,11 @@ def _extract_first_object(text: str) -> object:
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end <= start:
-        raise ClassificationError("no JSON object found in the model response")
+        raise UnusableResponseError("no JSON object found in the model response")
     try:
         return json.loads(text[start : end + 1])
     except ValueError as exc:
-        raise ClassificationError(f"the model response was not valid JSON: {exc}") from exc
+        raise UnusableResponseError(f"the model response was not valid JSON: {exc}") from exc
 
 
 def _as_float(value: object, *, default: float) -> float:

@@ -24,6 +24,7 @@ uv run epc login                # OAuth, once
 uv run epc prompt render        # the exact prompt a thread produces
 uv run epc run --dry-run        # plan everything, write nothing
 uv run epc apply log/mutations.jsonl
+uv run epc failures list        # threads skipped for failing repeatedly
 ```
 
 `.env` is not read by the application — there is no `python-dotenv`. Use
@@ -58,8 +59,8 @@ Both are covered by tests. Breaking either should fail the suite, not a mailbox.
 ```
 epc run
  ├ resolve labels          gmail/labels.py    names → IDs, at startup, fails loud
- ├ list threads            gmail/query.py     quoted label exclusions
- │   or history.list       gmail/client.py    incremental, from a stored historyId
+ ├ list threads            gmail/query.py     quoted label exclusions, every run
+ │   less known failures   state.py           threads that keep failing on their own
  ├ fetch + parse           gmail/mime.py      ★ recursive MIME walk, charsets, headers
  ├ budget + sanitise       classify/budget.py ★ the only route to a prompt
  ├ classify                classify/*         openai | bedrock | local
@@ -124,12 +125,28 @@ writes during a dry run.
 `SIGKILL` thirty seconds later. `shutdown.py` sets a flag; the pipeline stops beginning
 new classifications, lets running ones finish, flushes the sink, and reports
 `interrupted`. Classifications already paid for must not die with the process.
-Abandoned threads are counted separately from failures — nothing went wrong — but they
-do hold the checkpoint back, so they come round again.
+Abandoned threads are counted separately from failures — nothing went wrong — and still
+have no label, so they come round again.
 
-**The checkpoint only advances on a clean run.** After a partial failure the next run
-re-lists the same window; threads that did succeed are excluded by their labels, so the
-repeat is free.
+**There is no checkpoint, deliberately.** Every run searches the configured query, which
+excludes labelled threads, so it returns exactly what still needs a label and costs a page
+or two. A History API checkpoint was tried and removed. It could not honour `gmail.query`.
+It moved past threads a capped run cut off, and a dry run advanced it too. Worst, it broke
+the way the user re-classifies mail after changing their criteria: removing a label from
+old threads in Gmail. That has to keep working, which rules out time windows
+(`newer_than:`) as well. One cost remains: labels sit on messages, and a reply arriving
+in a labelled thread does not inherit them, so Gmail's message-level search lists that
+thread again and `_hydrate` fetches it only to skip it — on every run.
+
+**Failures are remembered only when the thread caused them.** `state.py` records parse
+failures, `RejectedByProviderError` (HTTP 400/413/422, Bedrock `ValidationException`) and
+`UnusableResponseError` (asked twice within the run). Throttling, outages, credentials and
+bugs are never recorded, so no incident can make mail be skipped. A thread is skipped
+after two failed runs, *and only if something else classified successfully since it
+first failed* — a misconfiguration that refuses every request looks thread-specific one
+thread at a time. A record is dropped when the thread's `historyId` moves, when backend,
+model or the prompt fingerprint changes, or after 30 days. Labels are not used for this:
+the user does not want the tool writing bookkeeping into their mailbox.
 
 ---
 

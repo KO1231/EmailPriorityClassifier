@@ -3,8 +3,9 @@
 from pathlib import Path
 from typing import Any, cast
 
+import httpx2
 import pytest
-from openai import APIError
+from openai import APIError, APIStatusError
 
 from epc.classify.base import Classifier
 from epc.classify.bedrock_backend import TOOL_NAME, BedrockClassifier
@@ -12,7 +13,7 @@ from epc.classify.budget import build_payload
 from epc.classify.factory import build_classifier
 from epc.classify.openai_backend import LocalClassifier, OpenAIClassifier
 from epc.classify.prompt import PromptRenderer
-from epc.errors import ClassificationError, ConfigError
+from epc.errors import ClassificationError, ConfigError, RejectedByProviderError, UnusableResponseError
 from epc.gmail.mime import parse_thread
 from epc.priority import Priority
 from epc.settings import BudgetSettings, load_settings
@@ -266,6 +267,52 @@ def test_a_non_toolchoice_error_is_not_retried(renderer: PromptRenderer, payload
     with pytest.raises(ClassificationError, match="bedrock request failed"):
         BedrockClassifier(model="any.model", renderer=renderer, client=cast(Any, client)).classify(payload)
     assert len(client.calls) == 1
+
+
+# --------------------------------------------------------------------------
+# What a failure says about the thread
+# --------------------------------------------------------------------------
+
+
+def status_error(status: int) -> APIStatusError:
+    response = httpx2.Response(status, request=httpx2.Request("POST", "https://api.example.invalid/v1/responses"))
+    return APIStatusError(f"HTTP {status}", response=response, body=None)
+
+
+@pytest.mark.parametrize("status", [400, 413, 422])
+def test_a_refused_request_is_named_as_such(renderer: PromptRenderer, payload: Any, status: int) -> None:
+    client = FakeResponses(error=status_error(status))
+    with pytest.raises(RejectedByProviderError):
+        OpenAIClassifier(model="gpt-test", renderer=renderer, client=cast(Any, client)).classify(payload)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 408, 429, 500, 503])
+def test_other_statuses_say_nothing_about_the_thread(renderer: PromptRenderer, payload: Any, status: int) -> None:
+    """Credentials, an unknown model, throttling, an outage: never remembered
+    against a thread, so never a reason to skip one."""
+    client = FakeResponses(error=status_error(status))
+    with pytest.raises(ClassificationError) as caught:
+        OpenAIClassifier(model="gpt-test", renderer=renderer, client=cast(Any, client)).classify(payload)
+    assert type(caught.value) is ClassificationError
+
+
+def test_an_unparseable_answer_is_named_as_such(renderer: PromptRenderer, payload: Any) -> None:
+    client = FakeResponses(content="I think this one is urgent.")
+    with pytest.raises(UnusableResponseError):
+        OpenAIClassifier(model="gpt-test", renderer=renderer, client=cast(Any, client)).classify(payload)
+
+
+def test_a_bedrock_validation_error_is_a_refusal(renderer: PromptRenderer, payload: Any) -> None:
+    client = FakeBedrock(Exception("ValidationException: Input is too long for requested model."))
+    with pytest.raises(RejectedByProviderError):
+        BedrockClassifier(model="any.model", renderer=renderer, client=cast(Any, client)).classify(payload)
+
+
+def test_bedrock_throttling_says_nothing_about_the_thread(renderer: PromptRenderer, payload: Any) -> None:
+    client = FakeBedrock(Exception("ThrottlingException: Rate exceeded"))
+    with pytest.raises(ClassificationError) as caught:
+        BedrockClassifier(model="any.model", renderer=renderer, client=cast(Any, client)).classify(payload)
+    assert type(caught.value) is ClassificationError
 
 
 # --------------------------------------------------------------------------

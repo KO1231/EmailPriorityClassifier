@@ -30,8 +30,9 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from epc.errors import GmailError, HistoryExpiredError
+from epc.errors import GmailError
 from epc.gmail.labels import GmailLabel, parse_labels
+from epc.gmail.models import ThreadRef
 
 DEFAULT_RETRIES = 5
 # `messages.batchModify` accepts up to 1000 IDs per call. The previous
@@ -40,9 +41,6 @@ DEFAULT_RETRIES = 5
 BATCH_MODIFY_LIMIT = 1000
 # `threads.list` caps a page at 500.
 THREAD_PAGE_LIMIT = 500
-# Only new mail is of interest. A label changing on an existing thread is
-# usually this tool's own work, and re-reading it would be a loop.
-HISTORY_TYPES = ("messageAdded",)
 
 # What the transport raises once `execute`'s own retries are spent. `OSError`
 # covers sockets, timeouts and TLS; the other two are the HTTP library's and
@@ -95,11 +93,12 @@ class GmailClient:
             type=str(response.get("type") or "user"),
         )
 
-    def list_thread_ids(self, query: str, *, limit: int) -> Iterator[str]:
-        """Thread IDs matching `query`, newest first, up to `limit`.
+    def list_threads(self, query: str, *, limit: int) -> Iterator[ThreadRef]:
+        """Threads matching `query`, newest first, up to `limit`.
 
-        Only IDs are requested. Fetching full threads during listing would pay
-        for every thread on the page, including the ones `limit` cuts off.
+        Only IDs and history IDs are requested. Fetching full threads during
+        listing would pay for every thread on the page, including the ones
+        `limit` cuts off.
         """
         request: Any | None = (
             self._service.users()
@@ -107,7 +106,7 @@ class GmailClient:
             .list(
                 userId="me",
                 q=query,
-                fields="threads(id),nextPageToken",
+                fields="threads(id,historyId),nextPageToken",
                 includeSpamTrash=False,
                 maxResults=min(THREAD_PAGE_LIMIT, limit),
             )
@@ -118,7 +117,7 @@ class GmailClient:
             for thread in response.get("threads") or []:
                 identifier = str(thread.get("id") or "")
                 if identifier:
-                    yield identifier
+                    yield ThreadRef(id=identifier, history_id=str(thread.get("historyId") or ""))
                     yielded += 1
                     if yielded >= limit:
                         return
@@ -173,56 +172,10 @@ class GmailClient:
             operation=f"modifying labels on {len(message_ids)} messages",
         )
 
-    def mailbox_profile(self) -> tuple[str, str]:
-        """The address and the mailbox's current `historyId`."""
+    def mailbox_address(self) -> str:
+        """The address of the authenticated mailbox."""
         response = self._execute(
-            self._service.users().getProfile(userId="me"),
+            self._service.users().getProfile(userId="me", fields="emailAddress"),
             operation="reading the mailbox profile",
         )
-        return str(response.get("emailAddress") or ""), str(response.get("historyId") or "")
-
-    def list_changed_thread_ids(self, start_history_id: str, *, label_id: str = "INBOX") -> tuple[list[str], str]:
-        """Threads that gained a message since `start_history_id`.
-
-        Returns the thread IDs and the checkpoint to store next. This is the
-        difference between a scheduled run costing a handful of API calls and
-        it re-listing the whole inbox every time.
-
-        Raises:
-            HistoryExpiredError: the checkpoint is older than Gmail keeps,
-                which is routine after an idle period. Fall back to a full scan.
-        """
-        thread_ids: dict[str, None] = {}
-        latest = start_history_id
-
-        request: Any | None = (
-            self._service.users()
-            .history()
-            .list(
-                userId="me",
-                startHistoryId=start_history_id,
-                historyTypes=list(HISTORY_TYPES),
-                labelId=label_id,
-            )
-        )
-        while request is not None:
-            try:
-                response = request.execute(num_retries=self._num_retries)
-            except HttpError as exc:
-                if exc.resp.status == 404:
-                    raise HistoryExpiredError(f"history since {start_history_id} is no longer available") from exc
-                raise GmailError(f"listing history failed: {exc}") from exc
-            except _TRANSPORT_ERRORS as exc:
-                raise GmailError(f"listing history failed: {type(exc).__name__}: {exc}") from exc
-
-            latest = str(response.get("historyId") or latest)
-            for entry in response.get("history") or []:
-                for added in entry.get("messagesAdded") or []:
-                    message = added.get("message") or {}
-                    identifier = str(message.get("threadId") or "")
-                    if identifier:
-                        thread_ids[identifier] = None
-
-            request = self._service.users().history().list_next(request, response)
-
-        return list(thread_ids), latest
+        return str(response.get("emailAddress") or "")

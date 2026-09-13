@@ -75,6 +75,9 @@ class EmailMessage(BaseModel):
     # found at all (an attachment-only message, say).
     body_mime_type: str | None = None
     attachments: list[Attachment] = Field(default_factory=list)
+    # Elements an inline style hid from the reader, dropped during extraction.
+    # Recorded because "this message contained text nobody sees" is a signal.
+    hidden_elements_removed: int = 0
 
     @property
     def recipient_count(self) -> int:

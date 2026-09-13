@@ -36,20 +36,33 @@ Landed so far:
   are incompatible. The legacy file keeps working for the legacy tool; `epc` detects the old
   schema and says so rather than emitting a wall of unknown-key errors. Pass `--config` to point
   the new tool at a new-schema file until the legacy tree is removed.
+- **Untrusted-content handling** — `epc.security.sanitize` (NFKC, zero-width and bidi stripping,
+  control characters, `data:` URIs, long binary runs, length caps) and `epc.security.detect`
+  (narrow, high-precision heuristics that produce a signal and never a decision). Text hidden by
+  CSS is dropped during HTML extraction instead, because that is a question of what is *visible*;
+  the count is carried on `EmailMessage.hidden_elements_removed` so the detector can use it.
+  `tests/injection/` is the adversarial corpus.
 
 ### Carried forward — obligations deferred out of a completed phase
 
 Deliberate omissions, recorded so they are not mistaken for oversights later.
 Nothing is removed from this list until the work is actually in the tree.
 
-| Owed | Deferred from | Where it must land | Why it was deferred |
-|---|---|---|---|
-| **Untrusted-content neutralisation** — NFKC, zero-width and bidi-override stripping, HTML comments, text hidden by `display:none` / `font-size:0` / foreground≈background, `data:` URIs and long base64 blobs, per-field and total length caps | MIME core | `epc/security/sanitize.py`, applied between `mime.parse_*` and prompt assembly | `mime.py` extracts faithfully; making content *safe* is a separate concern with a separate threat model. Mixing the two would leave neither testable on its own. |
-| Injection-detection signal (`suspicious_injection`) | MIME core | `epc/security/detect.py` | Needs the sanitiser it sits behind. |
+| Owed | Deferred from | Status |
+|---|---|---|
+| Untrusted-content neutralisation | MIME core | **Delivered.** `epc.security.sanitize` |
+| Injection-detection signal | MIME core | **Delivered.** `epc.security.detect` |
 
-`epc.gmail.mime` output is therefore **not yet safe to put in a prompt.** The
-classifier must not be wired to it until `sanitize` exists — the adversarial
-corpus under `tests/injection/` is the gate on that.
+One obligation remains open, and it is the reason the list stays:
+
+> **`epc.gmail.mime` output must not reach a prompt directly.** Everything that
+> goes to a model passes through `sanitise()` first, and carries the resulting
+> `InjectionSignal`. `tests/injection/` holds the invariant — for every known
+> attack, the payload is either removed or flagged, never present and silent —
+> and it is the gate on the classifier. A backend that reads `message.body`
+> without sanitising it is a bug that suite must be extended to catch.
+
+---
 
 ---
 

@@ -59,7 +59,7 @@ def test_script_style_and_comments_do_not_reach_the_body(leaked: str) -> None:
 
 
 def test_html_to_text_handles_an_empty_document() -> None:
-    assert html_to_text("") == ""
+    assert html_to_text("") == ("", 0)
 
 
 # --------------------------------------------------------------------------

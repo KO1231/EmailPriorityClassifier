@@ -29,6 +29,7 @@ from email.utils import getaddresses, parseaddr
 from typing import Any
 
 from bs4 import BeautifulSoup, Comment
+from pydantic import BaseModel
 
 from epc.gmail.models import Attachment, AuthenticationResults, EmailMessage, EmailThread
 
@@ -41,6 +42,19 @@ _TEXT_PREFERENCE = ("text/plain", "text/html")
 # Markup whose text content is never shown to a reader. `get_text()` keeps the
 # contents of these, so they have to be removed explicitly.
 _NON_VISIBLE_TAGS = ("script", "style", "head", "noscript", "template", "title")
+
+# Inline styles that hide an element from a reader while leaving its text in the
+# document. Marketing preheaders use the same trick, which is precisely why an
+# attacker can too: text nobody sees is text nobody proofreads.
+_HIDDEN_STYLE_RE = re.compile(
+    r"display\s*:\s*none"
+    r"|visibility\s*:\s*hidden"
+    r"|font-size\s*:\s*0(?:\.0+)?(?:px|pt|em|rem|%)?(?![\d.])"
+    r"|opacity\s*:\s*0(?:\.0+)?(?![\d.])"
+    r"|(?:max-)?height\s*:\s*0(?:\.0+)?(?:px|pt|em|rem|%)?(?![\d.])"
+    r"|text-indent\s*:\s*-\d{3,}",
+    re.IGNORECASE,
+)
 
 _CHARSET_RE = re.compile(r'charset\s*=\s*["\']?([\w\-.:+]+)', re.IGNORECASE)
 _AUTH_RESULT_RE = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*(\w+)", re.IGNORECASE)
@@ -118,14 +132,48 @@ def decode_body_data(data: str, charset: str) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
-def html_to_text(html: str) -> str:
-    """Visible text of an HTML document."""
+class ExtractedBody(BaseModel):
+    """The body text, where it came from, and what had to be dropped to get it."""
+
+    text: str = ""
+    mime_type: str | None = None
+    # Elements an inline style hid from the reader. Marketing preheaders use the
+    # same trick, so on its own this means little — but combined with content
+    # that addresses the model it is the commonest real attack there is.
+    hidden_elements_removed: int = 0
+
+
+def html_to_text(html: str) -> tuple[str, int]:
+    """The *visible* text of an HTML document.
+
+    Three kinds of content are dropped, all on the same grounds — a reader never
+    sees them, so they are not what the message says:
+
+    * markup whose text content is never rendered (`script`, `style`, `head`);
+    * HTML comments, a favourite hiding place for instructions;
+    * elements hidden by an inline style, `display:none` and friends.
+
+    That last one is a prompt-injection vector rather than a formatting quirk,
+    but it is handled here rather than in :mod:`epc.security.sanitize` because
+    deciding it needs the DOM, and by the time sanitisation runs the markup is
+    gone. The rule stays clean: this function returns what a person would read.
+    """
     soup = BeautifulSoup(html, "lxml")
+
     for tag in soup(_NON_VISIBLE_TAGS):
         tag.decompose()
     for comment in soup.find_all(string=lambda node: isinstance(node, Comment)):
         comment.extract()
-    return soup.get_text(separator="\n")
+
+    hidden_count = 0
+    for hidden in soup.find_all(None, attrs={"hidden": True}):
+        hidden.decompose()
+        hidden_count += 1
+    for styled in soup.find_all(style=_HIDDEN_STYLE_RE):
+        styled.decompose()
+        hidden_count += 1
+
+    return soup.get_text(separator="\n"), hidden_count
 
 
 def normalise_text(text: str) -> str:
@@ -151,10 +199,11 @@ def _is_attachment(part: GmailPayload, headers: dict[str, str]) -> bool:
     return headers.get("content-disposition", "").strip().lower().startswith("attachment")
 
 
-def extract_body(payload: GmailPayload) -> tuple[str, str | None]:
+def extract_body(payload: GmailPayload) -> ExtractedBody:
     """Best available body text, and the MIME type it came from.
 
-    Returns ``("", None)`` when the message carries no text part at all.
+    Returns an empty :class:`ExtractedBody` when the message carries no text
+    part at all.
     """
     candidates: dict[str, list[tuple[str, str]]] = {mime: [] for mime in _TEXT_PREFERENCE}
 
@@ -173,13 +222,14 @@ def extract_body(payload: GmailPayload) -> tuple[str, str | None]:
     for mime_type in _TEXT_PREFERENCE:
         for data, charset in candidates[mime_type]:
             decoded = decode_body_data(data, charset)
+            hidden = 0
             if mime_type == "text/html":
-                decoded = html_to_text(decoded)
+                decoded, hidden = html_to_text(decoded)
             text = normalise_text(decoded)
             if text:
-                return text, mime_type
+                return ExtractedBody(text=text, mime_type=mime_type, hidden_elements_removed=hidden)
 
-    return "", None
+    return ExtractedBody()
 
 
 def extract_attachments(payload: GmailPayload) -> list[Attachment]:
@@ -229,7 +279,7 @@ def parse_message(raw: GmailPayload) -> EmailMessage:
     """Parse one `users.messages` resource fetched with `format=full`."""
     payload: GmailPayload = raw.get("payload") or {}
     headers = header_map(payload)
-    body, body_mime_type = extract_body(payload)
+    extracted = extract_body(payload)
 
     sender_name, sender = parseaddr(headers.get("from", ""))
     sender = sender.lower()
@@ -253,8 +303,9 @@ def parse_message(raw: GmailPayload) -> EmailMessage:
         auto_submitted=headers.get("auto-submitted"),
         precedence=headers.get("precedence"),
         authentication=parse_authentication_results(headers.get("authentication-results", "")),
-        body=body,
-        body_mime_type=body_mime_type,
+        body=extracted.text,
+        body_mime_type=extracted.mime_type,
+        hidden_elements_removed=extracted.hidden_elements_removed,
         attachments=extract_attachments(payload),
     )
 

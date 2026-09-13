@@ -31,6 +31,8 @@ from pydantic_settings import (
     YamlConfigSettingsSource,
 )
 
+from epc.actions.rules import ActionRule
+from epc.gmail.models import NON_PRIMARY_CATEGORIES
 from epc.priority import Priority
 
 DEFAULT_CONFIG_FILENAME = "config.yml"
@@ -38,6 +40,7 @@ DEFAULT_CONFIG_FILENAME = "config.yml"
 StateBackend = Literal["local", "ssm", "s3"]
 CredentialsBackend = Literal["local", "ssm", "secrets_manager", "service_account"]
 LlmBackend = Literal["openai", "bedrock", "local"]
+SinkKind = Literal["direct", "jsonl"]
 InjectionResponse = Literal["ignore", "flag", "downgrade_and_flag"]
 
 
@@ -120,6 +123,43 @@ class LlmSettings(_Section):
         return self
 
 
+class ActionsSettings(_Section):
+    """What happens to a thread once its priority is known.
+
+    Rules live here rather than in the prompt because this is the half of the
+    decision that must not be negotiable. A mail that talks its way to P1 still
+    cannot talk its way into being starred.
+    """
+
+    rules: list[ActionRule] = Field(default_factory=list)
+
+    # Which Gmail tabs `move_to_primary` will leave. Removing a non-primary
+    # category is what moves a thread; Gmail treats their absence as Primary.
+    move_targets: list[str] = Field(
+        default_factory=lambda: sorted(NON_PRIMARY_CATEGORIES),
+    )
+
+    # Verbs that take a thread out of the inbox. Off unless asked for.
+    allow_destructive: bool = False
+
+    @model_validator(mode="after")
+    def _move_targets_must_be_category_labels(self) -> Self:
+        unknown = sorted(set(self.move_targets) - NON_PRIMARY_CATEGORIES)
+        if unknown:
+            raise ValueError(f"actions.move_targets may only name non-primary Gmail categories; got {unknown}")
+        return self
+
+
+class DispatchSettings(_Section):
+    """Where planned mutations go."""
+
+    sink: SinkKind = "direct"
+    jsonl_path: Path = Path("log/mutations.jsonl")
+    # Threads buffered before a write. `batchModify` takes 1000 message IDs per
+    # call, so buffering is what turns 1500 round trips into two.
+    batch_size: int = Field(default=1000, gt=0, le=1000)
+
+
 class SecuritySettings(_Section):
     # What to do with a thread whose content trips the injection heuristics.
     # `downgrade_and_flag` records the signal and withholds the high-privilege
@@ -173,6 +213,8 @@ class Settings(BaseSettings):
     gmail: GmailSettings = Field(default_factory=GmailSettings)
     credentials: CredentialsSettings = Field(default_factory=CredentialsSettings)
     llm: LlmSettings = Field(default_factory=LlmSettings)
+    actions: ActionsSettings = Field(default_factory=ActionsSettings)
+    dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     run: RunSettings = Field(default_factory=RunSettings)
 

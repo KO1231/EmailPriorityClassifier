@@ -55,6 +55,30 @@ llm:
     thread_tokens: 4000
     message_chars: 2000
 
+# What happens to a thread once its priority is known. These rules live here
+# rather than in the prompt because this is the half of the decision that must
+# not be negotiable: a mail that talks its way to P1 still cannot talk its way
+# into being starred. The first matching rule wins.
+actions:
+  rules:
+    - when: { priority: P1 }
+      unless: { any_label: [SPAM, TRASH] } # a P1 verdict on filtered mail stays quiet
+      do: [add_star, move_to_primary, mark_important]
+    - when: { priority: P2 }
+      do: [move_to_primary]
+  # Which tabs move_to_primary will leave. Gmail treats the absence of a
+  # category label as Primary, so moving a thread means removing one.
+  move_targets: [CATEGORY_PROMOTIONS, CATEGORY_SOCIAL, CATEGORY_UPDATES, CATEGORY_FORUMS]
+  # Verbs that take a thread out of the inbox (archive). Off unless asked for.
+  allow_destructive: false
+
+dispatch:
+  sink: direct # direct | jsonl
+  jsonl_path: log/mutations.jsonl
+  # Threads buffered before a write. batchModify takes 1000 message IDs per
+  # call, which is what turns 1500 round trips into two.
+  batch_size: 1000
+
 security:
   # What to do with a thread whose content trips the injection heuristics.
   # downgrade_and_flag records the signal and withholds the high-privilege

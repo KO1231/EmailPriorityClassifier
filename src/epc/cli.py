@@ -14,7 +14,11 @@ Subcommands land alongside the code they drive. Present so far:
     Print the exact prompt a thread would produce, personal policy included.
     The only way to review what is actually sent before sending it.
 
-``run`` and ``apply`` arrive with the pipeline and the mutation sinks.
+``epc run``
+    List, classify and dispatch. ``--dry-run`` writes the planned changes to a
+    file instead of applying them; that file can then be replayed.
+``epc apply``
+    Apply a file of planned changes — exactly what was reviewed, nothing else.
 """
 
 import argparse
@@ -22,6 +26,7 @@ import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
@@ -29,8 +34,17 @@ from epc import __version__
 from epc.errors import EpcError
 from epc.settings import DEFAULT_CONFIG_FILENAME, Settings, load_settings
 
+if TYPE_CHECKING:  # pragma: no cover
+    from epc.gmail.client import GmailClient
+
 EXIT_OK = 0
 EXIT_FATAL = 1
+# Some threads were lost but the run completed. Distinct from a fatal error so a
+# scheduler can tell "nothing happened" from "most of it happened".
+EXIT_PARTIAL = 2
+# Some threads were lost but the run completed. Distinct from a fatal error so
+# a scheduler can tell "nothing happened" from "most of it happened".
+EXIT_PARTIAL = 2
 
 
 def _add_config_option(parser: argparse.ArgumentParser) -> None:
@@ -62,6 +76,20 @@ def build_parser() -> argparse.ArgumentParser:
     login = subcommands.add_parser("login", help="authorise this tool against a Gmail account")
     _add_config_option(login)
 
+    run = subcommands.add_parser("run", help="classify and label threads")
+    _add_config_option(run)
+    _add_prompt_options(run)
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="write planned changes to a file instead of applying them",
+    )
+    run.add_argument("--limit", type=int, metavar="N", help="classify at most N threads (overrides the config)")
+
+    apply_command = subcommands.add_parser("apply", help="apply a file of planned changes")
+    _add_config_option(apply_command)
+    apply_command.add_argument("file", type=Path, help="a JSONL file written by --dry-run")
+
     prompt = subcommands.add_parser("prompt", help="inspect the prompts")
     prompt_actions = prompt.add_subparsers(dest="prompt_command", required=True)
     render = prompt_actions.add_parser("render", help="print the prompt a thread would produce")
@@ -76,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--policy", type=Path, default=Path("policy.yml"), metavar="PATH", help="personal policy")
 
     return parser
+
+
+def _add_prompt_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--prompts", type=Path, default=Path("prompts"), metavar="DIR", help="prompt directory")
+    parser.add_argument("--policy", type=Path, default=Path("policy.yml"), metavar="PATH", help="personal policy")
 
 
 # Keys that only ever appeared in the previous config schema.
@@ -216,11 +249,88 @@ def cmd_prompt_render(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _gmail_client(settings: Settings) -> GmailClient:
+    from epc.gmail.auth import LocalFileCredentialStore, get_credentials
+    from epc.gmail.client import GmailClient
+
+    store = LocalFileCredentialStore(settings.credentials.token_file)
+    return GmailClient(get_credentials(store))
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    from epc.classify.factory import build_classifier
+    from epc.classify.prompt import PromptRenderer
+    from epc.dispatch.applier import MutationApplier
+    from epc.dispatch.sink import DirectSink, JsonlSink, MutationSink
+    from epc.gmail.labels import resolve_priority_labels
+    from epc.pipeline import Pipeline
+
+    settings = _load(args.config)
+    if args.limit is not None:
+        settings = load_settings(args.config, gmail={"max_threads": args.limit})
+
+    client = _gmail_client(settings)
+    # Before a single thread is fetched: a configured label that does not exist
+    # is a configuration error, not a surprise 1500 threads later.
+    priority_label_ids = resolve_priority_labels(client.list_labels(), settings.labels.by_priority)
+
+    renderer = PromptRenderer.load(args.prompts, args.policy)
+    classifier = build_classifier(settings, renderer)
+
+    dry_run = args.dry_run or settings.run.dry_run
+    sink: MutationSink
+    if dry_run or settings.dispatch.sink == "jsonl":
+        sink = JsonlSink(settings.dispatch.jsonl_path)
+        print(f"Dry run - planned changes go to {settings.dispatch.jsonl_path}, nothing is applied.")
+    else:
+        sink = DirectSink(MutationApplier(client), batch_size=settings.dispatch.batch_size)
+
+    pipeline = Pipeline(
+        settings=settings,
+        client=client,
+        classifier=classifier,
+        sink=sink,
+        priority_label_ids=priority_label_ids,
+    )
+    print(f"Query: {pipeline.search_query()}")
+    summary = pipeline.run()
+    print()
+    print(summary.render())
+
+    if dry_run:
+        print(f"\nReplay with:  epc apply {settings.dispatch.jsonl_path}")
+    return EXIT_PARTIAL if summary.had_failures else EXIT_OK
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    from epc.dispatch.applier import MutationApplier
+    from epc.dispatch.sink import read_mutations
+
+    settings = _load(args.config)
+    if not args.file.is_file():
+        raise EpcError(f"file not found: {args.file}")
+
+    mutations = list(read_mutations(args.file))
+    print(f"Applying {len(mutations)} planned change(s) from {args.file}")
+
+    report = MutationApplier(_gmail_client(settings), batch_size=settings.dispatch.batch_size).apply(mutations)
+
+    print(
+        f"  applied {report.applied}  no-op {report.skipped_noop}  "
+        f"failed {report.failed}  gmail calls {report.api_calls}"
+    )
+    for failure in report.failures:
+        print(f"  ! {failure}", file=sys.stderr)
+    return EXIT_PARTIAL if report.had_failures else EXIT_OK
+
+
 _COMMANDS = {
     ("config", "validate"): cmd_config_validate,
     ("labels", None): cmd_labels,
     ("login", None): cmd_login,
     ("prompt", "render"): cmd_prompt_render,
+    ("run", None): cmd_run,
+    ("apply", None): cmd_apply,
 }
 
 

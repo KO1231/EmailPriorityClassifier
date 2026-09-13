@@ -16,6 +16,7 @@ Two properties this wrapper is responsible for:
    :class:`GmailClient` per worker thread rather than sharing one.
 """
 
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from google.oauth2.credentials import Credentials
@@ -26,6 +27,12 @@ from epc.errors import GmailError
 from epc.gmail.labels import GmailLabel, parse_labels
 
 DEFAULT_RETRIES = 5
+# `messages.batchModify` accepts up to 1000 IDs per call. The previous
+# implementation issued one `threads.modify` per thread, so a 1500-thread run
+# made 1500 round trips where this makes two.
+BATCH_MODIFY_LIMIT = 1000
+# `threads.list` caps a page at 500.
+THREAD_PAGE_LIMIT = 500
 
 
 class GmailClient:
@@ -69,4 +76,82 @@ class GmailClient:
             id=str(response.get("id") or ""),
             name=str(response.get("name") or name),
             type=str(response.get("type") or "user"),
+        )
+
+    def list_thread_ids(self, query: str, *, limit: int) -> Iterator[str]:
+        """Thread IDs matching `query`, newest first, up to `limit`.
+
+        Only IDs are requested. Fetching full threads during listing would pay
+        for every thread on the page, including the ones `limit` cuts off.
+        """
+        request: Any | None = (
+            self._service.users()
+            .threads()
+            .list(
+                userId="me",
+                q=query,
+                fields="threads(id),nextPageToken",
+                includeSpamTrash=False,
+                maxResults=min(THREAD_PAGE_LIMIT, limit),
+            )
+        )
+        yielded = 0
+        while request is not None and yielded < limit:
+            response = self._execute(request, operation="listing threads")
+            for thread in response.get("threads") or []:
+                identifier = str(thread.get("id") or "")
+                if identifier:
+                    yield identifier
+                    yielded += 1
+                    if yielded >= limit:
+                        return
+            request = self._service.users().threads().list_next(request, response)
+
+    def get_thread(self, thread_id: str) -> dict[str, Any]:
+        """One thread with full message payloads.
+
+        `format="full"` rather than `"raw"`: it omits attachment bytes, and at
+        1500 threads a run that downloads every PDF is not viable.
+        """
+        return self._execute(
+            self._service.users()
+            .threads()
+            .get(
+                userId="me",
+                id=thread_id,
+                format="full",
+                fields="id,messages(id,threadId,labelIds,payload,sizeEstimate,internalDate)",
+            ),
+            operation=f"fetching thread {thread_id}",
+        )
+
+    def batch_modify(
+        self,
+        message_ids: Sequence[str],
+        *,
+        add_label_ids: Sequence[str] = (),
+        remove_label_ids: Sequence[str] = (),
+    ) -> None:
+        """Apply one label change to up to `BATCH_MODIFY_LIMIT` messages.
+
+        Returns nothing on success — Gmail's response body is empty, so there is
+        no per-message outcome to report. Chunking is the caller's job.
+        """
+        if not message_ids or (not add_label_ids and not remove_label_ids):
+            return
+        if len(message_ids) > BATCH_MODIFY_LIMIT:
+            raise ValueError(f"batch_modify takes at most {BATCH_MODIFY_LIMIT} message IDs")
+
+        self._execute(
+            self._service.users()
+            .messages()
+            .batchModify(
+                userId="me",
+                body={
+                    "ids": list(message_ids),
+                    "addLabelIds": list(add_label_ids),
+                    "removeLabelIds": list(remove_label_ids),
+                },
+            ),
+            operation=f"modifying labels on {len(message_ids)} messages",
         )

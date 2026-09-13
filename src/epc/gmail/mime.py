@@ -155,8 +155,25 @@ def html_to_text(html: str) -> tuple[str, int]:
 
     That last one is a prompt-injection vector rather than a formatting quirk,
     but it is handled here rather than in :mod:`epc.security.sanitize` because
-    deciding it needs the DOM, and by the time sanitisation runs the markup is
+    deciding it needs the markup, and by the time sanitisation runs the markup is
     gone. The rule stays clean: this function returns what a person would read.
+
+    **This parses; it does not render.** No CSS cascade is resolved, no layout is
+    computed, no browser is involved — it is a parse tree plus a regex over
+    inline ``style`` attributes, which is why a 100 KB promotional email costs
+    single-digit milliseconds rather than the hundreds a headless renderer would.
+
+    Two kinds of hiding consequently get through, both deliberately:
+
+    * ``display:none`` applied via a ``<style>`` block and a class selector,
+      which would need the cascade resolved;
+    * foreground colour matching an *inherited* background, which would need to
+      know what that background actually is — and guessing would eat legitimate
+      text in dark-themed mail, a worse failure than leaving it.
+
+    Neither is left unguarded: `epc.security.detect` flags content that
+    addresses the model wherever it came from, and ``tests/injection`` holds
+    both cases open as named gaps rather than letting them be forgotten.
     """
     soup = BeautifulSoup(html, "lxml")
 

@@ -27,7 +27,12 @@ classify = [
     "lxml>=6,<7",
 ]
 # Credential/state/dispatch backends on AWS, plus the Bedrock classifier.
-aws = ["boto3>=1.40,<2"]
+aws = [
+    "boto3>=1.40,<2",
+    # The Lambda Runtime Interface Client. Present so that one image can serve
+    # both entrypoints: the CLI on Fargate, and the apply handler on Lambda.
+    "awslambdaric>=3,<4",
+]
 all = ["email-priority-classifier[classify,aws]"]
 
 [project.scripts]

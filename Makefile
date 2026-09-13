@@ -53,6 +53,36 @@ docker-build: ## Build the container image
 docker-run: ## Dry run inside the container, with the local config mounted
 	docker compose run --rm epc run --dry-run
 
+# --- Infrastructure -------------------------------------------------------
+# Same shape as the rest of the estate: init-{env} / plan-{env} / apply-{env},
+# with a plan file in between so apply does exactly what was reviewed.
+
+.PHONY: tf-fmt
+tf-fmt: ## Format the Terraform
+	terraform fmt -recursive environments/ modules/
+
+.PHONY: tf-validate
+tf-validate: ## Validate every environment without touching a backend
+	@for env in environments/*/; do \
+		echo "== $$env"; \
+		terraform -chdir=$$env init -backend=false >/dev/null && \
+		terraform -chdir=$$env validate || exit 1; \
+	done
+
+init-%: ## Initialise an environment (make init-dev)
+	@test -d environments/$* || { echo "No such environment: $*"; exit 1; }
+	@test -f environments/$*/config.yml || { echo "environments/$*/config.yml is missing"; exit 1; }
+	cd environments/$* && terraform init
+
+plan-%: ## Plan, saving the plan so apply can replay exactly it
+	@test -d environments/$*/.terraform || { echo "Run 'make init-$*' first"; exit 1; }
+	rm -f environments/$*/.plan
+	cd environments/$* && terraform plan -out .plan
+
+apply-%: ## Apply a saved plan, after showing it
+	@test -f environments/$*/.plan || { echo "Run 'make plan-$*' first"; exit 1; }
+	cd environments/$* && terraform show .plan && terraform apply .plan && rm -f .plan
+
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \

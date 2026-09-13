@@ -45,7 +45,6 @@ __pycache__/
 *.tfstate.*
 .terraform.lock.hcl
 /environments/*/.plan
-/environments/*/.build/
 
 # --- Evaluation data ------------------------------------------------------
 # Golden-set threads are real mail. Fixtures under tests/fixtures/ are

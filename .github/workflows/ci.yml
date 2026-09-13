@@ -45,6 +45,25 @@ jobs:
         # never run here.
         run: uv run pytest -m "not eval" --cov --cov-report=term-missing
 
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.14.5
+
+      - name: Format
+        run: terraform fmt -check -recursive environments/ modules/
+
+      - name: Validate
+        # -backend=false: validation needs no state and no credentials.
+        run: |
+          for env in environments/*/; do
+            terraform -chdir="$env" init -backend=false
+            terraform -chdir="$env" validate
+          done
+
   audit:
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,48 @@
+# Per-environment Terraform variables.
+#
+# NOT the application's config.yml — that one is mounted into the container and
+# has a different schema entirely. This file only describes the infrastructure.
+#
+# Copy environments/sample/ to environments/dev/ (which is git-ignored, because
+# it holds real account IDs and ARNs) and fill in the ??? values.
+
+aws:
+  region: ??? # e.g. ap-northeast-1. If using Bedrock, confirm the model is offered there.
+  profile: ??? # Your AWS CLI profile name.
+
+  # An existing VPC. Both Gmail and the model provider are external, so the
+  # subnets need a route out — public subnets with assign_public_ip, or private
+  # ones behind a NAT gateway.
+  network:
+    subnet_ids: ["subnet-???"]
+    security_group_ids: ["sg-???"]
+    assign_public_ip: true
+
+schedule:
+  expression: rate(1 hour)
+  timezone: Asia/Tokyo
+  # Start disabled. A schedule that fires the moment it is created gives nobody
+  # a chance to read the first dry run.
+  enabled: false
+
+# The image to run. Tag for dev; pin by digest for prod, because a tag that
+# moves under a scheduled task is a deploy nobody performed.
+image_tag: latest
+
+# Non-secret application settings, as EPC__-prefixed overrides. Anything absent
+# falls back to the config.yml baked into... nothing — so set what matters here.
+app:
+  llm_backend: openai
+  llm_model: gpt-5.4-mini
+  max_threads: "500"
+  extra_query: "newer_than:14d -in:chats"
+  # Start in dry run on a new environment, and turn it off once a run has been
+  # read. Actions here are visible and tedious to undo by hand.
+  dry_run: "true"
+
+# Bedrock model ARNs the task may invoke. Empty when using the OpenAI backend —
+# an unused permission is still a permission.
+bedrock_model_arns: []
+
+# Optional: an SNS topic for the dead-letter alarm.
+alarm_topic_arn: ""

@@ -55,6 +55,19 @@ Landed so far:
   rejection degrades to `toolChoice: auto` (latched, so 1500 threads do not each pay for a doomed
   first attempt) and then to reading plain text. `parse_classification` is the backstop in every
   case, which is what keeps the enum — not the transport — as the security boundary.
+- **Pipeline and actions** — `epc.pipeline` (ThreadPoolExecutor, not processes; the work is HTTP
+  wait end to end), `epc.ratelimit` (a next-slot clock, so one slow response delays only itself),
+  `epc.actions` (declarative rules, first match wins), `epc.dispatch` (`DirectSink` applies,
+  `JsonlSink` *is* dry-run and its output replays exactly). `epc run` / `epc apply`.
+  `tests/unit/test_layering.py` asserts the import graph: `actions/` and `dispatch/` never reach
+  `classify/` or the MIME parser, which is what keeps the apply worker's dependencies to
+  `google-api-python-client` plus `boto3`.
+- **Operations** — `epc.logging` (structlog; a redaction processor as a backstop, because the
+  previous implementation wrote whole email bodies to disk at DEBUG), `epc.report` (classification
+  history: subject as a digest, sender as a bare domain, never the mail), `epc.state` (the Gmail
+  `historyId` checkpoint), and History API incremental sync in the pipeline. The checkpoint only
+  advances on a clean run — after a partial failure the next run re-lists the same window, and the
+  label-based exclusion makes the threads that did succeed free to skip.
 
 ### Carried forward — obligations deferred out of a completed phase
 

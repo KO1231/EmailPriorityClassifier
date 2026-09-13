@@ -263,11 +263,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     from epc.dispatch.applier import MutationApplier
     from epc.dispatch.sink import DirectSink, JsonlSink, MutationSink
     from epc.gmail.labels import resolve_priority_labels
+    from epc.logging import configure_logging
     from epc.pipeline import Pipeline
+    from epc.report import HistorySink, JsonlHistorySink, NullHistorySink
+    from epc.state import LocalFileStateStore, NullStateStore, StateStore
 
     settings = _load(args.config)
     if args.limit is not None:
         settings = load_settings(args.config, gmail={"max_threads": args.limit})
+
+    configure_logging(
+        level=settings.observability.log_level,
+        json_output=settings.observability.log_json,
+        log_file=settings.observability.log_file,
+    )
 
     client = _gmail_client(settings)
     # Before a single thread is fetched: a configured label that does not exist
@@ -285,12 +294,23 @@ def cmd_run(args: argparse.Namespace) -> int:
     else:
         sink = DirectSink(MutationApplier(client), batch_size=settings.dispatch.batch_size)
 
+    state: StateStore = (
+        LocalFileStateStore(settings.run.state_file) if settings.run.state_backend == "local" else NullStateStore()
+    )
+    history: HistorySink = (
+        JsonlHistorySink(settings.observability.history_dir)
+        if settings.observability.history_dir is not None
+        else NullHistorySink()
+    )
+
     pipeline = Pipeline(
         settings=settings,
         client=client,
         classifier=classifier,
         sink=sink,
         priority_label_ids=priority_label_ids,
+        state_store=state,
+        history=history,
     )
     print(f"Query: {pipeline.search_query()}")
     summary = pipeline.run()

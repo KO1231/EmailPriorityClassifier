@@ -187,9 +187,25 @@ class CredentialsSettings(_Section):
         return self
 
 
+class ObservabilitySettings(_Section):
+    """Logs, and the record of what was decided."""
+
+    log_level: str = "INFO"
+    # JSON when something is going to parse it; readable text otherwise.
+    log_json: bool = False
+    log_file: Path | None = None
+
+    # Where classification records go. Unset means none are kept: a durable
+    # record of decisions about your mail is something to opt into, not
+    # something to discover later.
+    history_dir: Path | None = None
+
+
 class RunSettings(_Section):
     dry_run: bool = False
     state_backend: StateBackend = "local"
+    # backend: local — where the historyId checkpoint lives.
+    state_file: Path = Path(".state/run.json")
 
 
 class Settings(BaseSettings):
@@ -216,6 +232,7 @@ class Settings(BaseSettings):
     actions: ActionsSettings = Field(default_factory=ActionsSettings)
     dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     run: RunSettings = Field(default_factory=RunSettings)
 
     @classmethod

@@ -9,7 +9,7 @@ from epc.classify.base import Classification, ClassificationResult, Usage
 from epc.classify.budget import ThreadPayload
 from epc.dispatch.applier import MutationApplier
 from epc.dispatch.sink import DirectSink, JsonlSink, read_mutations
-from epc.errors import ClassificationError, GmailError
+from epc.errors import ClassificationError, GmailError, HistoryExpiredError
 from epc.pipeline import Pipeline
 from epc.priority import Priority
 from epc.settings import load_settings
@@ -34,11 +34,32 @@ actions:
 class FakeGmail:
     """A mailbox that answers the three calls the pipeline makes."""
 
-    def __init__(self, threads: dict[str, Any], *, unfetchable: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        threads: dict[str, Any],
+        *,
+        unfetchable: set[str] | None = None,
+        history_id: str = "1000",
+        changed: list[str] | None = None,
+        history_expired: bool = False,
+    ) -> None:
         self._threads = threads
         self._unfetchable = unfetchable or set()
+        self._history_id = history_id
+        self._changed = changed
+        self._history_expired = history_expired
         self.queries: list[str] = []
         self.writes: list[dict[str, Any]] = []
+        self.history_calls: list[str] = []
+
+    def mailbox_profile(self) -> tuple[str, str]:
+        return "someone@example.com", self._history_id
+
+    def list_changed_thread_ids(self, start_history_id: str, *, label_id: str = "INBOX") -> Any:
+        self.history_calls.append(start_history_id)
+        if self._history_expired:
+            raise HistoryExpiredError("too old")
+        return list(self._changed or []), self._history_id
 
     def list_thread_ids(self, query: str, *, limit: int) -> Any:
         self.queries.append(query)
@@ -237,3 +258,145 @@ def test_the_summary_renders(settings: Any) -> None:
 
 def _normalise(writes: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
     return sorted((tuple(sorted(w["ids"])), tuple(w["add"]), tuple(w["remove"])) for w in writes)
+
+
+# --------------------------------------------------------------------------
+# Incremental sync
+# --------------------------------------------------------------------------
+
+
+def test_the_first_run_scans_and_stores_a_checkpoint(settings: Any, tmp_path: Path) -> None:
+    from epc.state import LocalFileStateStore
+
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, history_id="5000")
+    store = LocalFileStateStore(tmp_path / "state.json")
+
+    pipeline = Pipeline(
+        settings=settings,
+        client=gmail,  # type: ignore[arg-type]
+        classifier=FakeClassifier(),
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        state_store=store,
+    )
+    summary = pipeline.run()
+
+    assert summary.incremental is False
+    assert gmail.queries, "a full scan was performed"
+    assert store.load().history_id == "5000"
+    assert store.load().mailbox == "someone@example.com"
+
+
+def test_a_later_run_asks_only_what_changed(settings: Any, tmp_path: Path) -> None:
+    """The difference between a scheduled run costing a few calls and a full scan."""
+    from epc.state import LocalFileStateStore, RunState
+
+    store = LocalFileStateStore(tmp_path / "state.json")
+    store.save(RunState(history_id="4000", mailbox="someone@example.com"))
+
+    gmail = FakeGmail(
+        {"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])},
+        history_id="5000",
+        changed=["t2"],
+    )
+    summary = Pipeline(
+        settings=settings,
+        client=gmail,  # type: ignore[arg-type]
+        classifier=FakeClassifier(),
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        state_store=store,
+    ).run()
+
+    assert summary.incremental is True
+    assert gmail.history_calls == ["4000"]
+    assert gmail.queries == []  # no full listing at all
+    assert summary.classified == 1
+    assert store.load().history_id == "5000"
+
+
+def test_an_expired_checkpoint_falls_back_to_a_full_scan(settings: Any, tmp_path: Path) -> None:
+    """Routine after an idle period — Gmail keeps about a week of history."""
+    from epc.state import LocalFileStateStore, RunState
+
+    store = LocalFileStateStore(tmp_path / "state.json")
+    store.save(RunState(history_id="1", mailbox="someone@example.com"))
+
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, history_id="9000", history_expired=True)
+    summary = Pipeline(
+        settings=settings,
+        client=gmail,  # type: ignore[arg-type]
+        classifier=FakeClassifier(),
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        state_store=store,
+    ).run()
+
+    assert summary.incremental is False
+    assert summary.classified == 1
+    assert store.load().history_id == "9000"
+
+
+def test_a_checkpoint_from_another_mailbox_is_not_used(settings: Any, tmp_path: Path) -> None:
+    from epc.state import LocalFileStateStore, RunState
+
+    store = LocalFileStateStore(tmp_path / "state.json")
+    store.save(RunState(history_id="4000", mailbox="someone-else@example.com"))
+
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, history_id="5000", changed=[])
+    summary = Pipeline(
+        settings=settings,
+        client=gmail,  # type: ignore[arg-type]
+        classifier=FakeClassifier(),
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        state_store=store,
+    ).run()
+
+    assert summary.incremental is False
+    assert gmail.history_calls == []
+
+
+def test_a_partial_failure_leaves_the_checkpoint_alone(settings: Any, tmp_path: Path) -> None:
+    """Otherwise the failed threads are skipped forever."""
+    from epc.state import LocalFileStateStore, RunState
+
+    store = LocalFileStateStore(tmp_path / "state.json")
+    store.save(RunState(history_id="4000", mailbox="someone@example.com"))
+
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])}, history_id="5000", changed=["t1"])
+    Pipeline(
+        settings=settings,
+        client=gmail,  # type: ignore[arg-type]
+        classifier=FakeClassifier(fail_on={"t1"}),
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        state_store=store,
+    ).run()
+
+    assert store.load().history_id == "4000"
+
+
+def test_history_is_recorded_without_the_mail(settings: Any, tmp_path: Path) -> None:
+    from epc.report import JsonlHistorySink, read_records
+
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"], body="Confidential merger details")})
+    history = JsonlHistorySink(tmp_path / "history")
+    Pipeline(
+        settings=settings,
+        client=gmail,  # type: ignore[arg-type]
+        classifier=FakeClassifier(),
+        sink=DirectSink(MutationApplier(gmail)),  # type: ignore[arg-type]
+        priority_label_ids=LABEL_IDS,
+        history=history,
+    ).run()
+
+    contents = history.path.read_text(encoding="utf-8")
+    assert "Confidential" not in contents
+    assert "a@example.com" not in contents
+
+    record = next(read_records(history.path))
+    assert record.thread_id == "t1"
+    assert record.sender_domain == "example.com"
+    assert record.priority is Priority.P1
+    assert record.applied is True

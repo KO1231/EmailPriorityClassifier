@@ -10,7 +10,8 @@ one slow response no longer stalls every worker.
 """
 
 import logging
-from collections.abc import Iterator
+import time
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -19,15 +20,17 @@ from epc.actions.planner import plan_mutation
 from epc.classify.base import Classifier, Usage
 from epc.classify.budget import build_payload
 from epc.dispatch.applier import ApplyReport
-from epc.dispatch.sink import MutationSink
-from epc.errors import ClassificationError, GmailError
+from epc.dispatch.sink import JsonlSink, MutationSink
+from epc.errors import ClassificationError, GmailError, HistoryExpiredError
 from epc.gmail.client import GmailClient
 from epc.gmail.mime import parse_thread
 from epc.gmail.models import EmailThread
 from epc.gmail.query import build_search_query
 from epc.priority import Priority
 from epc.ratelimit import RateLimiter
+from epc.report import HistorySink, NullHistorySink, record_for
 from epc.settings import Settings
+from epc.state import NullStateStore, RunState, StateStore
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,7 @@ class RunSummary:
     """What a run did. Printed at the end and used to pick an exit code."""
 
     listed: int = 0
+    incremental: bool = False
     already_labelled: int = 0
     fetch_failed: int = 0
     classified: int = 0
@@ -45,15 +49,17 @@ class RunSummary:
     by_priority: dict[Priority, int] = field(default_factory=lambda: dict.fromkeys(Priority, 0))
     usage: Usage = field(default_factory=Usage)
     apply: ApplyReport = field(default_factory=ApplyReport)
+    elapsed_seconds: float = 0.0
 
     @property
     def had_failures(self) -> bool:
         return bool(self.fetch_failed or self.classify_failed or self.apply.had_failures)
 
     def render(self) -> str:
+        mode = "incremental" if self.incremental else "full scan"
         lines = [
             "=== Summary ===",
-            f"  listed            {self.listed}",
+            f"  listed            {self.listed}  ({mode})",
             f"  already labelled  {self.already_labelled}  (skipped, no LLM call)",
             f"  classified        {self.classified}"
             f"  (failed: {self.classify_failed}, unfetchable: {self.fetch_failed})",
@@ -63,6 +69,7 @@ class RunSummary:
             f"  applied           {self.apply.applied}"
             f"  (no-op: {self.apply.skipped_noop}, failed: {self.apply.failed})",
             f"  gmail write calls {self.apply.api_calls}",
+            f"  elapsed           {self.elapsed_seconds:.1f}s",
         ]
         lines.extend(f"  ! {failure}" for failure in self.apply.failures)
         return "\n".join(lines)
@@ -79,6 +86,8 @@ class Pipeline:
         classifier: Classifier,
         sink: MutationSink,
         priority_label_ids: dict[Priority, str],
+        state_store: StateStore | None = None,
+        history: HistorySink | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -87,6 +96,8 @@ class Pipeline:
         self._priority_label_ids = priority_label_ids
         self._limiter = RateLimiter(settings.llm.requests_per_min)
         self._priority_label_id_set = set(priority_label_ids.values())
+        self._state_store = state_store or NullStateStore()
+        self._history = history or NullHistorySink()
 
     def search_query(self) -> str:
         return build_search_query(
@@ -96,8 +107,11 @@ class Pipeline:
         )
 
     def run(self) -> RunSummary:
+        started = time.monotonic()
         summary = RunSummary()
-        threads = self._hydrate(summary)
+
+        thread_ids, checkpoint, mailbox = self._thread_ids_to_consider(summary)
+        threads = self._hydrate(thread_ids, summary)
 
         concurrency = self._settings.llm.concurrency
         with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="epc") as pool:
@@ -118,15 +132,57 @@ class Pipeline:
                 summary.usage = summary.usage + usage
                 if mutation.suspicious:
                     summary.suspicious += 1
+
                 self._sink.emit(mutation)
+                self._history.write(
+                    record_for(
+                        mutation,
+                        subject=thread.subject,
+                        sender_domain=thread.latest.sender_domain if thread.latest else "",
+                        message_count=len(thread.messages),
+                        usage=usage,
+                        applied=not isinstance(self._sink, JsonlSink),
+                    )
+                )
 
         summary.apply = self._sink.close()
+        self._history.close()
+        summary.elapsed_seconds = time.monotonic() - started
+
+        # Only advance the checkpoint on a clean run. After a partial failure the
+        # next run re-lists the same window, and the label-based exclusion makes
+        # the threads that did succeed free to skip.
+        if checkpoint and not summary.had_failures:
+            self._state_store.save(RunState().advanced_to(checkpoint, mailbox=mailbox))
+
         return summary
 
-    def _hydrate(self, summary: RunSummary) -> list[EmailThread]:
+    def _thread_ids_to_consider(self, summary: RunSummary) -> tuple[Iterable[str], str, str]:
+        """Which threads to look at, and the checkpoint to store afterwards."""
+        if not self._settings.gmail.incremental:
+            return self._list_thread_ids(), "", ""
+
+        mailbox, current_history_id = self._client.mailbox_profile()
+        state = self._state_store.load()
+
+        if state.usable_for(mailbox) and state.history_id:
+            try:
+                changed, checkpoint = self._client.list_changed_thread_ids(state.history_id)
+            except HistoryExpiredError:
+                # Routine after an idle period: Gmail keeps about a week.
+                logger.info("history checkpoint expired; falling back to a full scan")
+            else:
+                summary.incremental = True
+                return changed[: self._settings.gmail.max_threads], checkpoint, mailbox
+
+        # No usable checkpoint. Scan, and store where the mailbox is now so the
+        # next run can be incremental.
+        return self._list_thread_ids(), current_history_id, mailbox
+
+    def _hydrate(self, thread_ids: Iterable[str], summary: RunSummary) -> list[EmailThread]:
         """Fetch and parse the threads that still need a priority."""
         threads: list[EmailThread] = []
-        for thread_id in self._list_thread_ids():
+        for thread_id in thread_ids:
             summary.listed += 1
             try:
                 raw = self._client.get_thread(thread_id)

@@ -85,9 +85,24 @@ security:
   # actions (starring, moving to Primary) from that thread.
   on_suspected_injection: downgrade_and_flag # ignore | flag | downgrade_and_flag
 
+observability:
+  log_level: INFO
+  # JSON when something is going to parse the output; readable text otherwise.
+  log_json: false
+  # log_file: log/epc.log
+
+  # Where to record what was decided — thread ID, a digest of the subject, the
+  # sender's domain, the priority and why. Never the mail itself. Unset means
+  # no record is kept; set it to be able to answer "why was this P1?" weeks
+  # later, and to measure whether a prompt change helped.
+  # history_dir: log/history
+
 run:
   dry_run: false
   state_backend: local # local | ssm | s3
+  # Where the Gmail historyId checkpoint lives, so the next run can ask "what
+  # changed" instead of re-listing the inbox.
+  state_file: .state/run.json
 
 # `actions` and `dispatch` arrive with the action planner and the mutation
 # sinks. They are deliberately absent rather than stubbed: a config schema is

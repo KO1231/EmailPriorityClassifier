@@ -34,3 +34,12 @@ class GmailError(EpcError):
 
 class ClassificationError(EpcError):
     """A thread could not be classified. Costs that thread, not the run."""
+
+
+class HistoryExpiredError(GmailError):
+    """The stored `historyId` is older than Gmail's retention window.
+
+    Recoverable rather than fatal: the caller falls back to a full scan and
+    stores a fresh checkpoint. Gmail keeps roughly a week of history, so a tool
+    that has not run for a while lands here as a matter of course.
+    """

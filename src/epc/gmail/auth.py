@@ -83,44 +83,73 @@ def serialise(credentials: Credentials) -> str:
     return json.dumps({key: data[key] for key in _DURABLE_FIELDS if data.get(key) is not None}, indent=2)
 
 
+# Appended to every "the stored value is no good" message, because the fix is
+# always the same and the person reading it is usually mid-setup.
+_LOGIN_HINT = "run `epc login` to authorise again and replace it"
+
+
 def deserialise(payload: str) -> Credentials:
     """Rebuild credentials from a stored payload."""
     try:
         info = json.loads(payload)
     except json.JSONDecodeError as exc:
-        raise CredentialError("stored credentials are not valid JSON") from exc
+        # The commonest cause by far: a secret store entry that was created
+        # empty — Terraform writes a placeholder — and never filled.
+        raise CredentialError(f"stored credentials are not valid JSON; {_LOGIN_HINT}") from exc
+    if not isinstance(info, dict):
+        raise CredentialError(f"stored credentials are not a JSON object; {_LOGIN_HINT}")
     try:
         return Credentials.from_authorized_user_info(info, SCOPES)
     except (ValueError, KeyError) as exc:
-        raise CredentialError(f"stored credentials are unusable: {exc}") from exc
+        raise CredentialError(f"stored credentials are unusable ({exc}); {_LOGIN_HINT}") from exc
 
 
-def get_credentials(store: CredentialStore, *, client_secrets_file: Path | None = None) -> Credentials:
-    """Return usable credentials, refreshing or re-authorising as needed.
+def load_credentials(store: CredentialStore) -> Credentials:
+    """Credentials for a run: whatever is stored, refreshed.
 
-    A newly issued refresh token is written back; a merely refreshed access
-    token is not, because it is not stored in the first place.
+    Never opens a browser. Runs happen on schedulers and in containers where
+    nobody is there to click through a consent screen, so a missing or broken
+    credential is an error naming the fix, not an attempt to authorise.
     """
     payload = store.load()
-    credentials = deserialise(payload) if payload else None
+    if not payload:
+        raise CredentialError("no Gmail credentials are stored yet; run `epc login`")
 
-    if credentials and credentials.refresh_token:
-        try:
-            credentials.refresh(Request())
-        except Exception as exc:  # google-auth raises a wide range here
-            raise CredentialError(
-                "could not refresh the stored Gmail credentials; re-run `epc login`. "
-                "If the OAuth consent screen is still in Testing, refresh tokens expire after 7 days."
-            ) from exc
-        return credentials
+    credentials = deserialise(payload)
+    if not credentials.refresh_token:
+        raise CredentialError(f"stored credentials have no refresh token; {_LOGIN_HINT}")
 
-    if client_secrets_file is None:
-        raise CredentialError("no stored credentials and no client secrets file to authorise with")
+    try:
+        credentials.refresh(Request())
+    except Exception as exc:  # google-auth raises a wide range here
+        raise CredentialError(
+            f"could not refresh the stored Gmail credentials; {_LOGIN_HINT}. "
+            "If the OAuth consent screen is still in Testing, refresh tokens expire after 7 days."
+        ) from exc
+    return credentials
+
+
+def authorise(store: CredentialStore, *, client_secrets_file: Path) -> Credentials:
+    """Run the consent flow in a browser and store what it grants.
+
+    Deliberately does not read what is already stored. `epc login` is the
+    recovery for every broken-credential error `load_credentials` raises — an
+    expired refresh token, a placeholder nobody filled, a file that got
+    truncated — so it must not fail on the very thing it exists to replace.
+    """
     if not client_secrets_file.is_file():
         raise CredentialError(f"client secrets file not found: {client_secrets_file}")
 
     flow = InstalledAppFlow.from_client_secrets_file(str(client_secrets_file), SCOPES)
-    credentials = flow.run_local_server()
+    # `prompt=consent`: Google issues a refresh token only when the consent
+    # screen is actually shown, and skips the screen for an app the account has
+    # already approved. Without this, logging in again to replace an expired
+    # token could come back without a new one.
+    credentials = flow.run_local_server(prompt="consent")
+    if not credentials.refresh_token:
+        # Storing this would look like success and fail on the first run.
+        raise CredentialError("Google did not issue a refresh token; nothing was stored")
+
     store.store(serialise(credentials))
     return credentials
 

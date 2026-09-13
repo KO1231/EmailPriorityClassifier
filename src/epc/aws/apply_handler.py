@@ -18,7 +18,7 @@ from typing import Any
 
 from epc.dispatch.applier import MutationApplier
 from epc.dispatch.sqs import parse_mutations
-from epc.gmail.auth import SsmCredentialStore, get_credentials
+from epc.gmail.auth import SsmCredentialStore, load_credentials
 from epc.gmail.client import GmailClient
 from epc.logging import configure_logging, get_logger
 
@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 def _client() -> GmailClient:
     parameter = os.environ[CREDENTIALS_PARAMETER_ENV]
     region = os.environ.get(REGION_ENV) or None
-    return GmailClient(get_credentials(SsmCredentialStore(parameter, region=region)))
+    return GmailClient(load_credentials(SsmCredentialStore(parameter, region=region)))
 
 
 def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:

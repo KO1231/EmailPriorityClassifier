@@ -156,13 +156,13 @@ def cmd_labels(args: argparse.Namespace) -> int:
 
 def cmd_login(args: argparse.Namespace) -> int:
     from epc.backends import build_credential_store
-    from epc.gmail.auth import SCOPES, get_credentials
+    from epc.gmail.auth import SCOPES, authorise
 
     settings = _load(args.config)
     # Authorise here, store wherever the backend says — so the browser flow can
     # run on a laptop and the credential land in a parameter the task reads.
     store = build_credential_store(settings)
-    get_credentials(store, client_secrets_file=settings.credentials.client_secrets_file)
+    authorise(store, client_secrets_file=settings.credentials.client_secrets_file)
     where = (
         settings.credentials.token_file
         if settings.credentials.backend == "local"
@@ -240,10 +240,10 @@ def cmd_prompt_render(args: argparse.Namespace) -> int:
 
 def _gmail_client(settings: Settings) -> GmailClient:
     from epc.backends import build_credential_store
-    from epc.gmail.auth import get_credentials
+    from epc.gmail.auth import load_credentials
     from epc.gmail.client import GmailClient
 
-    return GmailClient(get_credentials(build_credential_store(settings)))
+    return GmailClient(load_credentials(build_credential_store(settings)))
 
 
 def cmd_run(args: argparse.Namespace) -> int:

@@ -161,8 +161,10 @@ between a secret and a pushed layer — that no personal file was copied in.
 
 ## Conventions
 
-**Language.** Code comments and docstrings are Japanese. Log messages, exception
-messages and documentation are English.
+**Language.** `README.md` is Japanese — it is the public face of a personal tool, and its
+audience reads Japanese. This file stays English, as do log messages, exception messages,
+prompts, and the comments and docstrings that sit next to code an English-speaking model
+or contributor will read. Code comments are Japanese where the surrounding code is.
 
 **Commits.** `type: summary` — `add:`, `fix:`, `update:`, `refactor:`, `remove:`,
 `change:`. Summaries are usually Japanese. No attribution or co-author trailers.

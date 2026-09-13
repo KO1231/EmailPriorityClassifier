@@ -23,9 +23,13 @@ __pycache__/
 /secrets/**
 !/secrets/.gitkeep
 
-# Prompt templates carrying personal escalation rules. The generic, committed
-# prompts live under /prompts once they are split from the personal policy.
-/prompts
+# Prompts: deny by default, allow the committed generic ones by name. A new
+# file under prompts/ stays ignored until it is listed here explicitly, which is
+# the correct default when the remote is public — the legacy gptoss_*.txt
+# templates carry personal escalation rules and must never be published.
+/prompts/*
+!/prompts/system.md
+!/prompts/user.md
 
 # --- Runtime artefacts ----------------------------------------------------
 /log

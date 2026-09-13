@@ -10,11 +10,15 @@ Subcommands land alongside the code they drive. Present so far:
     that used to fail only after a full run had already been paid for.
 ``epc login``
     Run the OAuth flow and store the credentials.
+``epc prompt render``
+    Print the exact prompt a thread would produce, personal policy included.
+    The only way to review what is actually sent before sending it.
 
 ``run`` and ``apply`` arrive with the pipeline and the mutation sinks.
 """
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -57,6 +61,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     login = subcommands.add_parser("login", help="authorise this tool against a Gmail account")
     _add_config_option(login)
+
+    prompt = subcommands.add_parser("prompt", help="inspect the prompts")
+    prompt_actions = prompt.add_subparsers(dest="prompt_command", required=True)
+    render = prompt_actions.add_parser("render", help="print the prompt a thread would produce")
+    _add_config_option(render)
+    render.add_argument(
+        "--file",
+        type=Path,
+        metavar="PATH",
+        help="a Gmail threads.get JSON response; omit for a built-in example thread",
+    )
+    render.add_argument("--prompts", type=Path, default=Path("prompts"), metavar="DIR", help="prompt directory")
+    render.add_argument("--policy", type=Path, default=Path("policy.yml"), metavar="PATH", help="personal policy")
 
     return parser
 
@@ -134,10 +151,76 @@ def cmd_login(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# A thread with nothing personal in it, so `prompt render` works in a fresh
+# clone with no mailbox and no policy file.
+_EXAMPLE_THREAD = {
+    "id": "example-thread",
+    "messages": [
+        {
+            "id": "example-message",
+            "threadId": "example-thread",
+            "labelIds": ["INBOX", "UNREAD"],
+            "internalDate": "1767225600000",
+            "sizeEstimate": 2048,
+            "payload": {
+                "mimeType": "text/plain",
+                "filename": "",
+                "headers": [
+                    {"name": "From", "value": "Dana Reed <dana@example.com>"},
+                    {"name": "To", "value": "you@example.com"},
+                    {"name": "Subject", "value": "Contract review before Friday"},
+                    {"name": "Content-Type", "value": "text/plain; charset=utf-8"},
+                ],
+                "body": {
+                    "size": 64,
+                    "data": "Q291bGQgeW91IHJldmlldyB0aGUgYXR0YWNoZWQgY29udHJhY3QgYmVmb3JlIEZyaWRheT8",
+                },
+            },
+        }
+    ],
+}
+
+
+def cmd_prompt_render(args: argparse.Namespace) -> int:
+    from epc.classify.budget import build_payload
+    from epc.classify.prompt import PromptRenderer
+    from epc.gmail.mime import parse_thread
+
+    settings = _load(args.config)
+
+    if args.file is not None:
+        if not args.file.is_file():
+            raise EpcError(f"thread file not found: {args.file}")
+        raw = json.loads(args.file.read_text(encoding="utf-8"))
+    else:
+        raw = _EXAMPLE_THREAD
+
+    payload = build_payload(parse_thread(raw), settings.llm.budget)
+    rendered = PromptRenderer.load(args.prompts, args.policy).render(payload)
+
+    print(f"# prompt version {rendered.prompt_version}   nonce {rendered.nonce}")
+    print(f"# policy: {args.policy if args.policy.is_file() else 'none'}")
+    print(f"# estimated {payload.estimated_tokens} tokens, {payload.omitted_messages} messages omitted")
+    print("\n===== system =====\n")
+    print(rendered.system)
+    print("\n===== user =====\n")
+    print(rendered.user)
+
+    # Reported here, never in the prompt itself.
+    if payload.injection.suspicious:
+        print(
+            f"\n# injection signal (not sent to the model): "
+            f"{payload.injection.confidence} {payload.injection.patterns}",
+            file=sys.stderr,
+        )
+    return EXIT_OK
+
+
 _COMMANDS = {
     ("config", "validate"): cmd_config_validate,
     ("labels", None): cmd_labels,
     ("login", None): cmd_login,
+    ("prompt", "render"): cmd_prompt_render,
 }
 
 
@@ -149,7 +232,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return EXIT_OK
 
-    handler = _COMMANDS[(args.command, getattr(args, "config_command", None))]
+    subcommand = getattr(args, "config_command", None) or getattr(args, "prompt_command", None)
+    handler = _COMMANDS[(args.command, subcommand)]
     try:
         return handler(args)
     except ValidationError as exc:

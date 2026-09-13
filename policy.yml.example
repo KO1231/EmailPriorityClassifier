@@ -1,0 +1,17 @@
+# Personal classification policy.
+#
+# This file is NOT committed — it is where anything specific to you lives, so
+# that prompts/ can stay generic and publishable. Copy it to policy.yml and
+# edit.
+#
+# Everything here is rendered into the system prompt as additional guidance. It
+# is advice to the model, not a rule the code enforces: the classifier still
+# returns only P1/P2/P3, and actions are still decided by config.
+
+version: 1
+
+guidance:
+  - "Mail from university or government domains is never P3; treat it as at least P2."
+  - "Anything from finance@example.com about an invoice is P1 during the last week of a quarter."
+  - "Newsletters from example-vendor.com are P3 even when the subject says URGENT."
+  - "Threads where I am the only recipient and the sender is a person are never P3."

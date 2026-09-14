@@ -11,13 +11,18 @@ thread you are investigating and to spot patterns by sender, and not enough to
 reconstruct the mailbox from the file — which matters because this file
 outlives the run, gets copied to S3, and is the kind of thing that ends up in a
 backup nobody thinks about.
+
+The model's `reason` is left out too, unless asked for. It is a sentence the
+model wrote *about* the mail — "the invoice for ¥3,000,000 from X is overdue" —
+which makes it the mail's content by another route. Answering "why P1?" weeks
+later needs it; keeping it is `observability.history_include_reason`.
 """
 
 import hashlib
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -48,6 +53,7 @@ class ClassificationRecord(BaseModel):
 
     priority: Priority
     confidence: float = 0.0
+    # Empty unless `history_include_reason`; see the module docstring.
     reason: str = ""
     signals: list[str] = Field(default_factory=list)
 
@@ -63,8 +69,11 @@ class ClassificationRecord(BaseModel):
 
     add_label_ids: list[str] = Field(default_factory=list)
     remove_label_ids: list[str] = Field(default_factory=list)
-    # Whether the change was actually written, or only planned.
-    applied: bool = False
+    # Where the change was handed: applied here, queued for another process, or
+    # written to a plan file. Not whether it landed — a record is written as the
+    # change is handed over, and `batchModify` reports no per-thread outcome to
+    # wait for. An `applied: true` that could not know claimed more than that.
+    dispatched_via: Literal["direct", "sqs", "jsonl"] = "direct"
 
 
 def record_for(
@@ -75,7 +84,8 @@ def record_for(
     message_count: int,
     usage: Usage,
     injection_patterns: list[str] | None = None,
-    applied: bool = False,
+    dispatched_via: Literal["direct", "sqs", "jsonl"] = "direct",
+    include_reason: bool = False,
 ) -> ClassificationRecord:
     return ClassificationRecord(
         ts=datetime.now(UTC),
@@ -85,7 +95,7 @@ def record_for(
         message_count=message_count,
         priority=mutation.priority,
         confidence=mutation.confidence,
-        reason=mutation.reason,
+        reason=mutation.reason if include_reason else "",
         signals=mutation.signals,
         backend=mutation.backend,
         model=mutation.model,
@@ -96,7 +106,7 @@ def record_for(
         output_tokens=usage.output_tokens,
         add_label_ids=mutation.add_label_ids,
         remove_label_ids=mutation.remove_label_ids,
-        applied=applied,
+        dispatched_via=dispatched_via,
     )
 
 

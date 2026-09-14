@@ -1,5 +1,6 @@
 """The classification history: enough to investigate, not enough to reconstruct."""
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -59,7 +60,7 @@ def test_provenance_travels_with_the_record() -> None:
 
 def test_records_round_trip_through_a_file(tmp_path: Path) -> None:
     sink = JsonlHistorySink(tmp_path, now=datetime(2026, 3, 4, tzinfo=UTC))
-    record = record_for(MUTATION, subject="s", sender_domain="d", message_count=1, usage=Usage(), applied=True)
+    record = record_for(MUTATION, subject="s", sender_domain="d", message_count=1, usage=Usage(), dispatched_via="sqs")
     sink.write(record)
     sink.close()
 
@@ -101,3 +102,26 @@ def test_cost_is_computed_from_supplied_rates() -> None:
         output_per_mtok=2.0,
     )
     assert cost == pytest.approx(1.25)
+
+
+def test_the_models_reason_is_left_out_by_default() -> None:
+    """It is written about the mail, so it tends to say what the mail said."""
+    record = record_for(MUTATION, subject="s", sender_domain="d", message_count=1, usage=Usage())
+    assert record.reason == ""
+    assert "Deadline tomorrow" not in record.model_dump_json()
+
+
+def test_the_reason_is_kept_when_asked_for() -> None:
+    record = record_for(MUTATION, subject="s", sender_domain="d", message_count=1, usage=Usage(), include_reason=True)
+    assert record.reason == "Deadline tomorrow"
+
+
+def test_a_file_written_before_dispatched_via_still_reads(tmp_path: Path) -> None:
+    path = tmp_path / "old.jsonl"
+    legacy = record_for(MUTATION, subject="s", sender_domain="d", message_count=1, usage=Usage()).model_dump(
+        mode="json"
+    )
+    del legacy["dispatched_via"]
+    legacy["applied"] = True
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+    assert next(read_records(path)).dispatched_via == "direct"

@@ -450,7 +450,8 @@ def test_history_is_recorded_without_the_mail(settings: Any, tmp_path: Path) -> 
     assert record.thread_id == "t1"
     assert record.sender_domain == "example.com"
     assert record.priority is Priority.P1
-    assert record.applied is True
+    assert record.dispatched_via == "direct"
+    assert record.reason == ""  # history_include_reason is off by default
 
 
 # --------------------------------------------------------------------------

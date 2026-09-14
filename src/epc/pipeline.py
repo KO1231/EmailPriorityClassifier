@@ -21,13 +21,14 @@ import traceback
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from typing import Literal
 
 from epc.actions.model import ThreadMutation
 from epc.actions.planner import plan_carry_forward, plan_mutation
 from epc.classify.base import Classifier, Usage
 from epc.classify.budget import build_payload
 from epc.dispatch.applier import ApplyReport
-from epc.dispatch.sink import JsonlSink, MutationSink
+from epc.dispatch.sink import DirectSink, JsonlSink, MutationSink
 from epc.errors import ClassificationError, GmailError, RejectedByProviderError, UnusableResponseError
 from epc.gmail.client import GmailClient
 from epc.gmail.mime import parse_thread
@@ -176,6 +177,9 @@ class Pipeline:
         self._failed_threads: dict[str, str] = {}
         self._succeeded: set[str] = set()
         self._carried_forward: list[ThreadMutation] = []
+        self._dispatched_via: Literal["direct", "sqs", "jsonl"] = (
+            "jsonl" if isinstance(sink, JsonlSink) else "direct" if isinstance(sink, DirectSink) else "sqs"
+        )
 
     def search_query(self) -> str:
         return build_search_query(
@@ -274,7 +278,8 @@ class Pipeline:
                         sender_domain=thread.latest.sender_domain if thread.latest else "",
                         message_count=len(thread.messages),
                         usage=usage,
-                        applied=not isinstance(self._sink, JsonlSink),
+                        dispatched_via=self._dispatched_via,
+                        include_reason=self._settings.observability.history_include_reason,
                     )
                 )
         finally:

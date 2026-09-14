@@ -113,6 +113,9 @@ observability:
   # no record is kept; set it to be able to answer "why was this P1?" weeks
   # later, and to measure whether a prompt change helped.
   # history_dir: log/history
+  # Also keep the model's one-line reason. Off by default: the model writes it
+  # about the mail, so it tends to repeat what the mail said.
+  history_include_reason: false
 
 # Where run state is kept: the threads that keep failing for reasons of their
 # own (content a provider refuses, say), so they stop being retried every run.

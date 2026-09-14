@@ -237,6 +237,9 @@ class ObservabilitySettings(_Section):
     # record of decisions about your mail is something to opt into, not
     # something to discover later.
     history_dir: Path | None = None
+    # Also keep the model's one-line reason in each record. Off by default: it is
+    # written about the mail, and says what the mail said.
+    history_include_reason: bool = False
 
 
 class StateSettings(_Section):

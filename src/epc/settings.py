@@ -299,8 +299,12 @@ class Settings(BaseSettings):
 
     # Top level, and not a member of any section, because it overrides one.
     # Whatever `dispatch` is configured to do — apply now, or hand off to a
-    # queue — this says nothing is written to Gmail. A safety switch that only
-    # worked for some dispatch settings would be worse than none.
+    # queue — a run that plans says nothing is written to Gmail. A safety switch
+    # that only worked for some dispatch settings would be worse than none.
+    #
+    # It governs planning, not replaying. `epc apply` is how a reviewed dry run
+    # gets applied, so it does not consult this; and the apply Lambda only ever
+    # sees what a run that was not dry put on the queue.
     dry_run: bool = False
 
     @classmethod
@@ -323,7 +327,7 @@ class Settings(BaseSettings):
         """Where mutations actually go, with `dry_run` taking precedence.
 
         Keeping the precedence here rather than at the call site is the point:
-        every future entry point gets it, and a new sink cannot accidentally
+        every command that plans gets it, and a new sink cannot accidentally
         become one that writes during a dry run.
         """
         if force_dry_run or self.dry_run:

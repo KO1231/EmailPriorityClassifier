@@ -47,9 +47,6 @@ EXIT_FATAL = 1
 # Some threads were lost but the run completed. Distinct from a fatal error so a
 # scheduler can tell "nothing happened" from "most of it happened".
 EXIT_PARTIAL = 2
-# Some threads were lost but the run completed. Distinct from a fatal error so
-# a scheduler can tell "nothing happened" from "most of it happened".
-EXIT_PARTIAL = 2
 
 
 def _add_config_option(parser: argparse.ArgumentParser) -> None:

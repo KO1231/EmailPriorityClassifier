@@ -122,8 +122,13 @@ not that it landed. `batchModify` reports nothing per thread, so a record cannot
 
 **`dry_run` is top level, not inside a section.** It overrides `dispatch`, so it is not
 one of dispatch's peers. `Settings.resolve_sink()` holds that precedence in one place:
-every entry point gets it, and a sink added later cannot accidentally become one that
-writes during a dry run.
+every command that plans gets it, and a sink added later cannot accidentally become one
+that writes during a dry run. It governs planning, not replaying. `epc apply` ignores it
+on purpose: applying a reviewed plan is what a dry run is for, and honouring the flag there
+would make that impossible without editing the config. The apply Lambda cannot see a dry
+run's plan, because a dry run never enqueues. `epc apply` does re-read each thread's
+labels first, since a plan can wait hours and a person may have labelled a thread in the
+meantime. The Lambda skips that read: its window is seconds, and the read costs quota.
 
 **A stop request means "stop starting work", not "stop".** ECS sends `SIGTERM` and
 `SIGKILL` thirty seconds later. `shutdown.py` sets a flag; the pipeline stops beginning
@@ -235,18 +240,31 @@ stay publishable. A guard test asserts they contain no personal context.
 
 ---
 
+## AWS
+
+Terraform laid out like `KO1231/Delibird-priv`: `environments/<env>/` wires
+`modules/aws_*` together. `dev/` and `prod/` stay git-ignored; only `sample/` is committed.
+
+- **Secrets never pass through Terraform state.** Parameters are created holding a
+  placeholder with `lifecycle { ignore_changes = [value] }` and filled out of band
+  (`terraform output next_steps`). A value passed through a variable ends up in plaintext
+  in the state file and in every plan.
+- **SQS dispatch** is FIFO with `MessageGroupId = thread_id`. The per-thread ordering is
+  what matters. The five-minute dedup window is a cost optimisation, not a correctness
+  mechanism: re-applying a label is a no-op. The apply Lambda reports partial batch
+  failures, and anything that keeps failing lands in the DLQ.
+- **Backends.** Credentials: `local`, `ssm`, `secrets_manager`. State: `local`, `ssm`,
+  `s3`. `service_account` is accepted by the schema and refused at startup; it needs a
+  Workspace domain to delegate from.
+
 ## Not done yet
 
-- **Container and AWS.** `Dockerfile`, then Terraform laid out like
-  `KO1231/Delibird-priv` (`environments/` + `modules/aws_*`). `dev/` and `prod/` stay
-  git-ignored; only `sample/` is committed. Secrets never pass through Terraform state —
-  SSM parameters are created empty with `lifecycle { ignore_changes = [value] }` and
-  filled out-of-band.
-- **SQS dispatch.** `SqsSink` / `SqsSource` plus an apply Lambda. FIFO with
-  `MessageGroupId = thread_id`; the ordering matters more than the 5-minute dedup
-  window, which is a cost optimisation rather than a correctness mechanism.
-- **Remote credential and state backends.** The protocols exist (`gmail/auth.py`,
-  `state.py`); SSM Parameter Store and S3 implementations do not.
+- **Quoted label names in search are unverified.** A probe returned no hits for
+  `label:"name"` and hits for the bare `label:name`. `query.py::quote_label` quotes names
+  with spaces or non-ASCII characters. If Gmail does not accept the quotes, `-label:"…"`
+  excludes nothing, and every run re-lists the whole inbox. The configured labels need
+  no quotes, so nothing is affected today. Confirming it needs a throwaway label with a
+  space in its name.
 - **Eval harness.** A golden set and `epc eval`, so prompt changes are measured rather
   than guessed at. `report.py` already writes what it needs. Deferred by choice — worth
   building when the priority criteria are still being tuned, not before.

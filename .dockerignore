@@ -4,7 +4,10 @@
 !uv.lock
 !README.md
 !src/
-!prompts/
+# The two generic prompts by name, as `.gitignore` does. A personal prompt left
+# in a working copy must not ride along into a pushed image.
+!prompts/system.md
+!prompts/user.md
 
 # Belt and braces. The patterns above already exclude these, but this file is
 # the last thing standing between a secret and a layer that gets pushed.

@@ -204,7 +204,8 @@ OpenAI・Bedrock・ローカルサーバの切り替えは設定1行で、他の
 
    ```bash
    uv run epc login
-   uv run epc labels   # 設定した名前が正しく解決できるか確認
+   uv run epc labels            # 設定した名前が正しく解決できるか確認
+   uv run epc labels --create   # まだないラベルを作る場合
    ```
 
 ---

@@ -184,8 +184,10 @@ class DispatchSettings(_Section):
 
 class SecuritySettings(_Section):
     # What to do with a thread whose content trips the injection heuristics.
-    # `downgrade_and_flag` records the signal and withholds the high-privilege
-    # actions (starring, moving to Primary) from that thread.
+    # `ignore`: nothing. `flag`: record it on the mutation and in the history,
+    # and let rules match on it, but take no action away. `downgrade_and_flag`:
+    # record it and withhold the high-privilege actions (starring, marking
+    # important, moving to Primary) from that thread.
     on_suspected_injection: InjectionResponse = "downgrade_and_flag"
 
 

@@ -68,6 +68,7 @@ def plan_mutation(
     rules: Sequence[ActionRule],
     move_targets: set[str],
     suspicious: bool = False,
+    withhold_privileged_when_suspicious: bool = True,
     allow_destructive: bool = False,
     confidence: float = 0.0,
     reason: str = "",
@@ -77,7 +78,14 @@ def plan_mutation(
     prompt_version: str = "",
     now: datetime | None = None,
 ) -> ThreadMutation:
-    """Build the mutation for one classified thread."""
+    """Build the mutation for one classified thread.
+
+    `suspicious` is recorded on the mutation and visible to rules either way.
+    Whether it also withholds the high-privilege verbs is a separate choice —
+    `security.on_suspected_injection: flag` records without withholding — and
+    defaults to withholding, so a caller that forgets to decide gets the safe
+    one.
+    """
     actions = PlannedActions()
     # The priority label is not a rule — it is the point of the tool.
     actions.add.add(priority_label_ids[priority])
@@ -86,7 +94,7 @@ def plan_mutation(
     for verb in verbs:
         if verb in DESTRUCTIVE_VERBS and not allow_destructive:
             continue
-        if suspicious and verb in HIGH_PRIVILEGE_VERBS:
+        if suspicious and withhold_privileged_when_suspicious and verb in HIGH_PRIVILEGE_VERBS:
             continue
         actions.apply(verb, thread_label_ids=thread_label_ids, move_targets=move_targets)
 

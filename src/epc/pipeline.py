@@ -388,7 +388,8 @@ class Pipeline:
             self._raise_if_stopping(thread)
             result = self._classifier.classify(payload)
 
-        suspicious = payload.injection.suspicious and (self._settings.security.on_suspected_injection != "ignore")
+        response = self._settings.security.on_suspected_injection
+        suspicious = payload.injection.suspicious and response != "ignore"
         mutation = plan_mutation(
             thread_id=thread.thread_id,
             message_ids=thread.message_ids,
@@ -398,6 +399,9 @@ class Pipeline:
             rules=self._settings.actions.rules,
             move_targets=set(self._settings.actions.move_targets),
             suspicious=suspicious,
+            # `flag` records the signal and takes nothing away; only
+            # `downgrade_and_flag` withholds the star and the move.
+            withhold_privileged_when_suspicious=response == "downgrade_and_flag",
             allow_destructive=self._settings.actions.allow_destructive,
             confidence=result.classification.confidence,
             reason=result.classification.reason,

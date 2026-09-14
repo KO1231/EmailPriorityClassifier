@@ -121,6 +121,19 @@ def test_a_suspicious_thread_keeps_its_label_but_loses_the_privileges() -> None:
     assert mutation.suspicious is True
 
 
+def test_flag_only_records_and_takes_nothing_away() -> None:
+    """`flag` and `downgrade_and_flag` used to behave identically: a user who
+    chose to only record the signal silently lost actions on real mail."""
+    mutation = plan(
+        thread_label_ids={"INBOX", "CATEGORY_PROMOTIONS"},
+        suspicious=True,
+        withhold_privileged_when_suspicious=False,
+    )
+    assert mutation.suspicious is True
+    assert "STARRED" in mutation.add_label_ids
+    assert mutation.remove_label_ids == ["CATEGORY_PROMOTIONS"]
+
+
 def test_marking_read_is_still_allowed_on_a_suspicious_thread() -> None:
     rules = [ActionRule(when=ActionCondition(priority=Priority.P3), do=[ActionVerb.MARK_READ])]
     mutation = plan(priority=Priority.P3, rules=rules, suspicious=True)

@@ -11,6 +11,9 @@ from typing import Protocol, runtime_checkable
 from epc.actions.model import ThreadMutation
 from epc.dispatch.applier import ApplyReport, MutationApplier
 from epc.gmail.client import BATCH_MODIFY_LIMIT
+from epc.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @runtime_checkable
@@ -66,9 +69,10 @@ class JsonlSink:
     Written a line at a time so an interrupted run still leaves a usable file.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, log_planned: bool = False) -> None:
         self._path = path
         self._count = 0
+        self._log_planned = log_planned
         path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = path.open("w", encoding="utf-8")
 
@@ -76,6 +80,18 @@ class JsonlSink:
         self._handle.write(mutation.model_dump_json() + "\n")
         self._handle.flush()
         self._count += 1
+        if self._log_planned:
+            # Facts only. The reason is model output about the mail, and does
+            # not go to a log.
+            logger.info(
+                "planned",
+                thread_id=mutation.thread_id,
+                origin=mutation.origin,
+                priority=mutation.priority.value,
+                add=mutation.add_label_ids,
+                remove=mutation.remove_label_ids,
+                suspicious=mutation.suspicious,
+            )
 
     def close(self) -> ApplyReport:
         self._handle.close()

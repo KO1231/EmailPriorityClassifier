@@ -355,6 +355,8 @@ tests/                unit · integration · injection · fixtures（全て合�
 
 ローカルでもコンテナでも動きます。AWS 側は Terraform に記述してあります（ECR のイメージ、定期実行される Fargate タスク、FIFO キュー、ラベル変更を適用する Lambda）。
 
+AWS では `config.yml` と `policy.yml` をイメージに入れず、パラメータストアに置きます。ECS が起動時に環境変数 `EPC_CONFIG_YAML` / `EPC_POLICY_YAML` として注入するので、同じイメージをどの環境でも使えます。パラメータの中身は Terraform を通さず、`terraform output next_steps` に出る `aws ssm put-parameter` で入れてください（Terraform を通すと state ファイルに平文で残るため）。Gmail の認証情報はパラメータストアのほか、`credentials.backend: secrets_manager` で Secrets Manager にも置けます。
+
 **未実装**: 評価（eval）の仕組み。プロンプトの変更が良くなったのか悪くなったのかを測れるようにするものです。判断基準をこれから調整していく段階になったら作る価値があります。
 
 ---

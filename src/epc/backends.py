@@ -12,23 +12,25 @@ from epc.settings import Settings
 from epc.state import LocalFileStateStore, StateStore
 
 
-def _missing(extra: str, what: str) -> ConfigError:
-    return ConfigError(f"the {what} backend needs boto3; install the '{extra}' extra")
-
-
 def build_credential_store(settings: Settings) -> CredentialStore:
     credentials = settings.credentials
     match credentials.backend:
         case "local":
             return LocalFileCredentialStore(credentials.token_file)
-        case "ssm" | "secrets_manager":
-            try:
-                from epc.gmail.auth import SsmCredentialStore
-            except ImportError as exc:  # pragma: no cover - import is unconditional
-                raise _missing("aws", credentials.backend) from exc
+        case "ssm":
+            from epc.gmail.auth import SsmCredentialStore
+
             if not credentials.parameter_name:  # pragma: no cover - settings validate this
                 raise ConfigError("credentials.parameter_name is required")
             return SsmCredentialStore(credentials.parameter_name, region=settings.aws_region)
+        case "secrets_manager":
+            # Once aliased to the Parameter Store store: a config naming Secrets
+            # Manager read and wrote a parameter instead, and said nothing.
+            from epc.gmail.auth import SecretsManagerCredentialStore
+
+            if not credentials.parameter_name:  # pragma: no cover - settings validate this
+                raise ConfigError("credentials.parameter_name is required")
+            return SecretsManagerCredentialStore(credentials.parameter_name, region=settings.aws_region)
         case "service_account":
             raise ConfigError(
                 "the service_account credential backend is not implemented yet; "
@@ -62,7 +64,7 @@ def build_sink(settings: Settings, *, gmail_client: object, force_dry_run: bool 
 
     match settings.resolve_sink(force_dry_run=force_dry_run):
         case "jsonl":
-            return JsonlSink(settings.dispatch.jsonl_path)
+            return JsonlSink(settings.dispatch.jsonl_path, log_planned=settings.dispatch.log_planned)
         case "sqs":
             import boto3
 

@@ -14,3 +14,11 @@ output "openai_api_key" {
 output "state" {
   value = { name = aws_ssm_parameter.state.name, arn = aws_ssm_parameter.state.arn }
 }
+
+output "config" {
+  value = { name = aws_ssm_parameter.config.name, arn = aws_ssm_parameter.config.arn }
+}
+
+output "policy" {
+  value = { name = aws_ssm_parameter.policy.name, arn = aws_ssm_parameter.policy.arn }
+}

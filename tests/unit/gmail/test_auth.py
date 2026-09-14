@@ -212,3 +212,105 @@ def test_a_run_refreshes_what_is_stored(monkeypatch: pytest.MonkeyPatch) -> None
     refresh_raises(monkeypatch, None)
     credentials = load_credentials(MemoryStore(serialise(FAKE)))
     assert credentials.refresh_token == FAKE.refresh_token
+
+
+# --------------------------------------------------------------------------
+# Remote stores
+# --------------------------------------------------------------------------
+
+
+class NotFoundError(Exception):
+    pass
+
+
+class FakeSecretsManager:
+    def __init__(self, secret: str | None = None) -> None:
+        self.secret = secret
+        self.calls: list[str] = []
+
+    def get_secret_value(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append("get")
+        if self.secret is None:
+            raise NotFoundError("An error occurred (ResourceNotFoundException) when calling GetSecretValue")
+        return {"SecretString": self.secret}
+
+    def put_secret_value(self, **kwargs: Any) -> None:
+        self.calls.append("put")
+        if self.secret is None:
+            raise NotFoundError("An error occurred (ResourceNotFoundException) when calling PutSecretValue")
+        self.secret = kwargs["SecretString"]
+
+    def create_secret(self, **kwargs: Any) -> None:
+        self.calls.append("create")
+        self.secret = kwargs["SecretString"]
+
+
+def test_secrets_manager_round_trips() -> None:
+    from epc.gmail.auth import SecretsManagerCredentialStore
+
+    client = FakeSecretsManager("{}")
+    store = SecretsManagerCredentialStore("epc/gmail", client=client)
+    store.store(serialise(FAKE))
+    assert deserialise(store.load() or "").refresh_token == FAKE.refresh_token
+
+
+def test_a_missing_secret_reads_as_nothing_stored() -> None:
+    from epc.gmail.auth import SecretsManagerCredentialStore
+
+    assert SecretsManagerCredentialStore("epc/gmail", client=FakeSecretsManager()).load() is None
+
+
+def test_login_creates_the_secret_when_it_does_not_exist() -> None:
+    from epc.gmail.auth import SecretsManagerCredentialStore
+
+    client = FakeSecretsManager()
+    SecretsManagerCredentialStore("epc/gmail", client=client).store(serialise(FAKE))
+    assert client.calls == ["put", "create"]
+    assert client.secret is not None
+
+
+def test_any_other_secrets_manager_failure_is_a_credential_error() -> None:
+    from epc.gmail.auth import SecretsManagerCredentialStore
+
+    class Denied(FakeSecretsManager):
+        def get_secret_value(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("AccessDeniedException")
+
+    with pytest.raises(CredentialError, match="could not read epc/gmail"):
+        SecretsManagerCredentialStore("epc/gmail", client=Denied()).load()
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [("ssm", "SsmCredentialStore"), ("secrets_manager", "SecretsManagerCredentialStore")],
+)
+def test_the_configured_backend_is_the_one_used(tmp_path: Path, backend: str, expected: str) -> None:
+    """`secrets_manager` used to build the Parameter Store store."""
+    from epc.backends import build_credential_store
+    from epc.settings import load_settings
+
+    path = tmp_path / "config.yml"
+    path.write_text(
+        'labels: {p1: "a", p2: "b", p3: "c"}\n'
+        f"aws_region: ap-northeast-1\ncredentials: {{backend: {backend}, parameter_name: /epc/test/gmail}}\n",
+        encoding="utf-8",
+    )
+    assert type(build_credential_store(load_settings(path))).__name__ == expected
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [(None, "SsmCredentialStore"), ("ssm", "SsmCredentialStore"), ("secrets_manager", "SecretsManagerCredentialStore")],
+)
+def test_the_apply_lambda_honours_the_backend_too(
+    monkeypatch: pytest.MonkeyPatch, backend: str | None, expected: str
+) -> None:
+    from epc.aws import apply_handler
+
+    monkeypatch.setenv("EPC__CREDENTIALS__PARAMETER_NAME", "/epc/test/gmail")
+    monkeypatch.setenv("EPC__AWS_REGION", "ap-northeast-1")
+    if backend is None:
+        monkeypatch.delenv("EPC__CREDENTIALS__BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("EPC__CREDENTIALS__BACKEND", backend)
+    assert type(apply_handler.credential_store()).__name__ == expected

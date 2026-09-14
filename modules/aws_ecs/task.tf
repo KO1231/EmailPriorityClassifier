@@ -18,6 +18,13 @@ resource "aws_ecs_task_definition" "classify" {
   execution_role_arn = var.execution_role_arn
   task_role_arn      = var.task_role_arn
 
+  # Fargate's ephemeral storage, mounted at /tmp. With a read-only root
+  # filesystem nothing else is writable — Fargate adds no tmpfs of its own — and
+  # a dry run has to write its plan somewhere.
+  volume {
+    name = "tmp"
+  }
+
   container_definitions = jsonencode([
     {
       name      = "epc"
@@ -49,7 +56,9 @@ resource "aws_ecs_task_definition" "classify" {
       readonlyRootFilesystem = true
       # The container writes to /tmp only; log/ and .state/ are not used on AWS,
       # where logs go to CloudWatch and run state to Parameter Store.
-      mountPoints = []
+      mountPoints = [
+        { sourceVolume = "tmp", containerPath = "/tmp", readOnly = false }
+      ]
     }
   ])
 }

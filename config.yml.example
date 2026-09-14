@@ -88,6 +88,9 @@ actions:
 dispatch:
   sink: direct # direct | jsonl
   jsonl_path: log/mutations.jsonl
+  # Also log each planned change (IDs, priority, labels; never content). For
+  # containers, where the plan file does not outlive the run.
+  log_planned: false
   # Threads buffered before a write. batchModify takes 1000 message IDs per
   # call, which is what turns 1500 round trips into two.
   batch_size: 1000

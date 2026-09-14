@@ -182,3 +182,40 @@ def test_blank_lines_are_skipped(tmp_path: Path) -> None:
 def test_both_sinks_satisfy_the_protocol(tmp_path: Path) -> None:
     assert isinstance(DirectSink(MutationApplier(FakeClient())), MutationSink)  # type: ignore[arg-type]
     assert isinstance(JsonlSink(tmp_path / "x.jsonl"), MutationSink)
+
+
+def test_a_dry_run_can_log_its_plan_without_content(tmp_path: Path) -> None:
+    """On ECS the plan file is gone when the task stops; the log is what remains."""
+    from structlog.testing import capture_logs
+
+    mutation = _dry_run_mutation()
+    with capture_logs() as logs:
+        sink = JsonlSink(tmp_path / "plan.jsonl", log_planned=True)
+        sink.emit(mutation)
+        sink.close()
+
+    (event,) = [entry for entry in logs if entry["event"] == "planned"]
+    assert event["thread_id"] == mutation.thread_id
+    assert event["add"] == mutation.add_label_ids
+    assert "reason" not in event
+
+
+def test_a_dry_run_logs_nothing_unless_asked(tmp_path: Path) -> None:
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        sink = JsonlSink(tmp_path / "plan.jsonl")
+        sink.emit(_dry_run_mutation())
+        sink.close()
+    assert not [entry for entry in logs if entry["event"] == "planned"]
+
+
+def _dry_run_mutation() -> ThreadMutation:
+    return ThreadMutation(
+        thread_id="t1",
+        message_ids=["m1"],
+        add_label_ids=["Label_1"],
+        priority=Priority.P1,
+        reason="The sender says the invoice for 3,000,000 yen is overdue",
+        classified_at=datetime(2026, 9, 14, tzinfo=UTC),
+    )

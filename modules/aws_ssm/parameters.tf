@@ -36,6 +36,38 @@ resource "aws_ssm_parameter" "openai_api_key" {
   }
 }
 
+# The whole of config.yml and policy.yml, injected into the task as
+# EPC_CONFIG_YAML and EPC_POLICY_YAML. The image carries neither — the same
+# image serves every deployment — and both hold personal rules, so they are
+# encrypted like the credentials. Intelligent-Tiering moves a parameter to the
+# Advanced tier only if it outgrows Standard's 4 KB.
+#
+#   aws ssm put-parameter --overwrite --type SecureString \
+#     --name /epc/<env>/config --value file://config.yml
+resource "aws_ssm_parameter" "config" {
+  name        = "${local.prefix}/config"
+  description = "config.yml, injected as EPC_CONFIG_YAML."
+  type        = "SecureString"
+  tier        = "Intelligent-Tiering"
+  value       = "placeholder"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_ssm_parameter" "policy" {
+  name        = "${local.prefix}/policy"
+  description = "policy.yml, injected as EPC_POLICY_YAML. May stay empty ({})."
+  type        = "SecureString"
+  tier        = "Intelligent-Tiering"
+  value       = "{}"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 # Thread IDs of mail that keeps failing, and counters. Not secret, and holding
 # no content; encrypting it would add a kms:Decrypt to the task role for
 # nothing. Written by the task after every run, so its value is ignored here too.

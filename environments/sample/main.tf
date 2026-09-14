@@ -39,8 +39,12 @@ module "aws_iam" {
 
   ssm_prefix        = module.aws_ssm.prefix
   gmail_credentials = module.aws_ssm.gmail_credentials
-  openai_api_key    = module.aws_ssm.openai_api_key
   state_parameter   = module.aws_ssm.state
+  injected_parameters = [
+    module.aws_ssm.openai_api_key,
+    module.aws_ssm.config,
+    module.aws_ssm.policy,
+  ]
 
   mutations_queue = module.aws_sqs.mutations
   log_group_arns  = module.aws_cloudwatch.log_group_arns
@@ -83,10 +87,18 @@ module "aws_ecs" {
     EPC__DISPATCH__SINK              = "sqs"
     EPC__DISPATCH__QUEUE_URL         = module.aws_sqs.mutations.url
     EPC__OBSERVABILITY__LOG_JSON     = "true"
+    # A dry run's plan: written where the filesystem allows, and logged, since
+    # the file is gone when the task stops.
+    EPC__DISPATCH__JSONL_PATH  = "/tmp/mutations.jsonl"
+    EPC__DISPATCH__LOG_PLANNED = "true"
   }
 
+  # Injected by ECS with the execution role. config.yml and policy.yml arrive
+  # this way too: the image carries neither.
   secret_parameters = {
-    OPENAI_API_KEY = module.aws_ssm.openai_api_key.arn
+    OPENAI_API_KEY  = module.aws_ssm.openai_api_key.arn
+    EPC_CONFIG_YAML = module.aws_ssm.config.arn
+    EPC_POLICY_YAML = module.aws_ssm.policy.arn
   }
 }
 
@@ -137,6 +149,10 @@ output "next_steps" {
          uv run epc login   # with credentials.backend: ssm in your config.yml
          aws ssm put-parameter --overwrite --type SecureString \
            --name ${module.aws_ssm.openai_api_key.name} --value sk-...
+         aws ssm put-parameter --overwrite --type SecureString \
+           --name ${module.aws_ssm.config.name} --value file://config.yml
+         aws ssm put-parameter --overwrite --type SecureString \
+           --name ${module.aws_ssm.policy.name} --value file://policy.yml   # optional
 
     3. Read one run before enabling the schedule:
          aws ecs run-task --cluster ${module.aws_ecs.cluster.name} ...

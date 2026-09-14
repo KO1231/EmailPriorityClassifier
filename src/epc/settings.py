@@ -23,19 +23,29 @@ silently does nothing is the failure mode this whole module exists to avoid.
 from pathlib import Path
 from typing import Any, Literal, Self
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
+    InitSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     YamlConfigSettingsSource,
 )
 
 from epc.actions.rules import ActionRule
+from epc.errors import ConfigError
 from epc.gmail.models import NON_PRIMARY_CATEGORIES
 from epc.priority import Priority
 
 DEFAULT_CONFIG_FILENAME = "config.yml"
+
+# The whole of `config.yml`, as an environment variable. For deployments where a
+# file is the awkward thing to deliver: on ECS it is injected from a Parameter
+# Store parameter by the task's `secrets` block, the same way as an API key, so
+# the image carries nothing personal and the task definition carries nothing at
+# all. `EPC__…` variables still override individual keys on top of it.
+CONFIG_ENV = "EPC_CONFIG_YAML"
 
 StateBackend = Literal["local", "ssm", "s3"]
 CredentialsBackend = Literal["local", "ssm", "secrets_manager", "service_account"]
@@ -166,6 +176,10 @@ class DispatchSettings(_Section):
 
     sink: SinkKind = "direct"
     jsonl_path: Path = Path("log/mutations.jsonl")
+    # Also log each planned change — IDs, priority and labels, never content.
+    # For where the plan file does not outlive the run, as in a container: on
+    # ECS, a dry run is otherwise read from nowhere.
+    log_planned: bool = False
 
     # sink: sqs — a FIFO queue. Ordering per thread is what protects
     # correctness once a rule can remove a label; the dedup window is a cost
@@ -321,15 +335,43 @@ class Settings(BaseSettings):
         return f"{self.gmail.query} {extra}".strip() if extra else self.gmail.query
 
 
-def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings:
-    """Build :class:`Settings` from `config_path`, the environment and `overrides`.
+def load_settings(
+    config_path: Path | None = None,
+    *,
+    config_text: str | None = None,
+    **overrides: Any,
+) -> Settings:
+    """Build :class:`Settings` from a config, the environment and `overrides`.
 
+    The config is `config_text` when given — the YAML itself — and otherwise
+    the file at `config_path`. Either sits below the environment in precedence.
     `overrides` are the highest-precedence source and exist for CLI flags.
 
-    A per-call subclass is what lets the YAML path vary: pydantic-settings takes
-    it from the class config, and mutating that on the shared class would leak
+    A per-call subclass is what lets the YAML source vary: pydantic-settings
+    takes it from the class, and mutating that on the shared class would leak
     between calls and between tests.
     """
+    if config_text is not None:
+        data = parse_yaml_mapping(config_text, source=CONFIG_ENV)
+
+        class _TextScopedSettings(Settings):
+            # No file is read, so none is named; otherwise pydantic-settings
+            # warns that the class-level `yaml_file` went unused.
+            model_config = SettingsConfigDict(yaml_file=None)
+
+            @classmethod
+            def settings_customise_sources(
+                cls,
+                settings_cls: type[BaseSettings],
+                init_settings: PydanticBaseSettingsSource,
+                env_settings: PydanticBaseSettingsSource,
+                dotenv_settings: PydanticBaseSettingsSource,  # noqa: ARG003 - fixed hook signature
+                file_secret_settings: PydanticBaseSettingsSource,  # noqa: ARG003 - fixed hook signature
+            ) -> tuple[PydanticBaseSettingsSource, ...]:
+                return (init_settings, env_settings, InitSettingsSource(settings_cls, init_kwargs=data))
+
+        return _TextScopedSettings(**overrides)
+
     if config_path is None:
         return Settings(**overrides)
 
@@ -337,3 +379,16 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
         model_config = SettingsConfigDict(**{**Settings.model_config, "yaml_file": config_path})
 
     return _FileScopedSettings(**overrides)
+
+
+def parse_yaml_mapping(text: str, *, source: str) -> dict[str, Any]:
+    """Parse YAML that has to be a mapping, naming `source` when it is not."""
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{source} is not valid YAML: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{source} must be a mapping")
+    return data

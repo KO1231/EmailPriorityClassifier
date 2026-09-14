@@ -168,6 +168,16 @@ One image for every deployment; only environment variables and mounts differ.
 Baked in: the package and the generic prompts. Mounted: `config.yml`, `policy.yml`,
 `secrets/`, `log/`, `.state/`.
 
+On ECS nothing is mounted. `config.yml` and `policy.yml` live in SecureString parameters
+and arrive as `EPC_CONFIG_YAML` / `EPC_POLICY_YAML` through the task's `secrets` block,
+beside `OPENAI_API_KEY`. When `EPC_CONFIG_YAML` is set it wins over any file, and `EPC__…`
+variables still override single keys on top of it. Those `secrets` are resolved by the
+**execution** role before the program starts, so that role needs `ssm:GetParameters` and
+`kms:Decrypt` on them. The task role deliberately cannot read them. The root filesystem is
+read-only and Fargate adds no tmpfs, so an ephemeral volume is mounted at `/tmp`. A dry
+run there writes its plan to `/tmp` and, with `dispatch.log_planned`, to CloudWatch, since
+the file is gone when the task stops.
+
 - **Base images are pinned by digest.** A tag is mutable, and a base that changes under
   a build is the same hole `uv.lock` closes on the dependency side.
 - **uv is installed from PyPI, not copied from `ghcr.io/astral-sh/uv`.** One registry,

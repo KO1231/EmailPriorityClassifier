@@ -19,22 +19,26 @@ Subcommands land alongside the code they drive. Present so far:
     file instead of applying them; that file can then be replayed.
 ``epc apply``
     Apply a file of planned changes — exactly what was reviewed, nothing else.
+``epc failures``
+    List or forget the threads that are skipped for failing repeatedly.
 """
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
 from epc import __version__
 from epc.errors import EpcError
-from epc.settings import DEFAULT_CONFIG_FILENAME, Settings, load_settings
+from epc.settings import CONFIG_ENV, DEFAULT_CONFIG_FILENAME, Settings, load_settings
 
 if TYPE_CHECKING:  # pragma: no cover
+    from epc.classify.prompt import PromptRenderer
     from epc.gmail.client import GmailClient
 
 EXIT_OK = 0
@@ -119,16 +123,43 @@ def _add_prompt_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--policy", type=Path, default=Path("policy.yml"), metavar="PATH", help="personal policy")
 
 
-def _load(path: Path) -> Settings:
-    if not path.is_file():
-        raise EpcError(f"configuration file not found: {path}\nCopy {DEFAULT_CONFIG_FILENAME}.example and fill it in.")
+def _config_source(path: Path) -> str:
+    """What the configuration is read from, for messages."""
+    return CONFIG_ENV if os.environ.get(CONFIG_ENV) else str(path)
 
-    return load_settings(path)
+
+def _load(path: Path, **overrides: Any) -> Settings:
+    # The environment variable wins when it is set: it is how a deployment with
+    # no config file delivers one, and a stray file in the image must not
+    # quietly take its place.
+    text = os.environ.get(CONFIG_ENV)
+    if text:
+        return load_settings(config_text=text, **overrides)
+    if not path.is_file():
+        raise EpcError(
+            f"configuration file not found: {path}\n"
+            f"Copy {DEFAULT_CONFIG_FILENAME}.example and fill it in, or set {CONFIG_ENV} to its contents."
+        )
+    return load_settings(path, **overrides)
+
+
+def _policy_source(path: Path) -> str:
+    from epc.classify.prompt import POLICY_ENV
+
+    if os.environ.get(POLICY_ENV):
+        return POLICY_ENV
+    return str(path) if path.is_file() else "none"
+
+
+def _renderer(args: argparse.Namespace) -> PromptRenderer:
+    from epc.classify.prompt import POLICY_ENV, PromptRenderer
+
+    return PromptRenderer.load(args.prompts, args.policy, policy_text=os.environ.get(POLICY_ENV) or None)
 
 
 def cmd_config_validate(args: argparse.Namespace) -> int:
     settings = _load(args.config)
-    print(f"{args.config}: valid\n")
+    print(f"{_config_source(args.config)}: valid\n")
     print(f"  search query        {settings.search_query}")
     print(f"  max threads         {settings.gmail.max_threads}")
     print(f"  llm backend         {settings.llm.backend}")
@@ -212,7 +243,6 @@ _EXAMPLE_THREAD = {
 
 def cmd_prompt_render(args: argparse.Namespace) -> int:
     from epc.classify.budget import build_payload
-    from epc.classify.prompt import PromptRenderer
     from epc.gmail.mime import parse_thread
 
     settings = _load(args.config)
@@ -225,10 +255,10 @@ def cmd_prompt_render(args: argparse.Namespace) -> int:
         raw = _EXAMPLE_THREAD
 
     payload = build_payload(parse_thread(raw), settings.llm.budget)
-    rendered = PromptRenderer.load(args.prompts, args.policy).render(payload)
+    rendered = _renderer(args).render(payload)
 
     print(f"# prompt version {rendered.prompt_version}   nonce {rendered.nonce}")
-    print(f"# policy: {args.policy if args.policy.is_file() else 'none'}")
+    print(f"# policy: {_policy_source(args.policy)}")
     print(f"# estimated {payload.estimated_tokens} tokens, {payload.omitted_messages} messages omitted")
     print("\n===== system =====\n")
     print(rendered.system)
@@ -256,16 +286,13 @@ def _gmail_client(settings: Settings) -> GmailClient:
 def cmd_run(args: argparse.Namespace) -> int:
     from epc.backends import build_sink, build_state_store
     from epc.classify.factory import build_classifier
-    from epc.classify.prompt import PromptRenderer
     from epc.gmail.labels import resolve_priority_labels
     from epc.logging import configure_logging
     from epc.pipeline import Pipeline
     from epc.report import HistorySink, JsonlHistorySink, NullHistorySink
     from epc.shutdown import shutdown_on_signal
 
-    settings = _load(args.config)
-    if args.limit is not None:
-        settings = load_settings(args.config, gmail={"max_threads": args.limit})
+    settings = _load(args.config) if args.limit is None else _load(args.config, gmail={"max_threads": args.limit})
 
     configure_logging(
         level=settings.observability.log_level,
@@ -278,7 +305,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # is a configuration error, not a surprise 1500 threads later.
     priority_label_ids = resolve_priority_labels(client.list_labels(), settings.labels.by_priority)
 
-    renderer = PromptRenderer.load(args.prompts, args.policy)
+    renderer = _renderer(args)
     classifier = build_classifier(settings, renderer)
 
     sink_kind = settings.resolve_sink(force_dry_run=args.dry_run)
@@ -411,7 +438,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return handler(args)
     except ValidationError as exc:
-        print(f"{args.config}: invalid\n\n{exc}", file=sys.stderr)
+        print(f"{_config_source(args.config)}: invalid\n\n{exc}", file=sys.stderr)
         return EXIT_FATAL
     except EpcError as exc:
         print(f"error: {exc}", file=sys.stderr)

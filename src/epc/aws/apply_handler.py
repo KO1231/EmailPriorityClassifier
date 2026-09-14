@@ -8,7 +8,7 @@ That is the import boundary paying off: `tests/unit/test_layering.py` asserts
 that `actions/` and `dispatch/` never reach `classify/`, which is what keeps
 this deployment to `google-api-python-client` plus `boto3`.
 
-Configuration is three environment variables. Deliberately not the full
+Configuration is a handful of environment variables. Deliberately not the full
 `Settings` object: requiring `labels` here would mean carrying the classifier's
 configuration into a process that cannot classify.
 """
@@ -18,21 +18,32 @@ from typing import Any
 
 from epc.dispatch.applier import MutationApplier
 from epc.dispatch.sqs import parse_mutations
-from epc.gmail.auth import SsmCredentialStore, load_credentials
+from epc.gmail.auth import CredentialStore, SecretsManagerCredentialStore, SsmCredentialStore, load_credentials
 from epc.gmail.client import GmailClient
 from epc.logging import configure_logging, get_logger
 
 CREDENTIALS_PARAMETER_ENV = "EPC__CREDENTIALS__PARAMETER_NAME"
+# `ssm` (the default) or `secrets_manager`, as `credentials.backend` in config.
+CREDENTIALS_BACKEND_ENV = "EPC__CREDENTIALS__BACKEND"
 REGION_ENV = "EPC__AWS_REGION"
 LOG_LEVEL_ENV = "EPC__OBSERVABILITY__LOG_LEVEL"
 
 logger = get_logger(__name__)
 
 
-def _client() -> GmailClient:
-    parameter = os.environ[CREDENTIALS_PARAMETER_ENV]
+def credential_store() -> CredentialStore:
+    name = os.environ[CREDENTIALS_PARAMETER_ENV]
     region = os.environ.get(REGION_ENV) or None
-    return GmailClient(load_credentials(SsmCredentialStore(parameter, region=region)))
+    backend = os.environ.get(CREDENTIALS_BACKEND_ENV) or "ssm"
+    if backend == "secrets_manager":
+        return SecretsManagerCredentialStore(name, region=region)
+    if backend != "ssm":
+        raise ValueError(f"{CREDENTIALS_BACKEND_ENV} must be 'ssm' or 'secrets_manager', not {backend!r}")
+    return SsmCredentialStore(name, region=region)
+
+
+def _client() -> GmailClient:
+    return GmailClient(load_credentials(credential_store()))
 
 
 def handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any]:

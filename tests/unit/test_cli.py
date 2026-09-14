@@ -124,3 +124,65 @@ def test_failures_clear_with_no_ids_forgets_everything(tmp_path: Path) -> None:
 
     assert main(["failures", "clear", "--config", str(config)]) == EXIT_OK
     assert LocalFileStateStore(tmp_path / "state.json").load().failures == {}
+
+
+# --------------------------------------------------------------------------
+# Configuration delivered as an environment variable
+# --------------------------------------------------------------------------
+
+
+def test_the_config_can_arrive_as_an_environment_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """How ECS gets it: no file in the image, the YAML injected from Parameter
+    Store. The task used to exit with "configuration file not found" every run."""
+    monkeypatch.setenv("EPC_CONFIG_YAML", VALID_CONFIG)
+    assert main(["config", "validate", "--config", str(tmp_path / "absent.yml")]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "EPC_CONFIG_YAML: valid" in out
+    assert "#/P1" in out
+
+
+def test_the_environment_variable_wins_over_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "config.yml"
+    path.write_text(VALID_CONFIG.replace("#/P1", "#/from-file"), encoding="utf-8")
+    monkeypatch.setenv("EPC_CONFIG_YAML", VALID_CONFIG)
+
+    assert main(["config", "validate", "--config", str(path)]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "#/P1" in out
+    assert "#/from-file" not in out
+
+
+def test_individual_variables_still_override_the_delivered_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("EPC_CONFIG_YAML", VALID_CONFIG)
+    monkeypatch.setenv("EPC__GMAIL__MAX_THREADS", "7")
+    assert main(["config", "validate", "--config", str(tmp_path / "absent.yml")]) == EXIT_OK
+    assert "max threads         7" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("text", ["labels: [unclosed", "- a list\n- not a mapping"])
+def test_a_malformed_delivered_config_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], text: str
+) -> None:
+    monkeypatch.setenv("EPC_CONFIG_YAML", text)
+    assert main(["config", "validate", "--config", str(tmp_path / "absent.yml")]) == EXIT_FATAL
+    assert "EPC_CONFIG_YAML" in capsys.readouterr().err
+
+
+def test_policy_can_arrive_as_an_environment_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("EPC_CONFIG_YAML", VALID_CONFIG)
+    monkeypatch.setenv("EPC_POLICY_YAML", "guidance:\n  - Mail from the landlord is always P1.\n")
+
+    code = main(["prompt", "render", "--config", str(tmp_path / "absent.yml"), "--prompts", str(repo / "prompts")])
+    assert code == EXIT_OK
+    out = capsys.readouterr().out
+    assert "# policy: EPC_POLICY_YAML" in out
+    assert "Mail from the landlord is always P1." in out

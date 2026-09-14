@@ -98,16 +98,26 @@ def load_prompt(path: Path) -> Prompt:
     return parse_prompt(path.read_text(encoding="utf-8"))
 
 
+# The whole of `policy.yml`, as an environment variable. Delivered on ECS the
+# same way as `EPC_CONFIG_YAML`; see `epc.settings`.
+POLICY_ENV = "EPC_POLICY_YAML"
+
+
 def load_policy(path: Path) -> Policy:
     """Load personal guidance. An absent file is normal, not an error."""
     if not path.is_file():
         return Policy()
+    return load_policy_text(path.read_text(encoding="utf-8"), source=str(path))
+
+
+def load_policy_text(text: str, *, source: str = POLICY_ENV) -> Policy:
+    """Personal guidance from YAML text rather than a file."""
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        raw = yaml.safe_load(text) or {}
     except yaml.YAMLError as exc:
-        raise ConfigError(f"{path} is not valid YAML: {exc}") from exc
+        raise ConfigError(f"{source} is not valid YAML: {exc}") from exc
     if not isinstance(raw, dict):
-        raise ConfigError(f"{path} must be a mapping")
+        raise ConfigError(f"{source} must be a mapping")
     return Policy(**raw)
 
 
@@ -133,11 +143,20 @@ class PromptRenderer:
         cls,
         prompt_dir: Path = DEFAULT_PROMPT_DIR,
         policy_path: Path | None = None,
+        *,
+        policy_text: str | None = None,
     ) -> PromptRenderer:
+        """The committed prompts, with policy from `policy_text` when given and
+        from `policy_path` otherwise."""
+        policy = (
+            load_policy_text(policy_text)
+            if policy_text is not None
+            else load_policy(policy_path or Path(DEFAULT_POLICY_FILENAME))
+        )
         return cls(
             system=load_prompt(prompt_dir / "system.md"),
             user=load_prompt(prompt_dir / "user.md"),
-            policy=load_policy(policy_path or Path(DEFAULT_POLICY_FILENAME)),
+            policy=policy,
         )
 
     @property

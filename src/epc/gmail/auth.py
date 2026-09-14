@@ -46,8 +46,8 @@ _DURABLE_FIELDS = (
 class CredentialStore(Protocol):
     """Where the durable half of the OAuth credentials lives.
 
-    Implemented against the local filesystem here; SSM Parameter Store and
-    Secrets Manager plug in behind the same two methods.
+    Implemented for the local filesystem, SSM Parameter Store and Secrets
+    Manager, all behind the same two methods.
     """
 
     def load(self) -> str | None:
@@ -194,3 +194,53 @@ class SsmCredentialStore:
             self._client.put_parameter(Name=self._name, Value=payload, Type="SecureString", Overwrite=True)
         except Exception as exc:
             raise CredentialError(f"could not write {self._name}: {exc}") from exc
+
+
+class SecretsManagerCredentialStore:
+    """Credentials in a Secrets Manager secret.
+
+    For an estate that already keeps its secrets there, or wants what Parameter
+    Store lacks — resource policies, replication. See `SsmCredentialStore` for
+    why that is not the default.
+
+    Reading needs `secretsmanager:GetSecretValue`. `epc login` also needs
+    `secretsmanager:PutSecretValue`, and `secretsmanager:CreateSecret` when the
+    secret does not exist yet. `kms:Decrypt` is needed for a customer-managed
+    key.
+    """
+
+    def __init__(self, secret_id: str, client: Any = None, *, region: str | None = None) -> None:
+        if client is None:
+            import boto3
+
+            client = boto3.client("secretsmanager", region_name=region)
+        self._client = client
+        self._secret_id = secret_id
+
+    def load(self) -> str | None:
+        try:
+            response = self._client.get_secret_value(SecretId=self._secret_id)
+        except Exception as exc:  # botocore raises ClientError for every failure
+            if "ResourceNotFoundException" in str(exc):
+                return None
+            raise CredentialError(f"could not read {self._secret_id}: {exc}") from exc
+        value = response.get("SecretString")
+        return str(value) if value else None
+
+    def store(self, payload: str) -> None:
+        try:
+            self._client.put_secret_value(SecretId=self._secret_id, SecretString=payload)
+        except Exception as exc:
+            if "ResourceNotFoundException" not in str(exc):
+                raise CredentialError(f"could not write {self._secret_id}: {exc}") from exc
+            self._create(payload)
+
+    def _create(self, payload: str) -> None:
+        try:
+            self._client.create_secret(
+                Name=self._secret_id,
+                SecretString=payload,
+                Description="Durable half of the Gmail OAuth credentials. Written by `epc login`.",
+            )
+        except Exception as exc:
+            raise CredentialError(f"could not create {self._secret_id}: {exc}") from exc

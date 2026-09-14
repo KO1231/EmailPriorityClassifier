@@ -11,8 +11,9 @@ variable "gmail_credentials" {
   type = object({ name = string, arn = string })
 }
 
-variable "openai_api_key" {
-  type = object({ name = string, arn = string })
+variable "injected_parameters" {
+  description = "Parameters ECS reads on the task's behalf and injects as environment variables. Read by the execution role, never the task role."
+  type        = list(object({ name = string, arn = string }))
 }
 
 variable "state_parameter" {

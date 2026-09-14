@@ -23,21 +23,49 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# The container definition's `secrets` are resolved by ECS before the program
+# starts, with the *execution* role. The managed policy above covers pulling the
+# image and writing logs, not Parameter Store, so without this the task never
+# starts. The program itself cannot read these: they are not in the task role.
+data "aws_iam_policy_document" "ecs_execution" {
+  statement {
+    sid       = "ReadInjectedParameters"
+    actions   = ["ssm:GetParameters"]
+    resources = [for parameter in var.injected_parameters : parameter.arn]
+  }
+
+  statement {
+    sid       = "DecryptInjectedParameters"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ssm.${data.aws_region.current.region}.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "ecs_execution" {
+  name   = "epc-${var.environment}-ecs-execution"
+  role   = aws_iam_role.ecs_execution.id
+  policy = data.aws_iam_policy_document.ecs_execution.json
+}
+
 resource "aws_iam_role" "ecs_task" {
   name               = "epc-${var.environment}-ecs-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
 }
 
 data "aws_iam_policy_document" "ecs_task" {
-  # Read its own credentials, and nothing else's. Scoped to exact parameter
-  # ARNs rather than the path, so a new parameter under /epc is not readable
-  # by accident.
+  # What the program reads itself: the Gmail credential and the run state.
+  # Scoped to exact ARNs rather than the path, so a new parameter under /epc is
+  # not readable by accident. Injected parameters are deliberately absent.
   statement {
     sid     = "ReadOwnParameters"
     actions = ["ssm:GetParameter", "ssm:GetParameters"]
     resources = [
       var.gmail_credentials.arn,
-      var.openai_api_key.arn,
       var.state_parameter.arn,
     ]
   }
@@ -66,12 +94,6 @@ data "aws_iam_policy_document" "ecs_task" {
     sid       = "EnqueueMutations"
     actions   = ["sqs:SendMessage", "sqs:GetQueueUrl", "sqs:GetQueueAttributes"]
     resources = [var.mutations_queue.arn]
-  }
-
-  statement {
-    sid       = "WriteOwnLogs"
-    actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = [for arn in var.log_group_arns : "${arn}:*"]
   }
 
   dynamic "statement" {

@@ -35,22 +35,51 @@ from epc.settings import BudgetSettings
 _CJK_RE = re.compile(r"[　-鿿豈-﫿＀-￯]")
 _LATIN_CHARS_PER_TOKEN = 3
 
-# Lines introducing quoted history. Everything from the first match onward is
-# the previous message, which the thread already contains in full.
-_QUOTE_HEADERS = (
-    re.compile(r"^\s*-{2,}\s*(?:original message|forwarded message)\s*-{2,}\s*$", re.IGNORECASE),
+# What is cut, and why so little.
+#
+# Stripping exists so quoted history does not spend the budget twice: the thread
+# already holds the earlier messages in full. Every pattern below is therefore
+# held to one standard — it must mark *a copy of an earlier message* and nothing
+# else, because a false match deletes everything after it, and that tail is
+# usually the part that matters. Order confirmations separate sections with
+# `----------`; notices open with "事務局より:"; itineraries have "From: Tokyo".
+# A forwarded message is never cut: it is not elsewhere in the thread, and it is
+# often the entire point of the mail it arrived in.
+
+# A reply attribution specific enough to trust on its own.
+_ATTRIBUTIONS = (
+    re.compile(r"^\s*-{2,}\s*(?:original message|元のメッセージ)\s*-{2,}\s*$", re.IGNORECASE),
     re.compile(r"^\s*On .{4,80}\bwrote:\s*$", re.IGNORECASE),
-    re.compile(r"^\s*From:\s.+$", re.IGNORECASE),
     # \uff1a is the fullwidth colon. Sanitisation's NFKC pass folds it to ASCII
     # before these run, but `strip_quoted_reply` is usable on its own and should
     # not depend on having been sanitised first.
-    re.compile("^\\s*\\d{4}年\\d{1,2}月\\d{1,2}日.{0,40}[:\uff1a]\\s*$"),
-    re.compile("^.{0,60}(?:さんは(?:以下のように)?書きました|より)[:\uff1a]\\s*$"),
-    re.compile(r"^\s*_{10,}\s*$"),
+    re.compile("^.{0,60}さんは(?:以下のように)?書きました[:\uff1a]\\s*$"),
 )
+# Shaped like an attribution, and just as shaped like an ordinary line:
+# "事務局より:", "2026年10月1日 変更点:". Trusted only when the line names an
+# address, as Gmail's "2026年9月10日(水) 10:00 田中 <a@example.com>:" does, or when
+# quoted lines follow it.
+_WEAK_ATTRIBUTIONS = (
+    re.compile("^\\s*\\d{4}年\\d{1,2}月\\d{1,2}日.{0,60}[:\uff1a]\\s*$"),
+    re.compile("^.{1,60}より[:\uff1a]\\s*$"),
+)
+# Outlook's copy of the earlier message's headers.
+_OUTLOOK_RULE = re.compile(r"^\s*_{10,}\s*$")
+_HEADER_FROM = re.compile("^\\s*(?:From|差出人)\\s*[:\uff1a]\\s*(.+)$", re.IGNORECASE)
+_HEADER_DATE = re.compile("^\\s*(?:Sent|Date|送信日時|日付)\\s*[:\uff1a]", re.IGNORECASE)
+_HEADER_SUBJECT = re.compile("^\\s*(?:Subject|件名)\\s*[:\uff1a]\\s*(.*)$", re.IGNORECASE)
+_FORWARD_SUBJECT = re.compile("^(?:fwd?|転送)\\s*[:\uff1a]", re.IGNORECASE)
+_FORWARD_MARKER = re.compile(r"^\s*-{2,}\s*(?:forwarded message|転送(?:された)?メッセージ)\s*-{2,}\s*$", re.IGNORECASE)
+# How far below a From line its Sent/Date and Subject lines may sit.
+_HEADER_BLOCK_LINES = 5
+
 _QUOTED_LINE_RE = re.compile(r"^\s*>")
-# RFC 3676 signature delimiter, plus the two variants mail clients emit.
-_SIGNATURE_RE = re.compile(r"^\s*--\s?$|^\s*-{2,}\s*$")
+# RFC 3676's "-- ". Sanitisation strips trailing whitespace, so "--" is what
+# arrives. A run of dashes is a section rule, not a signature.
+_SIGNATURE_RE = re.compile(r"^--\s?$")
+# A signature is short. A delimiter with more than this below it is something
+# else, and cutting there would lose the message.
+_MAX_SIGNATURE_LINES = 15
 
 TRUNCATION_NOTE = "[message truncated]"
 
@@ -75,8 +104,8 @@ def strip_quoted_reply(text: str) -> str:
     than a redundant one.
     """
     lines = text.split("\n")
-    for index, line in enumerate(lines):
-        if any(pattern.match(line) for pattern in _QUOTE_HEADERS):
+    for index in range(len(lines)):
+        if _quote_starts_at(lines, index):
             lines = lines[:index]
             break
 
@@ -85,15 +114,69 @@ def strip_quoted_reply(text: str) -> str:
     return stripped or text.strip()
 
 
+def _quote_starts_at(lines: list[str], index: int) -> bool:
+    line = lines[index]
+    if any(pattern.match(line) for pattern in _ATTRIBUTIONS):
+        return True
+    if any(pattern.match(line) for pattern in _WEAK_ATTRIBUTIONS):
+        if "@" in line:
+            return True
+        following = _next_nonblank(lines, index)
+        return following is not None and bool(_QUOTED_LINE_RE.match(lines[following]))
+    if _OUTLOOK_RULE.match(line):
+        following = _next_nonblank(lines, index)
+        return following is not None and _is_header_block(lines, following, trust_sender=True)
+    return _is_header_block(lines, index, trust_sender=False)
+
+
+def _is_header_block(lines: list[str], index: int, *, trust_sender: bool) -> bool:
+    """A copied header block — From, then Sent/Date, within a few lines.
+
+    `trust_sender` is set when an Outlook rule line came first, which already
+    says what follows. Without it the From line must name an address, so
+    "From: Tokyo (HND)" in an itinerary is left alone. A block whose subject is
+    a forward, or which sits under a forwarding marker, is a forwarded message
+    and is kept.
+    """
+    sender = _HEADER_FROM.match(lines[index])
+    if sender is None or not (trust_sender or "@" in sender.group(1)):
+        return False
+
+    block = lines[index + 1 : index + 1 + _HEADER_BLOCK_LINES]
+    if not trust_sender and not any(_HEADER_DATE.match(line) for line in block):
+        return False
+    for line in block:
+        subject = _HEADER_SUBJECT.match(line)
+        if subject and _FORWARD_SUBJECT.match(subject.group(1).strip()):
+            return False
+
+    previous = _previous_nonblank(lines, index)
+    return not (previous is not None and _FORWARD_MARKER.match(lines[previous]))
+
+
+def _next_nonblank(lines: list[str], index: int) -> int | None:
+    return next((i for i in range(index + 1, len(lines)) if lines[i].strip()), None)
+
+
+def _previous_nonblank(lines: list[str], index: int) -> int | None:
+    return next((i for i in range(index - 1, -1, -1) if lines[i].strip()), None)
+
+
 def strip_signature(text: str) -> str:
-    """Remove a trailing signature block."""
+    """Remove a trailing signature block.
+
+    Only the last delimiter is considered, and only when what follows it is
+    short enough to be a signature.
+    """
     lines = text.split("\n")
-    for index, line in enumerate(lines):
-        # Only treat it as a signature if it is not the entire message.
-        if _SIGNATURE_RE.match(line) and index > 0:
+    for index in range(len(lines) - 1, 0, -1):
+        if _SIGNATURE_RE.match(lines[index].strip()):
+            if len(lines) - index - 1 > _MAX_SIGNATURE_LINES:
+                break
             candidate = "\n".join(lines[:index]).strip()
             if candidate:
                 return candidate
+            break
     return text.strip()
 
 

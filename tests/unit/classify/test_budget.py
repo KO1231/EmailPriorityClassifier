@@ -1,5 +1,7 @@
 """Budgeting: what the model sees, and what it is told is missing."""
 
+import pytest
+
 from epc.classify.budget import (
     build_payload,
     estimate_tokens,
@@ -73,6 +75,72 @@ def test_signatures_are_removed() -> None:
 
 def test_a_message_that_is_only_a_signature_delimiter_survives() -> None:
     assert strip_signature("--") == "--"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Section rules in an order confirmation. Cutting at the first rule left
+        # "ご注文ありがとうございます" and lost the deadline.
+        "ご注文ありがとうございます\n----------\n注文番号: 123\nお支払い期限: 明日",
+        "Your order\n--------------------\nOrder: 123\n--------------------\nPay by: tomorrow",
+        # A notice from an office, not a reply attribution.
+        "お知らせ\n事務局より\uff1a\n明日までに回答をお願いします",
+        # A dated heading, not Gmail's "2026年9月10日 田中 <a@example.com>:".
+        "変更のお知らせ\n2026年10月1日 変更点:\n料金が改定されます",
+        # An itinerary: From and To are places.
+        "フライト変更のお知らせ\nFrom: Tokyo (HND)\nTo: Osaka (ITM)\nDate: 2026-09-20\n出発時刻が変更されました",
+    ],
+    ids=["jp-order-rules", "en-order-rules", "office-notice", "dated-heading", "itinerary"],
+)
+def test_ordinary_lines_that_look_like_history_cut_nothing(text: str) -> None:
+    assert strip_signature(strip_quoted_reply(text)) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "FYI\n---------- Forwarded message ---------\nFrom: Boss <boss@example.com>\n"
+        "Date: Mon, 14 Sep 2026\nSubject: Contract\n至急対応してください",
+        "ご確認ください\n---------- 転送メッセージ ---------\n差出人: 田中 <tanaka@example.com>\n"
+        "日付: 2026年9月14日\n件名: 契約\n本日中に返送が必要です",
+        # Outlook forwards look like Outlook replies; the subject tells them apart.
+        "See below.\n________________________________\nFrom: Boss\nSent: Monday\nSubject: FW: Contract\nSign by Friday",
+    ],
+    ids=["gmail-forward", "gmail-forward-ja", "outlook-forward"],
+)
+def test_a_forwarded_message_is_kept(text: str) -> None:
+    """It is not elsewhere in the thread, and often the whole point of the mail."""
+    assert strip_quoted_reply(text) == text
+
+
+def test_an_address_confirms_a_dated_japanese_attribution() -> None:
+    text = "承知しました。\n\n2026年9月10日(水) 10:00 田中 明 <a.tanaka@example.co.jp>:\n契約書の確認をお願いします"
+    assert strip_quoted_reply(text) == "承知しました。"
+
+
+def test_quoted_lines_confirm_a_weak_attribution() -> None:
+    assert strip_quoted_reply("了解です。\n\n田中より:\n> よろしく") == "了解です。"
+
+
+def test_a_copied_header_block_with_an_address_is_history() -> None:
+    text = "Approved.\n\nFrom: Akira <akira@example.com>\nSent: Monday, 14 September 2026\nTo: me\nSubject: Budget"
+    assert strip_quoted_reply(text) == "Approved."
+
+
+def test_japanese_outlook_history_is_removed() -> None:
+    text = "承認します。\n\n________________________________\n差出人: 田中 明\n送信日時: 2026年9月14日\n件名: 予算"
+    assert strip_quoted_reply(text) == "承認します。"
+
+
+def test_a_long_block_below_a_delimiter_is_not_a_signature() -> None:
+    body = "Summary\n--\n" + "\n".join(f"Item {n}: details" for n in range(30))
+    assert strip_signature(body) == body
+
+
+def test_only_the_last_delimiter_is_a_signature() -> None:
+    text = "Part one\n--\nPart two\n--\nAkira Tanaka"
+    assert strip_signature(text) == "Part one\n--\nPart two"
 
 
 # --------------------------------------------------------------------------

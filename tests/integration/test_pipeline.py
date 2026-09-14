@@ -36,8 +36,9 @@ class FakeGmail:
     """A mailbox that answers the calls the pipeline makes.
 
     Writes land on the stored threads. With `exclude_labelled`, listing leaves
-    out threads that carry a priority label, as the real query does, so that
-    consecutive runs see what they would against a real mailbox.
+    out threads whose every message carries a priority label. That is what the
+    real query does: Gmail search matches messages, so one unlabelled message is
+    enough to list its thread.
     """
 
     def __init__(
@@ -63,7 +64,7 @@ class FakeGmail:
         refs = [
             ThreadRef(id=thread_id, history_id=self.history_ids.get(thread_id, "100"))
             for thread_id in self._threads
-            if not (self._exclude_labelled and self.labels_of(thread_id) & set(LABEL_IDS.values()))
+            if not (self._exclude_labelled and self.fully_labelled(thread_id))
         ]
         return refs[:limit]
 
@@ -79,6 +80,10 @@ class FakeGmail:
                 if message["id"] in message_ids:
                     labels = set(message.get("labelIds") or []) | set(add_label_ids)
                     message["labelIds"] = sorted(labels - set(remove_label_ids))
+
+    def fully_labelled(self, thread_id: str) -> bool:
+        priority = set(LABEL_IDS.values())
+        return all(set(message.get("labelIds") or []) & priority for message in self._threads[thread_id]["messages"])
 
     def labels_of(self, thread_id: str) -> set[str]:
         return {label for message in self._threads[thread_id]["messages"] for label in message.get("labelIds") or []}
@@ -759,3 +764,73 @@ def test_state_that_cannot_be_saved_is_reported(settings: Any) -> None:
     assert summary.classified == 1
     assert summary.state_not_saved
     assert summary.had_failures
+
+
+# --------------------------------------------------------------------------
+# Replies arriving in labelled threads
+# --------------------------------------------------------------------------
+
+
+def labelled_thread_with_a_new_reply(thread_id: str, *, labels: tuple[str, ...] = ("Label_2",)) -> Any:
+    """Seen in a real mailbox: 18 labelled messages and a reply from today."""
+    return fx.thread(
+        fx.message(
+            fx.text_part("Original request."),
+            message_id=f"{thread_id}-m1",
+            thread_id=thread_id,
+            label_ids=["INBOX", labels[0]],
+            headers=[("From", "a@example.com"), ("Subject", "Subject")],
+        ),
+        *(
+            fx.message(
+                fx.text_part("Another message."),
+                message_id=f"{thread_id}-m{n + 2}",
+                thread_id=thread_id,
+                label_ids=["INBOX", label],
+                headers=[("From", "a@example.com"), ("Subject", "Re: Subject")],
+            )
+            for n, label in enumerate(labels[1:])
+        ),
+        fx.message(
+            fx.text_part("A reply that arrived later."),
+            message_id=f"{thread_id}-new",
+            thread_id=thread_id,
+            label_ids=["INBOX", "UNREAD"],
+            headers=[("From", "a@example.com"), ("Subject", "Re: Subject")],
+        ),
+        thread_id=thread_id,
+    )
+
+
+def test_a_reply_in_a_labelled_thread_gets_the_label_and_the_thread_stops_coming_back(
+    settings: Any, store: Any
+) -> None:
+    gmail = FakeGmail({"t1": labelled_thread_with_a_new_reply("t1")}, exclude_labelled=True)
+    classifier = FakeClassifier()
+
+    first = run_once(settings, gmail, classifier, store)
+    second = run_once(settings, gmail, classifier, store)
+
+    assert (first.listed, first.already_labelled, first.labels_carried_forward) == (1, 1, 1)
+    assert gmail.writes == [{"ids": ["t1-new"], "add": ["Label_2"], "remove": []}]
+    assert classifier.seen == []  # not classified: rule B
+    assert second.listed == 0
+
+
+def test_a_dry_run_only_plans_the_carried_label(settings: Any, store: Any, tmp_path: Path) -> None:
+    gmail = FakeGmail({"t1": labelled_thread_with_a_new_reply("t1")})
+    path = tmp_path / "mutations.jsonl"
+    run_once(settings, gmail, FakeClassifier(), store, dry_run=True, sink=JsonlSink(path))
+
+    assert gmail.writes == []
+    (planned,) = list(read_mutations(path))
+    assert (planned.origin, planned.message_ids, planned.add_label_ids) == ("carried_forward", ["t1-new"], ["Label_2"])
+
+
+def test_a_thread_with_two_priority_labels_is_left_alone(settings: Any, store: Any) -> None:
+    gmail = FakeGmail({"t1": labelled_thread_with_a_new_reply("t1", labels=("Label_1", "Label_3"))})
+    summary = run_once(settings, gmail, FakeClassifier(), store)
+
+    assert summary.already_labelled == 1
+    assert summary.labels_carried_forward == 0
+    assert gmail.writes == []

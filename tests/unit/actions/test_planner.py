@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from epc.actions.model import ActionVerb, ThreadMutation
-from epc.actions.planner import plan_mutation
+from epc.actions.planner import plan_carry_forward, plan_mutation
 from epc.actions.rules import ActionCondition, ActionRule, select_verbs
 from epc.gmail.models import NON_PRIMARY_CATEGORIES
 from epc.priority import Priority
@@ -197,3 +197,66 @@ def test_the_mutation_round_trips_through_json() -> None:
 
 def test_message_ids_are_carried_because_batch_modify_needs_them() -> None:
     assert plan().message_ids == ["m1", "m2"]
+
+
+# --------------------------------------------------------------------------
+# Carrying a label forward to later replies
+# --------------------------------------------------------------------------
+
+PRIORITY_LABELS = {Priority.P1: "Label_1", Priority.P2: "Label_2", Priority.P3: "Label_3"}
+
+
+def carry(message_label_ids: dict[str, set[str]]) -> ThreadMutation | None:
+    return plan_carry_forward(
+        thread_id="t1",
+        message_label_ids=message_label_ids,
+        priority_label_ids=PRIORITY_LABELS,
+        now=datetime(2026, 9, 14, tzinfo=UTC),
+    )
+
+
+def test_a_reply_gets_the_label_its_thread_already_has() -> None:
+    mutation = carry({"m1": {"INBOX", "Label_2"}, "m2": {"INBOX", "Label_2"}, "m3": {"INBOX", "UNREAD"}})
+
+    assert mutation is not None
+    assert mutation.message_ids == ["m3"]
+    assert mutation.add_label_ids == ["Label_2"]
+    assert mutation.remove_label_ids == []
+    assert mutation.priority is Priority.P2
+    assert mutation.origin == "carried_forward"
+
+
+def test_nothing_is_carried_when_every_message_has_the_label() -> None:
+    assert carry({"m1": {"Label_1"}, "m2": {"Label_1"}}) is None
+
+
+def test_nothing_is_carried_when_the_thread_has_no_priority_label() -> None:
+    """That thread needs classifying, not carrying."""
+    assert carry({"m1": {"INBOX"}}) is None
+
+
+def test_nothing_is_carried_when_two_priority_labels_disagree() -> None:
+    """No single answer to extend. Guessing one would overrule a person."""
+    assert carry({"m1": {"Label_1"}, "m2": {"Label_3"}, "m3": {"INBOX"}}) is None
+
+
+def test_carrying_forward_never_adds_actions() -> None:
+    """Rule B: not re-planned, so no star, no move, no removal."""
+    mutation = carry({"m1": {"Label_1", "CATEGORY_PROMOTIONS"}, "m2": {"CATEGORY_PROMOTIONS"}})
+    assert mutation is not None
+    assert (mutation.add_label_ids, mutation.remove_label_ids) == (["Label_1"], [])
+
+
+def test_a_carried_label_is_not_a_duplicate_of_the_classification_before_it() -> None:
+    """Same thread, same label: a FIFO queue must not drop it as a repeat."""
+    classified = plan(rules=[])
+    carried = carry({"m1": {"Label_1"}, "m2": set()})
+    assert carried is not None
+    assert classified.label_signature == carried.label_signature
+    assert classified.idempotency_key != carried.idempotency_key
+
+
+def test_a_mutation_written_before_origin_existed_still_reads() -> None:
+    legacy = plan().model_dump(mode="json")
+    del legacy["origin"]
+    assert ThreadMutation.model_validate(legacy).origin == "classified"

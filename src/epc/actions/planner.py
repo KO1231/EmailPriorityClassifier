@@ -13,7 +13,7 @@ quietly, and every single time.
 """
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 
 from epc.actions.model import (
@@ -118,13 +118,62 @@ def plan_mutation(
     return mutation
 
 
+def plan_carry_forward(
+    *,
+    thread_id: str,
+    message_label_ids: Mapping[str, set[str]],
+    priority_label_ids: dict[Priority, str],
+    now: datetime | None = None,
+) -> ThreadMutation | None:
+    """Put a labelled thread's priority label on the messages that lack it.
+
+    Labels belong to messages, not threads, and a reply arriving in a labelled
+    thread does not inherit them. Gmail search matches messages, so without
+    this the thread is listed again on every run, fetched, and skipped — and
+    with no time limit on the query, such threads only ever accumulate.
+
+    Rule B is intact. The thread is not classified and not planned: no priority
+    is decided and no action runs. The label it already carries, whether this
+    tool or a person put it there, is extended to its newer messages and
+    nothing else changes. With more than one priority label on the thread there
+    is no single answer to extend, so nothing is done.
+    """
+    priority_by_label = {label_id: priority for priority, label_id in priority_label_ids.items()}
+    present = {label for labels in message_label_ids.values() for label in labels} & set(priority_by_label)
+    if len(present) != 1:
+        return None
+
+    (label_id,) = present
+    missing = [message_id for message_id, labels in message_label_ids.items() if label_id not in labels]
+    if not missing:
+        return None
+
+    mutation = ThreadMutation(
+        thread_id=thread_id,
+        message_ids=missing,
+        add_label_ids=[label_id],
+        priority=priority_by_label[label_id],
+        classified_at=now or datetime.now(UTC),
+        origin="carried_forward",
+    )
+    mutation.idempotency_key = idempotency_key(mutation)
+    return mutation
+
+
 def idempotency_key(mutation: ThreadMutation) -> str:
     """A stable digest of thread plus the exact change requested.
 
     Deliberately excludes the timestamp and the reason: replaying the same
     change should look like the same change, while a *different* change to the
     same thread must not be mistaken for a duplicate.
+
+    A carried-forward label names its messages too. Otherwise it can share a key
+    with the classification that labelled the thread minutes earlier, and a
+    FIFO queue would drop it as a duplicate of a change it is not.
     """
     add, remove = mutation.label_signature
-    material = "|".join([mutation.thread_id, ",".join(add), ",".join(remove)])
+    parts = [mutation.thread_id, ",".join(add), ",".join(remove)]
+    if mutation.origin != "classified":
+        parts += [mutation.origin, ",".join(sorted(mutation.message_ids))]
+    material = "|".join(parts)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]

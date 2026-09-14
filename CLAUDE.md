@@ -46,7 +46,8 @@ one thing: mislabel one thread.** Any feature that lets the model pick an action
 invalidates the entire security story, not just part of it.
 
 **B. Only newly classified threads are planned.** A thread that already carries a
-priority label is counted and skipped (`pipeline.py::_hydrate`). It may have been set by
+priority label is counted and skipped (`pipeline.py::_hydrate`); at most, its label is
+carried to replies that arrived later. It may have been set by
 hand, and now that actions can *remove* labels, re-planning would undo that correction
 on every run — silently, forever.
 
@@ -134,9 +135,18 @@ or two. A History API checkpoint was tried and removed. It could not honour `gma
 It moved past threads a capped run cut off, and a dry run advanced it too. Worst, it broke
 the way the user re-classifies mail after changing their criteria: removing a label from
 old threads in Gmail. That has to keep working, which rules out time windows
-(`newer_than:`) as well. One cost remains: labels sit on messages, and a reply arriving
-in a labelled thread does not inherit them, so Gmail's message-level search lists that
-thread again and `_hydrate` fetches it only to skip it — on every run.
+(`newer_than:`) as well.
+
+**A labelled thread's label is carried to replies that arrive later.** Labels sit on
+messages, a new reply does not inherit them, and Gmail search matches messages — so
+without this such a thread is listed, fetched and skipped on every run, and with no time
+limit they only accumulate (two appeared in a real mailbox in one day).
+`planner.py::plan_carry_forward` adds the thread's existing priority label to the
+messages lacking it, through the sink like any mutation (`origin: carried_forward`). It
+does not break rule B: nothing is classified or planned, and a label a person set is only
+extended, never replaced. With two priority labels on the thread it does nothing. A
+removed label is still a request to re-classify, because removing a label in Gmail's
+conversation view removes it from every message.
 
 **Failures are remembered only when the thread caused them.** `state.py` records parse
 failures, `RejectedByProviderError` (HTTP 400/413/422, Bedrock `ValidationException`) and

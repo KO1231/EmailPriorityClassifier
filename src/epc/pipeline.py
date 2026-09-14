@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from epc.actions.model import ThreadMutation
-from epc.actions.planner import plan_mutation
+from epc.actions.planner import plan_carry_forward, plan_mutation
 from epc.classify.base import Classifier, Usage
 from epc.classify.budget import build_payload
 from epc.dispatch.applier import ApplyReport
@@ -59,6 +59,8 @@ class RunSummary:
 
     listed: int = 0
     already_labelled: int = 0
+    # Of those, threads whose label was put on replies that arrived after it.
+    labels_carried_forward: int = 0
     # Left out because they failed on earlier runs for reasons of their own.
     # Not failures of this run: see `epc.state` for when they come back.
     skipped_known_failures: int = 0
@@ -104,7 +106,8 @@ class RunSummary:
         lines = [
             "=== Summary ===",
             f"  listed            {self.listed}",
-            f"  already labelled  {self.already_labelled}  (skipped, no LLM call)",
+            f"  already labelled  {self.already_labelled}"
+            f"  (skipped, no LLM call; label carried to new replies: {self.labels_carried_forward})",
             *(
                 [f"  known failures    {self.skipped_known_failures}  (skipped: {shown})"]
                 if self.skipped_known_failures
@@ -172,6 +175,7 @@ class Pipeline:
         self._history_ids: dict[str, str] = {}
         self._failed_threads: dict[str, str] = {}
         self._succeeded: set[str] = set()
+        self._carried_forward: list[ThreadMutation] = []
 
     def search_query(self) -> str:
         return build_search_query(
@@ -191,6 +195,9 @@ class Pipeline:
         threads = self._hydrate(self._threads_to_consider(state, summary), summary)
 
         try:
+            # Inside the `try`, so the sink that takes them is always closed.
+            for mutation in self._carried_forward:
+                self._sink.emit(mutation)
             self._classify_all(threads, summary)
         finally:
             # Reached on every path out — a stop request, a halt, an exception
@@ -338,6 +345,16 @@ class Pipeline:
             # re-planning would undo the correction on every run.
             if thread.label_ids & self._priority_label_id_set:
                 summary.already_labelled += 1
+                carried = plan_carry_forward(
+                    thread_id=thread.thread_id,
+                    message_label_ids={message.message_id: set(message.label_ids) for message in thread.messages},
+                    priority_label_ids=self._priority_label_ids,
+                )
+                if carried is not None:
+                    # So the thread stops matching the search, instead of being
+                    # fetched and skipped like this on every run from now on.
+                    summary.labels_carried_forward += 1
+                    self._carried_forward.append(carried)
                 continue
             threads.append(thread)
         return threads

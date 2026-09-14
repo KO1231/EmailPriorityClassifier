@@ -8,6 +8,7 @@ an API. It is versioned and pinned by a test for that reason.
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -15,6 +16,8 @@ from epc.gmail.models import NON_PRIMARY_CATEGORIES
 from epc.priority import Priority
 
 SCHEMA_VERSION = 1
+
+MutationOrigin = Literal["classified", "carried_forward"]
 
 # Gmail system labels the verbs below manipulate.
 LABEL_STARRED = "STARRED"
@@ -79,6 +82,13 @@ class ThreadMutation(BaseModel):
     # Recorded rather than acted on here: the planner has already withheld the
     # high-privilege verbs, and the applier has no business re-deciding.
     suspicious: bool = False
+
+    # Why the mutation exists. `carried_forward` puts a thread's existing
+    # priority label on messages that arrived after it was labelled: nothing
+    # was classified and nothing else is written. Added with a default, so
+    # `SCHEMA_VERSION` stands and a consumer built before it reads every
+    # mutation the same way.
+    origin: MutationOrigin = "classified"
 
     @property
     def is_noop(self) -> bool:

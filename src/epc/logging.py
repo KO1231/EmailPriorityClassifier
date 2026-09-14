@@ -11,7 +11,11 @@ So there are two defences here and they are not the same defence:
   every string is capped, so a future call site that gets it wrong leaks a
   truncated line instead of a mailbox.
 
-Human-readable output locally, JSON when something is going to parse it.
+Human-readable output locally, JSON when something is going to parse it — and
+the same for records from the standard `logging` module. The Google and AWS
+client libraries log that way, and they log request details; routing their
+records through the same processors means redaction and JSON apply to every
+line the process writes, not only to the lines this package writes.
 """
 
 import logging
@@ -75,6 +79,27 @@ def configure_logging(
     """Set up logging for a run. Safe to call more than once."""
     numeric_level = getattr(logging, level.upper(), logging.INFO)
 
+    renderer: Any = (
+        structlog.processors.JSONRenderer()
+        if json_output
+        else structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
+    )
+    shared: list[Any] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        redact,
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
+    # One formatter for both kinds of record. `foreign_pre_chain` is what a
+    # standard-library record goes through; a structlog event has been through
+    # `shared` already.
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared,
+        processors=[structlog.stdlib.ProcessorFormatter.remove_processors_meta, renderer],
+    )
+
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if log_file is not None:
         # `parents=True`: the old implementation could only create one level and
@@ -85,30 +110,13 @@ def configure_logging(
                 log_file, maxBytes=LOG_FILE_BYTES, backupCount=LOG_FILE_BACKUPS, encoding="utf-8"
             )
         )
+    for handler in handlers:
+        handler.setFormatter(formatter)
 
-    logging.basicConfig(
-        format="%(message)s",
-        level=numeric_level,
-        handlers=handlers,
-        force=True,
-    )
-
-    renderer: Any = (
-        structlog.processors.JSONRenderer()
-        if json_output
-        else structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
-    )
+    logging.basicConfig(level=numeric_level, handlers=handlers, force=True)
 
     structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.stdlib.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            redact,
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            renderer,
-        ],
+        processors=[*shared, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
         wrapper_class=structlog.make_filtering_bound_logger(numeric_level),
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,

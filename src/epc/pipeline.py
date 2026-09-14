@@ -15,7 +15,6 @@ skipped the flush — so one malformed model reply threw away every label the ru
 had already decided.
 """
 
-import logging
 import threading
 import time
 import traceback
@@ -34,6 +33,7 @@ from epc.gmail.client import GmailClient
 from epc.gmail.mime import parse_thread
 from epc.gmail.models import EmailThread, ThreadRef
 from epc.gmail.query import build_search_query
+from epc.logging import get_logger
 from epc.priority import Priority
 from epc.ratelimit import RateLimiter
 from epc.report import HistorySink, NullHistorySink, record_for
@@ -41,7 +41,7 @@ from epc.settings import Settings
 from epc.shutdown import ShutdownRequestedError
 from epc.state import NullStateStore, RunState, StateStore
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Failures in a row, in completion order, after which no new classification is
 # started. Past this point the cause is almost never the threads: a revoked key,
@@ -232,12 +232,12 @@ class Pipeline:
                     # About this thread: remembered, so it can stop being retried.
                     summary.classify_failed += 1
                     self._failed_threads[thread.thread_id] = self._history_ids.get(thread.thread_id, "")
-                    logger.warning("classification failed for %s: %s", thread.thread_id, exc)
+                    logger.warning("classification failed", thread_id=thread.thread_id, error=str(exc))
                     consecutive_failures = self._note_failure(consecutive_failures)
                     continue
                 except ClassificationError as exc:
                     summary.classify_failed += 1
-                    logger.warning("classification failed for %s: %s", thread.thread_id, exc)
+                    logger.warning("classification failed", thread_id=thread.thread_id, error=str(exc))
                     consecutive_failures = self._note_failure(consecutive_failures)
                     continue
                 except Exception as exc:
@@ -248,10 +248,12 @@ class Pipeline:
                     # needs, and neither carries content.
                     summary.classify_failed += 1
                     logger.error(
-                        "unexpected %s while classifying %s\n%s",
-                        type(exc).__name__,
-                        thread.thread_id,
-                        "".join(traceback.format_tb(exc.__traceback__)).rstrip(),
+                        "unexpected error while classifying",
+                        thread_id=thread.thread_id,
+                        error_type=type(exc).__name__,
+                        # A list of frames, so the per-string length cap in
+                        # redaction does not cut the stack to its first line.
+                        frames=[frame.rstrip() for frame in traceback.format_tb(exc.__traceback__)],
                     )
                     consecutive_failures = self._note_failure(consecutive_failures)
                     continue
@@ -284,10 +286,7 @@ class Pipeline:
     def _note_failure(self, consecutive_failures: int) -> int:
         consecutive_failures += 1
         if consecutive_failures >= self._max_consecutive_failures and not self._halt.is_set():
-            logger.error(
-                "%d classifications failed in a row; starting no more this run",
-                consecutive_failures,
-            )
+            logger.error("classifications failing in a row; starting no more this run", failures=consecutive_failures)
             self._halt.set()
         return consecutive_failures
 
@@ -324,7 +323,7 @@ class Pipeline:
                 raw = self._client.get_thread(ref.id)
             except GmailError as exc:
                 summary.fetch_failed += 1
-                logger.warning("could not fetch thread %s: %s", ref.id, exc)
+                logger.warning("could not fetch thread", thread_id=ref.id, error=str(exc))
                 continue
 
             try:
@@ -337,7 +336,7 @@ class Pipeline:
                 # mail's own doing, so it is remembered like one.
                 summary.parse_failed += 1
                 self._failed_threads[ref.id] = ref.history_id
-                logger.warning("could not parse thread %s: %s", ref.id, type(exc).__name__)
+                logger.warning("could not parse thread", thread_id=ref.id, error_type=type(exc).__name__)
                 continue
             # Second half of idempotency: a label can appear between the search
             # and the fetch. Such a thread is counted and left alone — never
@@ -367,7 +366,7 @@ class Pipeline:
             self._state_store.save(updated)
         except Exception as exc:
             summary.state_not_saved = True
-            logger.error("could not save run state: %s", type(exc).__name__)
+            logger.error("could not save run state", error_type=type(exc).__name__)
 
     def _classify(self, thread: EmailThread) -> tuple[ThreadMutation, Usage]:
         # Checked before the expensive part rather than after: a queued task

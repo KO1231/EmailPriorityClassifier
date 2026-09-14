@@ -76,9 +76,28 @@ class InjectionSignal(BaseModel):
         return "low" if len(self.patterns) < 2 else "medium"
 
 
-def detect_injection(text: str, *, used_hiding_techniques: bool = False) -> InjectionSignal:
-    """Scan sanitised text for content aimed at the model."""
-    matched = sorted(name for name, pattern in _PATTERNS.items() if pattern.search(text))
+# Patterns that key off the start of a line, and so mean something only where
+# there are lines. "System: maintenance tonight" is an ordinary subject.
+_LINE_PATTERNS = frozenset({"role_marker"})
+
+
+def detect_injection(
+    text: str,
+    *,
+    used_hiding_techniques: bool = False,
+    single_line: bool = False,
+) -> InjectionSignal:
+    """Scan sanitised text for content aimed at the model.
+
+    `single_line` is for header-like fields — a subject, a file name — where a
+    line-start pattern would fire on ordinary text and cost a real thread its
+    actions.
+    """
+    matched = sorted(
+        name
+        for name, pattern in _PATTERNS.items()
+        if not (single_line and name in _LINE_PATTERNS) and pattern.search(text)
+    )
     return InjectionSignal(
         suspicious=bool(matched),
         patterns=matched,

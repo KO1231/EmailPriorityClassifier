@@ -78,8 +78,19 @@ class SanitisationReport(BaseModel):
         return bool(self.bidi_controls or self.invisible_chars)
 
 
-def sanitise(text: str, *, max_chars: int | None = None) -> tuple[str, SanitisationReport]:
-    """Return `text` made safe to embed in a prompt, and what was removed."""
+def sanitise(
+    text: str,
+    *,
+    max_chars: int | None = None,
+    fold_compatibility: bool = True,
+) -> tuple[str, SanitisationReport]:
+    """Return `text` made safe to embed in a prompt, and what was removed.
+
+    `fold_compatibility=False` skips the NFKC step and nothing else. It is for
+    identity — addresses and domains — where folding would turn a fullwidth
+    lookalike of a real domain *into* the real domain, hiding precisely the
+    spoof the model ought to notice.
+    """
     report = SanitisationReport()
     if not text:
         return "", report
@@ -95,7 +106,8 @@ def sanitise(text: str, *, max_chars: int | None = None) -> tuple[str, Sanitisat
     # NFKC folds the compatibility forms — fullwidth Latin, halfwidth katakana,
     # circled and superscript digits — that would otherwise let the same word be
     # written a dozen ways to slip past a reader's eye.
-    text = unicodedata.normalize("NFKC", text)
+    if fold_compatibility:
+        text = unicodedata.normalize("NFKC", text)
 
     # Removals can leave ragged whitespace behind.
     text = re.sub(r"[^\S\n]+", " ", text)

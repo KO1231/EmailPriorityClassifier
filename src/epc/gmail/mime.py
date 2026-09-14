@@ -186,7 +186,7 @@ def html_to_text(html: str) -> tuple[str, int]:
     computed, no browser is involved — it is a parse tree, a regex over inline
     ``style`` attributes and a walk up the parents for inherited font sizes,
     which is why a dense 100 KB promotional email costs a few tens of
-    milliseconds rather than the seconds a headless renderer would.
+    milliseconds rather than the hundreds a headless renderer would.
 
     Two kinds of hiding consequently get through, both deliberately:
 

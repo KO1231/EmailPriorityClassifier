@@ -145,3 +145,12 @@ def test_escaping_uses_a_visible_character() -> None:
 
 def test_content_without_the_delimiter_is_untouched() -> None:
     assert escape_delimiter("ordinary text", "<tag>") == "ordinary text"
+
+
+def test_compatibility_folding_can_be_skipped_for_identity() -> None:
+    """Everything else still happens; only NFKC is left out."""
+    text, report = sanitise("billing@\uff50aypal.com\u200b")
+    assert text == "billing@paypal.com"
+    kept, kept_report = sanitise("billing@\uff50aypal.com\u200b", fold_compatibility=False)
+    assert kept == "billing@\uff50aypal.com"
+    assert kept_report.invisible_chars == report.invisible_chars == 1

@@ -15,12 +15,18 @@ result is built as a structure and serialised afterwards — so it is always val
 and always says how much was left out.
 
 This module is also the sanitisation gate. `build_payload` is the only supported
-route from a parsed thread to a prompt, and it sanitises on the way through.
+route from a parsed thread to a prompt, and it sanitises on the way *out*: every
+string in the finished payload, whatever field it sits in, passes through
+`sanitise` and `detect_injection` in one place. The fields are deliberately not
+listed. A list is what let the subject, the attachment names and the reply-to
+address reach the model untouched while the body was scrubbed — and a list is
+what the next new field would have been left off.
 """
 
 import re
 from datetime import datetime
 from math import ceil
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -242,18 +248,15 @@ def build_payload(thread: EmailThread, budget: BudgetSettings) -> ThreadPayload:
 
     selected: list[MessagePayload] = []
     used_tokens = 0
-    patterns: set[str] = set()
     used_hiding = False
 
     # Newest first: if anything has to be dropped, it should be the history.
     for message in reversed(thread.messages):
+        # Sanitised here as well as on the way out: quote stripping needs the
+        # line structure normalised, and the cap has to apply before budgeting.
         body, report = sanitise(message.body, max_chars=budget.message_chars)
         body = strip_signature(strip_quoted_reply(body))
-
-        hiding = report.carries_hiding_techniques or bool(message.hidden_elements_removed)
-        used_hiding = used_hiding or hiding
-        signal = detect_injection(body, used_hiding_techniques=hiding)
-        patterns.update(signal.patterns)
+        used_hiding = used_hiding or report.carries_hiding_techniques or bool(message.hidden_elements_removed)
 
         cost = estimate_tokens(body) + _HEADER_TOKEN_ALLOWANCE
         if selected and used_tokens + cost > budget.thread_tokens:
@@ -267,12 +270,57 @@ def build_payload(thread: EmailThread, budget: BudgetSettings) -> ThreadPayload:
     payload.messages = selected
     payload.omitted_messages = len(thread.messages) - len(selected)
     payload.estimated_tokens = used_tokens
-    payload.injection = InjectionSignal(
+    return _seal(payload, used_hiding=used_hiding)
+
+
+# Every string but a body is capped at this. Subjects, addresses and file names
+# have no business being longer; a body has a budget of its own.
+_FIELD_CHARS = 300
+
+# Identity keeps its exact characters. Every other kind of sanitising still
+# applies — see `sanitise(fold_compatibility=...)` for why folding does not.
+_IDENTITY_FIELDS = frozenset({"sender", "sender_domain", "reply_to"})
+
+
+def _seal(payload: ThreadPayload, *, used_hiding: bool) -> ThreadPayload:
+    """Sanitise and scan every string the payload holds, and nothing else.
+
+    Walks the serialised form rather than naming fields, so a field added to
+    the payload later is covered the moment it exists — capped, stripped,
+    folded and scanned — without anyone remembering to add it here.
+    """
+    patterns: set[str] = set()
+    hiding = used_hiding
+
+    def clean(value: Any, key: str | None) -> Any:
+        nonlocal hiding
+        if isinstance(value, dict):
+            return {name: clean(item, name) for name, item in value.items()}
+        if isinstance(value, list):
+            return [clean(item, key) for item in value]
+        if not isinstance(value, str):
+            return value
+
+        is_body = key == "body"
+        # A header has no line structure; a newline decoded out of one is only
+        # there to start a fresh line in front of the model.
+        text = value if is_body else " ".join(value.split())
+        text, report = sanitise(
+            text,
+            max_chars=None if is_body else _FIELD_CHARS,
+            fold_compatibility=key not in _IDENTITY_FIELDS,
+        )
+        hiding = hiding or report.carries_hiding_techniques
+        patterns.update(detect_injection(text, single_line=not is_body).patterns)
+        return text
+
+    sealed = ThreadPayload.model_validate(clean(payload.model_dump(exclude={"injection"}), None))
+    sealed.injection = InjectionSignal(
         suspicious=bool(patterns),
         patterns=sorted(patterns),
-        used_hiding_techniques=used_hiding,
+        used_hiding_techniques=hiding,
     )
-    return payload
+    return sealed
 
 
 # Headers, attachment names and JSON punctuation cost something too. A flat

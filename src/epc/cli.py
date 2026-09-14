@@ -38,6 +38,7 @@ from epc.errors import EpcError
 from epc.settings import CONFIG_ENV, DEFAULT_CONFIG_FILENAME, Settings, load_settings
 
 if TYPE_CHECKING:  # pragma: no cover
+    from epc.actions.model import ThreadMutation
     from epc.classify.prompt import PromptRenderer
     from epc.gmail.client import GmailClient
 
@@ -76,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     labels = subcommands.add_parser("labels", help="resolve the configured labels against the mailbox")
     _add_config_option(labels)
+    labels.add_argument("--create", action="store_true", help="create configured labels that do not exist yet")
 
     login = subcommands.add_parser("login", help="authorise this tool against a Gmail account")
     _add_config_option(login)
@@ -184,6 +186,15 @@ def cmd_labels(args: argparse.Namespace) -> int:
     client = _gmail_client(settings)
 
     available = client.list_labels()
+    if args.create:
+        # Here, as a deliberate setup step, and never during `run`: a dry run
+        # promises to write nothing, and a label is a write.
+        existing = {label.name for label in available}
+        for name in settings.labels.by_priority.values():
+            if name not in existing:
+                client.create_label(name)
+                print(f"Created label {name!r}")
+        available = client.list_labels()
     resolved = resolve_priority_labels(available, settings.labels.by_priority)
 
     print(f"{len(available)} labels in the mailbox. Configured priority labels resolve to:\n")
@@ -396,17 +407,55 @@ def cmd_apply(args: argparse.Namespace) -> int:
         raise EpcError(f"file not found: {args.file}")
 
     mutations = list(read_mutations(args.file))
+    client = _gmail_client(settings)
     print(f"Applying {len(mutations)} planned change(s) from {args.file}")
 
-    report = MutationApplier(_gmail_client(settings), batch_size=settings.dispatch.batch_size).apply(mutations)
+    current, unchecked = _still_as_planned(client, settings, mutations)
+    report = MutationApplier(client, batch_size=settings.dispatch.batch_size).apply(current)
 
+    skipped = len(mutations) - len(current) - len(unchecked)
     print(
         f"  applied {report.applied}  no-op {report.skipped_noop}  "
-        f"failed {report.failed}  gmail calls {report.api_calls}"
+        f"failed {report.failed + len(unchecked)}  gmail calls {report.api_calls}"
     )
-    for failure in report.failures:
+    if skipped:
+        print(f"  skipped {skipped}: the thread's priority label changed after it was planned")
+    for failure in [*report.failures, *unchecked]:
         print(f"  ! {failure}", file=sys.stderr)
-    return EXIT_PARTIAL if report.had_failures else EXIT_OK
+    return EXIT_PARTIAL if report.had_failures or unchecked else EXIT_OK
+
+
+def _still_as_planned(
+    client: GmailClient, settings: Settings, mutations: list[ThreadMutation]
+) -> tuple[list[ThreadMutation], list[str]]:
+    """The mutations whose threads have not been re-labelled since planning.
+
+    A plan file can wait hours between `run --dry-run` and `apply`, and a person
+    can label a thread in that time. Applying the plan over that label would
+    undo the correction — rule B, broken by a replay. So each thread's labels are
+    read again first. A classified change goes ahead only if the thread still
+    has no priority label; a carried-forward one only if it still has exactly
+    the label being carried.
+
+    The apply Lambda does not do this. It runs seconds after planning, and a
+    read per thread would spend Gmail quota on a race that window barely allows.
+    """
+    from epc.errors import GmailError
+    from epc.gmail.labels import resolve_priority_labels
+
+    priority_ids = set(resolve_priority_labels(client.list_labels(), settings.labels.by_priority).values())
+    current: list[ThreadMutation] = []
+    unchecked: list[str] = []
+    for mutation in mutations:
+        try:
+            present = client.thread_label_ids(mutation.thread_id) & priority_ids
+        except GmailError as exc:
+            unchecked.append(f"{mutation.thread_id}: not applied, labels could not be checked: {exc}")
+            continue
+        expected = set(mutation.add_label_ids) & priority_ids if mutation.origin == "carried_forward" else set()
+        if present == expected:
+            current.append(mutation)
+    return current, unchecked
 
 
 _COMMANDS = {

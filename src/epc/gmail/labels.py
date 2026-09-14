@@ -91,7 +91,7 @@ def _missing_label_message(missing: Mapping[Priority, str], by_name: Mapping[str
         hint = f"  did you mean: {', '.join(repr(s) for s in suggestions)}" if suggestions else ""
         lines.append(f"  {priority.value}: {name!r} not found.{hint}")
     lines.append("")
-    lines.append("Create the labels in Gmail, correct labels.* in the config, or set labels.create_if_missing.")
+    lines.append("Create the labels in Gmail or with `epc labels --create`, or correct labels.* in the config.")
     return "\n".join(lines)
 
 

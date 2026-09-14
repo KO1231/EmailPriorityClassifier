@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from epc import __version__
-from epc.cli import EXIT_FATAL, EXIT_OK, build_parser, main
+from epc.cli import EXIT_FATAL, EXIT_OK, EXIT_PARTIAL, build_parser, main
 
 VALID_CONFIG = """
 labels:
@@ -186,3 +186,138 @@ def test_policy_can_arrive_as_an_environment_variable(
     out = capsys.readouterr().out
     assert "# policy: EPC_POLICY_YAML" in out
     assert "Mail from the landlord is always P1." in out
+
+
+# --------------------------------------------------------------------------
+# Commands that talk to Gmail, against a fake
+# --------------------------------------------------------------------------
+
+
+class FakeGmailClient:
+    def __init__(self, labels: dict[str, str], thread_labels: dict[str, set[str]] | None = None) -> None:
+        self.labels = dict(labels)  # name -> id
+        self.thread_labels = thread_labels or {}
+        self.created: list[str] = []
+        self.writes: list[tuple[list[str], list[str]]] = []
+
+    def list_labels(self) -> list[object]:
+        from epc.gmail.labels import GmailLabel
+
+        return [GmailLabel(id=label_id, name=name) for name, label_id in self.labels.items()]
+
+    def create_label(self, name: str) -> object:
+        self.created.append(name)
+        self.labels[name] = f"Label_new_{len(self.created)}"
+        return None
+
+    def thread_label_ids(self, thread_id: str) -> set[str]:
+        from epc.errors import GmailError
+
+        if thread_id not in self.thread_labels:
+            raise GmailError("thread not found")
+        return self.thread_labels[thread_id]
+
+    def batch_modify(self, message_ids: object, *, add_label_ids: object = (), remove_label_ids: object = ()) -> None:
+        self.writes.append((list(message_ids), list(add_label_ids)))  # type: ignore[call-overload]
+
+
+PRIORITY_LABELS = {"#/P1": "Label_1", "#/P2": "Label_2", "#/P3": "Label_3"}
+
+
+def use_fake_client(monkeypatch: pytest.MonkeyPatch, client: FakeGmailClient) -> None:
+    monkeypatch.setattr("epc.cli._gmail_client", lambda _settings: client)
+
+
+def test_labels_create_makes_only_the_missing_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.yml"
+    config.write_text(VALID_CONFIG, encoding="utf-8")
+    client = FakeGmailClient({"#/P1": "Label_1"})
+    use_fake_client(monkeypatch, client)
+
+    assert main(["labels", "--create", "--config", str(config)]) == EXIT_OK
+    assert client.created == ["#/P2", "#/P3"]
+    assert "Created label '#/P2'" in capsys.readouterr().out
+
+
+def test_labels_without_create_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "config.yml"
+    config.write_text(VALID_CONFIG, encoding="utf-8")
+    client = FakeGmailClient({"#/P1": "Label_1"})
+    use_fake_client(monkeypatch, client)
+
+    assert main(["labels", "--config", str(config)]) == EXIT_FATAL
+    assert client.created == []
+
+
+def write_plan(path: Path, *mutations: object) -> None:
+    path.write_text("".join(m.model_dump_json() + "\n" for m in mutations), encoding="utf-8")  # type: ignore[attr-defined]
+
+
+def planned(thread_id: str, label: str, *, origin: str = "classified") -> object:
+    from datetime import UTC, datetime
+
+    from epc.actions.model import ThreadMutation
+    from epc.priority import Priority
+
+    return ThreadMutation(
+        thread_id=thread_id,
+        message_ids=[f"{thread_id}-m1"],
+        add_label_ids=[label],
+        priority=Priority.P1,
+        classified_at=datetime(2026, 9, 14, tzinfo=UTC),
+        origin=origin,  # type: ignore[arg-type]
+    )
+
+
+def test_apply_skips_threads_labelled_since_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Hours can pass between a dry run and its replay. A label a person set in
+    that time must not be overwritten by the replay."""
+    config = tmp_path / "config.yml"
+    config.write_text(VALID_CONFIG, encoding="utf-8")
+    plan = tmp_path / "plan.jsonl"
+    write_plan(plan, planned("untouched", "Label_1"), planned("relabelled", "Label_1"))
+    client = FakeGmailClient(PRIORITY_LABELS, {"untouched": {"INBOX"}, "relabelled": {"INBOX", "Label_3"}})
+    use_fake_client(monkeypatch, client)
+
+    assert main(["apply", str(plan), "--config", str(config)]) == EXIT_OK
+    assert client.writes == [(["untouched-m1"], ["Label_1"])]
+    assert "skipped 1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("labels_now", "applied"),
+    [({"Label_2"}, True), (set(), False), ({"Label_1"}, False)],
+    ids=["still-carried-label", "label-removed", "label-changed"],
+)
+def test_apply_carries_a_label_only_if_the_thread_still_has_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, labels_now: set[str], applied: bool
+) -> None:
+    """A removed label is a request to re-classify; carrying it back would undo that."""
+    config = tmp_path / "config.yml"
+    config.write_text(VALID_CONFIG, encoding="utf-8")
+    plan = tmp_path / "plan.jsonl"
+    write_plan(plan, planned("t1", "Label_2", origin="carried_forward"))
+    client = FakeGmailClient(PRIORITY_LABELS, {"t1": {"INBOX", *labels_now}})
+    use_fake_client(monkeypatch, client)
+
+    assert main(["apply", str(plan), "--config", str(config)]) == EXIT_OK
+    assert bool(client.writes) is applied
+
+
+def test_apply_does_not_write_what_it_could_not_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.yml"
+    config.write_text(VALID_CONFIG, encoding="utf-8")
+    plan = tmp_path / "plan.jsonl"
+    write_plan(plan, planned("gone", "Label_1"))
+    client = FakeGmailClient(PRIORITY_LABELS, {})
+    use_fake_client(monkeypatch, client)
+
+    assert main(["apply", str(plan), "--config", str(config)]) == EXIT_PARTIAL
+    assert client.writes == []
+    assert "labels could not be checked" in capsys.readouterr().err

@@ -69,7 +69,6 @@ class LabelSettings(_Section):
     p1: str
     p2: str
     p3: str
-    create_if_missing: bool = False
 
     @model_validator(mode="after")
     def _names_must_be_distinct(self) -> Self:

@@ -46,6 +46,7 @@ class FakeThreads:
     def __init__(self, request: FakeRequest) -> None:
         self._request = request
         self.list_kwargs: dict[str, Any] | None = None
+        self.get_kwargs: dict[str, Any] | None = None
 
     def list(self, **kwargs: Any) -> FakeRequest:
         self.list_kwargs = kwargs
@@ -53,6 +54,10 @@ class FakeThreads:
 
     def list_next(self, _request: Any, _response: Any) -> None:
         return None
+
+    def get(self, **kwargs: Any) -> FakeRequest:
+        self.get_kwargs = kwargs
+        return self._request
 
 
 class FakeService:
@@ -163,3 +168,9 @@ def test_listing_carries_each_threads_history_id(make_client: Any) -> None:
 
     assert refs == [ThreadRef(id="t1", history_id="42"), ThreadRef(id="t2", history_id="")]
     assert "historyId" in service.threads_resource.list_kwargs["fields"]
+
+
+def test_a_threads_labels_are_read_without_its_messages(make_client: Any) -> None:
+    client, service = make_client({"messages": [{"labelIds": ["INBOX", "Label_1"]}, {"labelIds": ["UNREAD"]}]})
+    assert client.thread_label_ids("t1") == {"INBOX", "Label_1", "UNREAD"}
+    assert service.threads_resource.get_kwargs["format"] == "minimal"

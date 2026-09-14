@@ -16,7 +16,9 @@ labels:
   p1: "#/P1"
   p2: "#/P2"
   p3: "#/P3"
-  create_if_missing: false
+  # Labels that do not exist yet are an error at startup, never created mid-run:
+  # a dry run writes nothing, and that includes labels. `epc labels --create`
+  # creates them once.
 
 gmail:
   query: "in:inbox"

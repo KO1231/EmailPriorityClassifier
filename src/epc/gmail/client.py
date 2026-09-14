@@ -123,6 +123,16 @@ class GmailClient:
                         return
             request = self._service.users().threads().list_next(request, response)
 
+    def thread_label_ids(self, thread_id: str) -> set[str]:
+        """The labels on any message of a thread, without fetching the messages."""
+        response = self._execute(
+            self._service.users()
+            .threads()
+            .get(userId="me", id=thread_id, format="minimal", fields="messages(labelIds)"),
+            operation=f"reading the labels of thread {thread_id}",
+        )
+        return {str(label) for message in response.get("messages") or [] for label in message.get("labelIds") or []}
+
     def get_thread(self, thread_id: str) -> dict[str, Any]:
         """One thread with full message payloads.
 

@@ -45,17 +45,31 @@ _TEXT_PREFERENCE = ("text/plain", "text/html")
 _NON_VISIBLE_TAGS = ("script", "style", "head", "noscript", "template", "title")
 
 # Inline styles that hide an element from a reader while leaving its text in the
-# document. Marketing preheaders use the same trick, which is precisely why an
+# document. Marketing preheaders use the same tricks, which is precisely why an
 # attacker can too: text nobody sees is text nobody proofreads.
-_HIDDEN_STYLE_RE = re.compile(
-    r"display\s*:\s*none"
-    r"|visibility\s*:\s*hidden"
-    r"|font-size\s*:\s*0(?:\.0+)?(?:px|pt|em|rem|%)?(?![\d.])"
-    r"|opacity\s*:\s*0(?:\.0+)?(?![\d.])"
-    r"|(?:max-)?height\s*:\s*0(?:\.0+)?(?:px|pt|em|rem|%)?(?![\d.])"
-    r"|text-indent\s*:\s*-\d{3,}",
+#
+# Each property name is anchored, so `min-height:0` and `line-height:0` are not
+# read as `height:0`. Only what actually hides counts: a false match removes
+# visible mail, and an empty body is a worse answer than a flagged one.
+_PROPERTY = r"(?<![\w-])"
+
+# Hidden whatever the element contains: nothing inside can undo these.
+_HIDING_STYLE_RE = re.compile(
+    _PROPERTY + r"display\s*:\s*none"
+    r"|" + _PROPERTY + r"visibility\s*:\s*hidden"
+    r"|" + _PROPERTY + r"opacity\s*:\s*0(?:\.0+)?(?![\d.])"
+    r"|" + _PROPERTY + r"text-indent\s*:\s*-\d{3,}",
     re.IGNORECASE,
 )
+# A zero height hides nothing on its own — content overflows it and stays
+# visible. It hides together with `overflow: hidden`, the preheader idiom.
+_ZERO_HEIGHT_RE = re.compile(_PROPERTY + r"(?:max-)?height\s*:\s*0(?:\.0+)?(?:px|pt|em|rem|%)?(?![\d.])", re.IGNORECASE)
+_OVERFLOW_HIDDEN_RE = re.compile(_PROPERTY + r"overflow(?:-y)?\s*:\s*hidden", re.IGNORECASE)
+# `font-size` is inherited, and a descendant can set it back. Responsive email
+# layouts depend on exactly that — `font-size:0` on a table cell to close the
+# gaps between inline-block columns, readable sizes on the columns inside — so
+# it is judged per piece of text, by the nearest size that applies to it.
+_FONT_SIZE_RE = re.compile(_PROPERTY + r"font-size\s*:\s*([\d.]+)", re.IGNORECASE)
 
 _CHARSET_RE = re.compile(r'charset\s*=\s*["\']?([\w\-.:+]+)', re.IGNORECASE)
 _AUTH_RESULT_RE = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*(\w+)", re.IGNORECASE)
@@ -169,9 +183,10 @@ def html_to_text(html: str) -> tuple[str, int]:
     gone. The rule stays clean: this function returns what a person would read.
 
     **This parses; it does not render.** No CSS cascade is resolved, no layout is
-    computed, no browser is involved — it is a parse tree plus a regex over
-    inline ``style`` attributes, which is why a 100 KB promotional email costs
-    single-digit milliseconds rather than the hundreds a headless renderer would.
+    computed, no browser is involved — it is a parse tree, a regex over inline
+    ``style`` attributes and a walk up the parents for inherited font sizes,
+    which is why a dense 100 KB promotional email costs a few tens of
+    milliseconds rather than the seconds a headless renderer would.
 
     Two kinds of hiding consequently get through, both deliberately:
 
@@ -196,11 +211,43 @@ def html_to_text(html: str) -> tuple[str, int]:
     for hidden in soup.find_all(None, attrs={"hidden": True}):
         hidden.decompose()
         hidden_count += 1
-    for styled in soup.find_all(style=_HIDDEN_STYLE_RE):
+    for styled in soup.find_all(style=_hides_element):
         styled.decompose()
         hidden_count += 1
+    for text in soup.find_all(string=True):
+        if text.strip() and _rendered_at_zero_size(text.parent):
+            text.extract()
+            hidden_count += 1
 
     return soup.get_text(separator="\n"), hidden_count
+
+
+def _hides_element(style: str | None) -> bool:
+    if not style:
+        return False
+    if _HIDING_STYLE_RE.search(style):
+        return True
+    return bool(_ZERO_HEIGHT_RE.search(style) and _OVERFLOW_HIDDEN_RE.search(style))
+
+
+def _rendered_at_zero_size(element: Any) -> bool:
+    """Whether the nearest `font-size` over this element is zero.
+
+    The inline-style inheritance chain only; no stylesheet is consulted, as
+    everywhere else in this function.
+    """
+    while element is not None:
+        style = element.get("style") if hasattr(element, "get") else None
+        if style:
+            sizes = _FONT_SIZE_RE.findall(style)
+            if sizes:
+                # The last declaration in an attribute is the one that applies.
+                try:
+                    return float(sizes[-1]) == 0
+                except ValueError:
+                    return False
+        element = element.parent
+    return False
 
 
 def normalise_text(text: str) -> str:

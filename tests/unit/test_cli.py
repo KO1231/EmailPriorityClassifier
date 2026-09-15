@@ -92,16 +92,23 @@ def seed_failures(tmp_path: Path, *, classifier: str | None = None, now: datetim
 REPO = Path(__file__).resolve().parents[2]
 
 
+def empty_policy(config: Path) -> Path:
+    policy = config.parent / "policy.yml"
+    policy.write_text("guidance: []\n", encoding="utf-8")
+    return policy
+
+
 def current_classifier(config: Path) -> str:
     from epc.classify.prompt import PromptRenderer
     from epc.cli import _classifier_version
     from epc.settings import load_settings
 
-    return _classifier_version(load_settings(config), PromptRenderer.load(REPO / "prompts", REPO / "absent.yml"))
+    return _classifier_version(load_settings(config), PromptRenderer.load(REPO / "prompts", empty_policy(config)))
 
 
 def failures_list(config: Path) -> list[str]:
-    return ["failures", "list", "--config", str(config), "--prompts", str(REPO / "prompts"), "--policy", "absent.yml"]
+    policy = empty_policy(config)
+    return ["failures", "list", "--config", str(config), "--prompts", str(REPO / "prompts"), "--policy", str(policy)]
 
 
 def test_failures_list_shows_what_is_skipped(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -427,3 +434,21 @@ def test_apply_does_not_write_what_it_could_not_check(
     assert main(["apply", str(plan), "--config", str(config)]) == EXIT_PARTIAL
     assert client.writes == []
     assert "labels could not be checked" in capsys.readouterr().err
+
+
+def test_a_policy_path_that_does_not_exist_is_an_error(
+    no_config_here: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A mistyped path used to classify the whole run without personal rules."""
+    monkeypatch.setenv("EPC_CONFIG_YAML", VALID_CONFIG)
+    code = main(["prompt", "render", "--prompts", str(REPO / "prompts"), "--policy", "polcy.yml"])
+    assert code == EXIT_FATAL
+    assert "policy file not found: polcy.yml" in capsys.readouterr().err
+
+
+def test_no_policy_at_all_is_still_fine(
+    no_config_here: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("EPC_CONFIG_YAML", VALID_CONFIG)
+    assert main(["prompt", "render", "--prompts", str(REPO / "prompts")]) == EXIT_OK
+    assert "# policy: none" in capsys.readouterr().out

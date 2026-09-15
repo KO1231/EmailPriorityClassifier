@@ -180,6 +180,65 @@ def test_body_is_found_at_arbitrary_depth() -> None:
     assert parse_message(fx.message(payload)).body == "Buried four levels down."
 
 
+def test_a_body_split_around_an_inline_image_is_kept_whole() -> None:
+    """Apple Mail sends text, image, text as sibling parts. Taking the first text
+    part dropped everything after the image."""
+    message = fx.message(
+        fx.multipart(
+            "mixed",
+            fx.text_part("前半: 見積書を送ります。"),
+            fx.part("image/png", content=b"\x89PNG", headers=[("Content-Disposition", "inline")]),
+            fx.text_part("後半: 金額は300万円、期限は明日です。"),
+        )
+    )
+    body = parse_message(message).body
+    assert "前半: 見積書を送ります。" in body
+    assert "後半: 金額は300万円、期限は明日です。" in body
+
+
+def test_only_one_form_of_an_alternative_is_taken() -> None:
+    message = fx.message(
+        fx.multipart(
+            "alternative",
+            fx.text_part("Please review the contract."),
+            fx.text_part("<p>Please review the contract.</p>", subtype="html"),
+        )
+    )
+    assert parse_message(message).body.count("Please review the contract.") == 1
+
+
+def test_a_stub_plain_part_gives_way_to_the_html() -> None:
+    """Seen in a real inbox: 29 characters of "view this as HTML" beside ~2000 of
+    content, and the message was classified on the 29."""
+    message = fx.message(
+        fx.multipart(
+            "alternative",
+            fx.text_part("このメールはHTML形式です。"),
+            fx.text_part(
+                "<p>請求書のご案内: ご請求金額は 50,000円 です。お支払い期限は 9月20日 です。"
+                "期限を過ぎますとサービスが停止されますのでご注意ください。</p>",
+                subtype="html",
+            ),
+        )
+    )
+    parsed = parse_message(message)
+    assert "50,000円" in parsed.body
+    assert parsed.body_mime_type == "text/html"
+
+
+def test_a_short_but_real_plain_part_is_still_preferred() -> None:
+    message = fx.message(
+        fx.multipart(
+            "alternative",
+            fx.text_part("承認します。"),
+            fx.text_part("<p>承認します。</p><p>--</p><p>山田</p>", subtype="html"),
+        )
+    )
+    parsed = parse_message(message)
+    assert parsed.body == "承認します。"
+    assert parsed.body_mime_type == "text/plain"
+
+
 def test_walk_parts_yields_root_and_every_descendant() -> None:
     payload = fx.multipart("mixed", fx.multipart("alternative", fx.text_part("a"), fx.text_part("b")))
     assert len(list(walk_parts(payload))) == 4

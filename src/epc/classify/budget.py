@@ -9,10 +9,19 @@ wrong with that, and all three mattered:
 * Quoted history was counted against the budget over and over, so a long thread
   spent its entire allowance re-reading itself.
 
-What happens instead: quoted replies and signatures come off, each message is
-capped, messages are admitted **newest first** until the budget is spent, and the
-result is built as a structure and serialised afterwards — so it is always valid,
-and always says how much was left out.
+What happens instead: quoted history that the thread already holds comes off,
+each message is then capped, messages are admitted **newest first** until the
+budget is spent, and the result is built as a structure and serialised
+afterwards — so it is always valid, and always says how much was left out.
+
+**Nothing is removed on the strength of its shape alone.** A line that looks
+like the start of quoted history only licenses a cut once the text below it is
+found in an earlier message of the same thread. Removing duplicated history
+saves tokens; removing history that exists nowhere else — a message someone was
+CC'd into halfway, a reply whose earlier messages were deleted — loses the only
+copy the model will ever see. A missed saving costs a little; a false cut costs
+the thread. Signatures are no longer stripped at all, for the same reason: the
+only marker is a bare "--", which is also a section rule.
 
 This module is also the sanitisation gate. `build_payload` is the only supported
 route from a parsed thread to a prompt, and it sanitises on the way *out*: every
@@ -24,6 +33,7 @@ what the next new field would have been left off.
 """
 
 import re
+from collections.abc import Sequence
 from datetime import datetime
 from math import ceil
 from typing import Any
@@ -32,7 +42,7 @@ from pydantic import BaseModel, Field
 
 from epc.gmail.models import EmailMessage, EmailThread
 from epc.security.detect import InjectionSignal, detect_injection
-from epc.security.sanitize import sanitise
+from epc.security.sanitize import TRUNCATION_MARKER, sanitise
 from epc.settings import BudgetSettings
 
 # Roughly one token per CJK character; Latin text runs nearer four characters per
@@ -44,13 +54,14 @@ _LATIN_CHARS_PER_TOKEN = 3
 # What is cut, and why so little.
 #
 # Stripping exists so quoted history does not spend the budget twice: the thread
-# already holds the earlier messages in full. Every pattern below is therefore
-# held to one standard — it must mark *a copy of an earlier message* and nothing
-# else, because a false match deletes everything after it, and that tail is
-# usually the part that matters. Order confirmations separate sections with
-# `----------`; notices open with "事務局より:"; itineraries have "From: Tokyo".
-# A forwarded message is never cut: it is not elsewhere in the thread, and it is
-# often the entire point of the mail it arrived in.
+# usually holds the earlier messages in full. The patterns below only *find*
+# where quoted history seems to begin, and they are held to one standard — they
+# must mark a copy of an earlier message and nothing else. Order confirmations
+# separate sections with `----------`; notices open with "事務局より:";
+# itineraries have "From: Tokyo". Even a genuine match is only cut once
+# `_found_in_thread` confirms the text is elsewhere in the thread. A forwarded
+# message is never cut: it is not elsewhere in the thread, and it is often the
+# entire point of the mail it arrived in.
 
 # A reply attribution specific enough to trust on its own.
 _ATTRIBUTIONS = (
@@ -88,12 +99,19 @@ _FORWARD_MARKERS = (
 _HEADER_BLOCK_LINES = 5
 
 _QUOTED_LINE_RE = re.compile(r"^\s*>")
-# RFC 3676's "-- ". Sanitisation strips trailing whitespace, so "--" is what
-# arrives. A run of dashes is a section rule, not a signature.
-_SIGNATURE_RE = re.compile(r"^--\s?$")
-# A signature is short. A delimiter with more than this below it is something
-# else, and cutting there would lose the message.
-_MAX_SIGNATURE_LINES = 15
+# Header lines of a copied block. Left out when comparing quoted history with the
+# thread: a client writes them differently from the headers themselves.
+_COPIED_HEADER = re.compile(
+    "^\\s*(?:From|Sent|To|Cc|Subject|Date|差出人|送信日時|宛先|件名|日付)\\s*[:\uff1a]", re.IGNORECASE
+)
+# How much of the quoted text must appear in earlier messages before it is cut.
+# Measured on a real inbox: quoted history that was in the thread overlapped by
+# 0.66 to 1.0 — line wrapping and HTML-to-text conversion account for the rest —
+# while history that was not in the thread overlapped by 0.15.
+_SHARED_ENOUGH = 0.5
+_SHINGLE = 12
+_SHINGLE_STEP = 6
+_UNSPACED = re.compile(r"[\s>]+")
 
 TRUNCATION_NOTE = "[message truncated]"
 
@@ -110,13 +128,21 @@ def estimate_tokens(text: str) -> int:
     return cjk + ceil((len(text) - cjk) / _LATIN_CHARS_PER_TOKEN)
 
 
-def strip_quoted_reply(text: str) -> str:
-    """Remove quoted history, keeping only what this message actually added.
+def strip_quoted_reply(text: str, earlier: Sequence[str] = ()) -> str:
+    """Remove quoted history the thread already holds, keeping what this message added.
+
+    `earlier` is the text of the messages before this one in the thread. Quoted
+    history is cut only when enough of it is found there; with nothing earlier —
+    the first message of a thread, a message someone was CC'd into halfway —
+    nothing is. Quoted lines interleaved with answers are kept: without the
+    question, "no, make it 200" means nothing.
 
     Returns the original text when stripping would leave nothing: a bare "+1" on
     top of a quote is still the message, and an empty body tells the model less
     than a redundant one.
     """
+    if not earlier:
+        return text.strip()
     lines = text.split("\n")
     for index in range(len(lines)):
         if any(marker.match(lines[index]) for marker in _FORWARD_MARKERS):
@@ -124,12 +150,42 @@ def strip_quoted_reply(text: str) -> str:
             # thread anywhere else, so none of it is cut.
             return text.strip()
         if _quote_starts_at(lines, index):
-            lines = lines[:index]
+            if _found_in_thread(lines[index + 1 :], earlier):
+                lines = lines[:index]
+            # Either way the search ends here. Below an unconfirmed attribution
+            # is history that exists nowhere else, and a later attribution
+            # inside it would cut it partway.
             break
 
-    kept = [line for line in lines if not _QUOTED_LINE_RE.match(line)]
-    stripped = "\n".join(kept).strip()
+    quoted = [index for index, line in enumerate(lines) if _QUOTED_LINE_RE.match(line)]
+    if quoted:
+        interleaved = any(
+            lines[index].strip() and not _QUOTED_LINE_RE.match(lines[index]) for index in range(quoted[0], quoted[-1])
+        )
+        if not interleaved and _found_in_thread([lines[index] for index in quoted], earlier):
+            dropped = set(quoted)
+            lines = [line for index, line in enumerate(lines) if index not in dropped]
+
+    stripped = "\n".join(lines).strip()
     return stripped or text.strip()
+
+
+def _found_in_thread(lines: Sequence[str], earlier: Sequence[str]) -> bool:
+    """Whether most of `lines` already appears in an earlier message.
+
+    Compared with whitespace and quote markers removed, in overlapping
+    fragments, because the copy is never character-for-character: clients
+    re-wrap quoted lines, and an HTML message quoted as plain text loses its
+    layout.
+    """
+    quoted = _UNSPACED.sub("", "".join(line for line in lines if not _COPIED_HEADER.match(line)))
+    if not quoted:
+        return True
+    history = _UNSPACED.sub("", "".join(earlier))
+    if len(quoted) <= _SHINGLE:
+        return quoted in history
+    fragments = {quoted[start : start + _SHINGLE] for start in range(0, len(quoted) - _SHINGLE + 1, _SHINGLE_STEP)}
+    return sum(fragment in history for fragment in fragments) >= _SHARED_ENOUGH * len(fragments)
 
 
 def _quote_starts_at(lines: list[str], index: int) -> bool:
@@ -169,24 +225,6 @@ def _is_header_block(lines: list[str], index: int, *, trust_sender: bool) -> boo
 
 def _next_nonblank(lines: list[str], index: int) -> int | None:
     return next((i for i in range(index + 1, len(lines)) if lines[i].strip()), None)
-
-
-def strip_signature(text: str) -> str:
-    """Remove a trailing signature block.
-
-    Only the last delimiter is considered, and only when what follows it is
-    short enough to be a signature.
-    """
-    lines = text.split("\n")
-    for index in range(len(lines) - 1, 0, -1):
-        if _SIGNATURE_RE.match(lines[index].strip()):
-            if len(lines) - index - 1 > _MAX_SIGNATURE_LINES:
-                break
-            candidate = "\n".join(lines[:index]).strip()
-            if candidate:
-                return candidate
-            break
-    return text.strip()
 
 
 class MessagePayload(BaseModel):
@@ -253,16 +291,23 @@ def build_payload(thread: EmailThread, budget: BudgetSettings) -> ThreadPayload:
     used_tokens = 0
     used_hiding = False
 
+    # Sanitised once each, uncapped: stripping has to see a quote whole to find
+    # it elsewhere, and earlier messages are what it is compared against.
+    sanitised = [sanitise(message.body) for message in thread.messages]
+    texts = [text for text, _ in sanitised]
+
     # Newest first: if anything has to be dropped, it should be the history.
-    for message in reversed(thread.messages):
-        # Sanitised here as well as on the way out: quote stripping needs the
-        # line structure normalised, and the cap has to apply before budgeting.
-        body, report = sanitise(message.body, max_chars=budget.message_chars)
+    for index in reversed(range(len(thread.messages))):
+        message = thread.messages[index]
+        body, report = sanitised[index]
         # A forward's body is the forwarded mail, which is not elsewhere in the
         # thread — so there is no history in it to strip.
         if not _FORWARD_SUBJECT.match(message.subject.strip()):
-            body = strip_quoted_reply(body)
-        body = strip_signature(body)
+            body = strip_quoted_reply(body, earlier=texts[:index])
+        # Capped after stripping, not before. A reply written below a long quote
+        # used to be cut off by the cap, then the quote stripped, leaving nothing
+        # of what the sender actually wrote.
+        body, truncated = _cap(body, budget.message_chars)
         used_hiding = used_hiding or report.carries_hiding_techniques or bool(message.hidden_elements_removed)
 
         cost = estimate_tokens(body) + _HEADER_TOKEN_ALLOWANCE
@@ -270,7 +315,7 @@ def build_payload(thread: EmailThread, budget: BudgetSettings) -> ThreadPayload:
             break
 
         used_tokens += cost
-        selected.append(_to_payload(message, body, truncated=report.truncated_from is not None))
+        selected.append(_to_payload(message, body, truncated=truncated))
 
     # Back into reading order; the model is told what is missing from the front.
     selected.reverse()
@@ -278,6 +323,45 @@ def build_payload(thread: EmailThread, budget: BudgetSettings) -> ThreadPayload:
     payload.omitted_messages = len(thread.messages) - len(selected)
     payload.estimated_tokens = used_tokens
     return _seal(payload, used_hiding=used_hiding)
+
+
+# Stands in for quoted lines removed to fit a message under its cap.
+QUOTE_ELIDED = "> [...]"
+
+
+def _cap(text: str, max_chars: int) -> tuple[str, bool]:
+    """Fit `text` into `max_chars`, giving up quoted lines before anything else.
+
+    Quoted history that could not be confirmed elsewhere in the thread stays in
+    the body. Cut from the end, a long quote would push out a reply written below
+    it; so when a message is over the cap, its `>` lines go first — from the end
+    of the quote, keeping the start for context — and only then is the rest cut.
+    What the sender wrote is worth more than their copy of someone else.
+    """
+    if len(text) <= max_chars:
+        return text, False
+
+    lines = text.split("\n")
+    quoted = [index for index, line in enumerate(lines) if _QUOTED_LINE_RE.match(line)]
+    dropped: set[int] = set()
+    length = len(text)
+    for index in reversed(quoted):
+        if length + len(QUOTE_ELIDED) + 1 <= max_chars:
+            break
+        dropped.add(index)
+        length -= len(lines[index]) + 1
+    if dropped:
+        kept: list[str] = []
+        for index, line in enumerate(lines):
+            if index not in dropped:
+                kept.append(line)
+            elif not kept or kept[-1] != QUOTE_ELIDED:
+                kept.append(QUOTE_ELIDED)
+        text = "\n".join(kept)
+        if len(text) <= max_chars:
+            return text, True
+
+    return text[: max(0, max_chars - len(TRUNCATION_MARKER))].rstrip() + TRUNCATION_MARKER, True
 
 
 # Every string but a body is capped at this. Subjects, addresses and file names

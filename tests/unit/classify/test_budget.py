@@ -6,7 +6,6 @@ from epc.classify.budget import (
     build_payload,
     estimate_tokens,
     strip_quoted_reply,
-    strip_signature,
 )
 from epc.gmail.mime import parse_thread
 from epc.settings import BudgetSettings
@@ -30,51 +29,134 @@ def thread_of(*bodies: str, **kwargs: object) -> object:
 
 
 # --------------------------------------------------------------------------
-# Quote and signature stripping
+# Quote stripping
 # --------------------------------------------------------------------------
+
+# What the earlier message in these threads said. Quoted history is only cut
+# when it is found in an earlier message, so each case supplies one.
+ORIGINAL_EN = "Please review this by Friday"
+ORIGINAL_JA = "契約書の確認をお願いします"
 
 
 def test_english_quoted_history_is_removed() -> None:
     text = "Sounds good, will do.\n\nOn Tue, 9 Sep 2026, Akira wrote:\n> Please review this\n> by Friday"
-    assert strip_quoted_reply(text) == "Sounds good, will do."
+    assert strip_quoted_reply(text, earlier=[ORIGINAL_EN]) == "Sounds good, will do."
 
 
 def test_japanese_quoted_history_is_removed() -> None:
     text = "承知しました。\n\n2026年9月10日 田中 明:\n> 契約書の確認をお願いします"
-    assert strip_quoted_reply(text) == "承知しました。"
+    assert strip_quoted_reply(text, earlier=[ORIGINAL_JA]) == "承知しました。"
 
 
 def test_the_wrote_variant_is_removed() -> None:
-    text = "了解です。\n\n田中さんは書きました:\n> よろしく"
-    assert strip_quoted_reply(text) == "了解です。"
+    text = "了解です。\n\n田中さんは書きました:\n> 契約書の確認をお願いします"
+    assert strip_quoted_reply(text, earlier=[ORIGINAL_JA]) == "了解です。"
 
 
 def test_outlook_style_history_is_removed() -> None:
-    text = "Approved.\n\n________________________________\nFrom: someone@example.com\nSent: Monday"
-    assert strip_quoted_reply(text) == "Approved."
+    text = "Approved.\n\n________________________________\nFrom: someone@example.com\nSent: Monday\n\n" + ORIGINAL_EN
+    assert strip_quoted_reply(text, earlier=[ORIGINAL_EN]) == "Approved."
 
 
 def test_bare_quote_markers_are_removed() -> None:
-    assert strip_quoted_reply("agreed\n> old line\n>> older line") == "agreed"
+    assert strip_quoted_reply("agreed\n> old line\n>> older line", earlier=["old line", "older line"]) == "agreed"
 
 
 def test_a_reply_that_is_only_a_quote_keeps_the_quote() -> None:
     """An empty body tells the model less than a redundant one."""
     text = "> Please confirm receipt."
-    assert strip_quoted_reply(text) == text
+    assert strip_quoted_reply(text, earlier=["Please confirm receipt."]) == text
 
 
 def test_a_message_without_quotes_is_untouched() -> None:
     text = "Could you review the contract before Friday?"
+    assert strip_quoted_reply(text, earlier=[text]) == text
+
+
+# --------------------------------------------------------------------------
+# ...and only history the thread already holds
+# --------------------------------------------------------------------------
+
+
+def test_history_that_is_nowhere_else_in_the_thread_is_kept() -> None:
+    """The reviewer's case: CC'd in halfway, the incident report exists only in
+    this message's quote. It used to be cut, leaving "please handle"."""
+    text = (
+        "Aさん、CC に追加します。対応をお願いします。\n\n________________________________\n"
+        "From: 山田 <yamada@example.com>\nSent: 2026年9月15日 10:00\nSubject: RE: 障害対応\n\n"
+        "本番 DB が停止しています。本日中に復旧が必要です。"
+    )
     assert strip_quoted_reply(text) == text
+    assert strip_quoted_reply(text, earlier=["別の件のメールです。"]) == text
 
 
-def test_signatures_are_removed() -> None:
-    assert strip_signature("Please review.\n\n--\nAkira Tanaka\nExample Co.") == "Please review."
+def test_the_first_message_of_a_thread_is_never_stripped() -> None:
+    thread = parse_thread(
+        fx.thread(
+            fx.message(
+                fx.text_part("対応をお願いします。\n\nOn Mon, 14 Sep 2026, 山田 wrote:\n> 本番 DB が停止しています。"),
+                headers=[("From", "a@example.com"), ("Subject", "RE: 障害対応")],
+            )
+        )
+    )
+    assert "本番 DB が停止しています。" in build_payload(thread, BUDGET).messages[0].body
 
 
-def test_a_message_that_is_only_a_signature_delimiter_survives() -> None:
-    assert strip_signature("--") == "--"
+def test_quoted_history_survives_rewrapping_and_is_still_recognised() -> None:
+    """Clients re-wrap quoted lines; the copy is never character for character."""
+    original = "The staging database will be offline between 02:00 and 04:00 on Saturday for the upgrade."
+    text = (
+        "Noted.\n\nOn Fri, 11 Sep 2026, Ops wrote:\n> The staging database will be offline\n"
+        "> between 02:00 and 04:00 on\n> Saturday for the upgrade."
+    )
+    assert strip_quoted_reply(text, earlier=[original]) == "Noted."
+
+
+def test_quoted_lines_between_answers_are_kept() -> None:
+    """Without the question, "no, make it 200" means nothing."""
+    text = "> 納期は来週でよいですか\n来週で問題ありません。\n> 数量は100でよいですか\nいいえ、200に変更してください。"
+    earlier = ["納期は来週でよいですか。数量は100でよいですか。"]
+    assert strip_quoted_reply(text, earlier=earlier) == text
+
+
+def test_a_reply_below_a_long_quote_survives_the_cap() -> None:
+    """The cap used to apply first: it cut the reply off, stripping then removed
+    the quote, and nothing the sender wrote was left."""
+    history = "\n".join(f"前回のご連絡内容その{n}について詳細を記載します。" for n in range(120))
+    reply = "\n".join(f"> {line}" for line in history.split("\n")) + "\n\n承認します。明日までに発注してください。"
+    thread = parse_thread(
+        fx.thread(
+            fx.message(
+                fx.text_part(history), message_id="m1", headers=[("From", "a@example.com"), ("Subject", "発注")]
+            ),
+            fx.message(
+                fx.text_part(reply), message_id="m2", headers=[("From", "b@example.com"), ("Subject", "RE: 発注")]
+            ),
+        )
+    )
+    assert build_payload(thread, BUDGET).messages[-1].body == "承認します。明日までに発注してください。"
+
+
+def test_a_reply_below_a_long_unconfirmed_quote_survives_the_cap() -> None:
+    """When the quote is kept — its history is nowhere else — the cap takes quoted
+    lines first, not the reply at the bottom."""
+    quote = "\n".join(f"> 前回のご連絡内容その{n}について詳細を記載します。" for n in range(120))
+    reply = quote + "\n\n承認します。明日までに発注してください。"
+    thread = parse_thread(
+        fx.thread(
+            fx.message(
+                fx.text_part("別件です。"), message_id="m1", headers=[("From", "a@example.com"), ("Subject", "発注")]
+            ),
+            fx.message(
+                fx.text_part(reply), message_id="m2", headers=[("From", "b@example.com"), ("Subject", "RE: 発注")]
+            ),
+        )
+    )
+    message = build_payload(thread, BUDGET).messages[-1]
+    assert message.body.endswith("承認します。明日までに発注してください。")
+    assert message.body.startswith("> 前回のご連絡内容その0")  # the start of the quote, for context
+    assert message.body_truncated
+    assert len(message.body) <= BUDGET.message_chars
 
 
 @pytest.mark.parametrize(
@@ -84,6 +166,9 @@ def test_a_message_that_is_only_a_signature_delimiter_survives() -> None:
         # "ご注文ありがとうございます" and lost the deadline.
         "ご注文ありがとうございます\n----------\n注文番号: 123\nお支払い期限: 明日",
         "Your order\n--------------------\nOrder: 123\n--------------------\nPay by: tomorrow",
+        # A bare "--" is a signature delimiter to RFC 3676 and a section rule to
+        # everyone else. Signatures are no longer stripped for exactly this.
+        "ご注文内容\n商品: 冷蔵庫\n--\n合計: 198,000円\nお支払い期限: 9月20日",
         # A notice from an office, not a reply attribution.
         "お知らせ\n事務局より\uff1a\n明日までに回答をお願いします",
         # A dated heading, not Gmail's "2026年9月10日 田中 <a@example.com>:".
@@ -91,10 +176,11 @@ def test_a_message_that_is_only_a_signature_delimiter_survives() -> None:
         # An itinerary: From and To are places.
         "フライト変更のお知らせ\nFrom: Tokyo (HND)\nTo: Osaka (ITM)\nDate: 2026-09-20\n出発時刻が変更されました",
     ],
-    ids=["jp-order-rules", "en-order-rules", "office-notice", "dated-heading", "itinerary"],
+    ids=["jp-order-rules", "en-order-rules", "double-dash-rule", "office-notice", "dated-heading", "itinerary"],
 )
 def test_ordinary_lines_that_look_like_history_cut_nothing(text: str) -> None:
-    assert strip_signature(strip_quoted_reply(text)) == text
+    """Even with the same text elsewhere in the thread — the shape has to be right too."""
+    assert strip_quoted_reply(text, earlier=[text]) == text
 
 
 @pytest.mark.parametrize(
@@ -116,19 +202,26 @@ def test_ordinary_lines_that_look_like_history_cut_nothing(text: str) -> None:
 )
 def test_a_forwarded_message_is_kept(text: str) -> None:
     """It is not elsewhere in the thread, and often the whole point of the mail."""
-    assert strip_quoted_reply(text) == text
+    assert strip_quoted_reply(text, earlier=[text]) == text
 
 
-def _single_message_body(body: str, subject: str) -> str:
+def _reply_body(body: str, subject: str) -> str:
+    """The body of a reply in a thread whose first message is the original."""
     thread = parse_thread(
         fx.thread(
             fx.message(
+                fx.text_part("Sign by Friday."),
+                message_id="m1",
+                headers=[("From", "boss@example.com"), ("Subject", "Contract")],
+            ),
+            fx.message(
                 fx.text_part(body),
+                message_id="m2",
                 headers=[("From", "me@example.com"), ("Subject", subject)],
-            )
+            ),
         )
     )
-    return build_payload(thread, BUDGET).messages[0].body
+    return build_payload(thread, BUDGET).messages[-1].body
 
 
 # What Outlook writes above a forwarded message: the *original* headers, subject
@@ -141,13 +234,12 @@ OUTLOOK_BLOCK = (
 
 @pytest.mark.parametrize("subject", ["FW: Contract", "Fwd: Contract", "[External] FW: Contract", "転送: 契約"])
 def test_an_outlook_forward_is_recognised_by_its_own_subject(subject: str) -> None:
-    body = _single_message_body("FYI, please handle." + OUTLOOK_BLOCK, subject)
+    body = _reply_body("FYI, please handle." + OUTLOOK_BLOCK, subject)
     assert "Sign by Friday." in body
 
 
 def test_the_same_block_under_a_reply_is_still_history() -> None:
-    body = _single_message_body("Done." + OUTLOOK_BLOCK, "RE: Contract")
-    assert body == "Done."
+    assert _reply_body("Done." + OUTLOOK_BLOCK, "RE: Contract") == "Done."
 
 
 def test_a_reply_to_a_forward_strips_the_forward_it_quotes() -> None:
@@ -156,36 +248,32 @@ def test_a_reply_to_a_forward_strips_the_forward_it_quotes() -> None:
         "Thanks, on it.\n\n________________________________\nFrom: Boss <boss@example.com>\n"
         "Sent: Monday\nSubject: FW: Contract\n\nFYI"
     )
-    assert strip_quoted_reply(text) == "Thanks, on it."
+    assert strip_quoted_reply(text, earlier=["FYI"]) == "Thanks, on it."
 
 
 def test_an_address_confirms_a_dated_japanese_attribution() -> None:
     text = "承知しました。\n\n2026年9月10日(水) 10:00 田中 明 <a.tanaka@example.co.jp>:\n契約書の確認をお願いします"
-    assert strip_quoted_reply(text) == "承知しました。"
+    assert strip_quoted_reply(text, earlier=[ORIGINAL_JA]) == "承知しました。"
 
 
 def test_quoted_lines_confirm_a_weak_attribution() -> None:
-    assert strip_quoted_reply("了解です。\n\n田中より:\n> よろしく") == "了解です。"
+    assert strip_quoted_reply("了解です。\n\n田中より:\n> よろしく", earlier=["よろしく"]) == "了解です。"
 
 
 def test_a_copied_header_block_with_an_address_is_history() -> None:
-    text = "Approved.\n\nFrom: Akira <akira@example.com>\nSent: Monday, 14 September 2026\nTo: me\nSubject: Budget"
-    assert strip_quoted_reply(text) == "Approved."
+    text = (
+        "Approved.\n\nFrom: Akira <akira@example.com>\nSent: Monday, 14 September 2026\nTo: me\n"
+        "Subject: Budget\n\n" + ORIGINAL_EN
+    )
+    assert strip_quoted_reply(text, earlier=[ORIGINAL_EN]) == "Approved."
 
 
 def test_japanese_outlook_history_is_removed() -> None:
-    text = "承認します。\n\n________________________________\n差出人: 田中 明\n送信日時: 2026年9月14日\n件名: 予算"
-    assert strip_quoted_reply(text) == "承認します。"
-
-
-def test_a_long_block_below_a_delimiter_is_not_a_signature() -> None:
-    body = "Summary\n--\n" + "\n".join(f"Item {n}: details" for n in range(30))
-    assert strip_signature(body) == body
-
-
-def test_only_the_last_delimiter_is_a_signature() -> None:
-    text = "Part one\n--\nPart two\n--\nAkira Tanaka"
-    assert strip_signature(text) == "Part one\n--\nPart two"
+    text = (
+        "承認します。\n\n________________________________\n差出人: 田中 明\n送信日時: 2026年9月14日\n"
+        "件名: 予算\n\n" + ORIGINAL_JA
+    )
+    assert strip_quoted_reply(text, earlier=[ORIGINAL_JA]) == "承認します。"
 
 
 # --------------------------------------------------------------------------

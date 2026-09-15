@@ -174,6 +174,11 @@ def _renderer(args: argparse.Namespace) -> PromptRenderer:
 
     # The same order as `--config`: the flag, then the variable, then policy.yml.
     policy_text = os.environ.get(POLICY_ENV) or None if args.policy is None else None
+    if args.policy is not None and not args.policy.is_file():
+        # An absent default policy.yml is normal: most people have none. A path
+        # someone typed is not — silently classifying without their rules would
+        # label a whole run by nobody's criteria, and rule B keeps those labels.
+        raise EpcError(f"policy file not found: {args.policy}")
     return PromptRenderer.load(args.prompts, args.policy, policy_text=policy_text)
 
 

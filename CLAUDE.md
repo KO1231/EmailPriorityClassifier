@@ -76,13 +76,36 @@ supported route from a parsed thread to a prompt, and it sanitises on the way th
 Anything reading `EmailMessage.body` directly has skipped that; `tests/injection/`
 exists to catch it.
 
+**Nothing is cut from a body on the strength of its shape alone.** A false cut
+loses the only copy the model will see; a missed cut costs tokens. So:
+
+- `strip_quoted_reply` finds where quoted history seems to start, then cuts only if
+  enough of it (`_SHARED_ENOUGH`, compared in whitespace-free fragments) is found in an
+  earlier message of the same thread. A first message is never stripped. A message
+  someone was CC'd into halfway keeps its history, and so does a reply whose earlier
+  messages were deleted. Quoted lines interleaved with answers are kept, and a forward
+  is never stripped.
+- Signatures are not stripped. Their only marker, a bare `--`, is also a section rule.
+  In a real inbox it appeared in a fifth of messages.
+- The per-message cap applies *after* stripping, and gives up `>` lines before
+  anything else. Otherwise a reply written below a long quote is cut off.
+- `extract_body` follows MIME structure. It picks one child of `multipart/alternative`
+  and joins every child of any other multipart. A plain-text alternative under a
+  third of the HTML's visible length is treated as a stub, and the HTML is used.
+
+These were settled by measuring a real inbox (330 messages), not by reasoning alone.
+Change them the same way: before and after, lengths only — no message got shorter.
+
 **Hidden-text removal lives in `gmail/mime.py`, not `security/`.** Text hidden with
 `display:none` is a question of what is *visible*, and deciding it needs the markup —
 which is gone by the time sanitisation runs. `html_to_text` parses; it does not render,
 resolve the CSS cascade, or compute layout. Two kinds of hiding therefore get through
 (class selectors in a `<style>` block, and colour matching an inherited background);
 both are named cases in `tests/injection/corpus.py` and are held shut by detection
-rather than removal.
+rather than removal. On a real inbox, what the rules remove is preheader text: the
+inbox-preview summary, styled `display:none; max-height:0; opacity:0`. None of the
+removed text was visible body text. It is a summary of the body, lost on purpose,
+because it is also the commonest place to hide an instruction.
 
 **The injection signal is never shown to the model.** Telling it "this thread looks
 hostile" would make that judgement itself worth attacking. It travels beside the

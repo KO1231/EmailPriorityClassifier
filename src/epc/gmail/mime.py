@@ -5,9 +5,12 @@ bytes, and at 1500 threads a run that downloads every PDF is not viable.
 The cost is that Gmail hands back a half-parsed MIME tree that this module has
 to finish parsing properly:
 
-* the tree is walked **recursively** — the body of a
+* the tree is walked **recursively and by its structure** — the body of a
   ``multipart/mixed > multipart/alternative > text/plain`` message is two levels
-  down, and looking only at the top level's direct children finds nothing;
+  down; the children of ``multipart/alternative`` are one message in several
+  forms, so one is chosen; the children of any other multipart are the message
+  in pieces, so all are kept, in order. Apple Mail splits text around an inline
+  image into separate parts, and taking the first dropped the rest;
 * part bytes are decoded using the **charset its own headers declare**, so
   ISO-2022-JP and Shift_JIS mail survives instead of raising part-way through;
 * HTML is decoded **first and parsed second**, which is the only order in which
@@ -37,8 +40,11 @@ from epc.gmail.models import Attachment, AuthenticationResults, EmailMessage, Em
 # A node of Gmail's payload tree, or a whole message/thread resource.
 GmailPayload = dict[str, Any]
 
-# Body text is taken from the first of these that yields anything.
-_TEXT_PREFERENCE = ("text/plain", "text/html")
+# A plain-text alternative this much shorter than the HTML's visible text is a
+# stub ("this message is best viewed as HTML"), not the message. In one real
+# inbox, 13 of 330 messages had a 29-character plain part beside ~2000 characters
+# of HTML — and were classified on the 29 characters.
+_STUB_RATIO = 3
 
 # Markup whose text content is never shown to a reader. `get_text()` keeps the
 # contents of these, so they have to be removed explicitly.
@@ -287,36 +293,55 @@ def _is_attachment(part: GmailPayload, headers: dict[str, str]) -> bool:
 
 
 def extract_body(payload: GmailPayload) -> ExtractedBody:
-    """Best available body text, and the MIME type it came from.
+    """The message's text, and the MIME type it came from.
 
     Returns an empty :class:`ExtractedBody` when the message carries no text
     part at all.
     """
-    candidates: dict[str, list[tuple[str, str]]] = {mime: [] for mime in _TEXT_PREFERENCE}
+    return _extract(payload) or ExtractedBody()
 
-    for part in walk_parts(payload):
-        mime_type = str(part.get("mimeType") or "").lower()
-        if mime_type not in candidates:
-            continue
-        headers = header_map(part)
-        if _is_attachment(part, headers):
-            continue
-        data = str((part.get("body") or {}).get("data") or "")
-        if not data:
-            continue
-        candidates[mime_type].append((data, charset_of(headers)))
 
-    for mime_type in _TEXT_PREFERENCE:
-        for data, charset in candidates[mime_type]:
-            decoded = decode_body_data(data, charset)
-            hidden = 0
-            if mime_type == "text/html":
-                decoded, hidden = html_to_text(decoded)
-            text = normalise_text(decoded)
-            if text:
-                return ExtractedBody(text=text, mime_type=mime_type, hidden_elements_removed=hidden)
+def _extract(part: GmailPayload) -> ExtractedBody | None:
+    headers = header_map(part)
+    if _is_attachment(part, headers):
+        return None
+    mime_type = str(part.get("mimeType") or "").lower()
 
-    return ExtractedBody()
+    if mime_type in ("text/plain", "text/html"):
+        decoded = decode_body_data(str((part.get("body") or {}).get("data") or ""), charset_of(headers))
+        hidden = 0
+        if mime_type == "text/html":
+            decoded, hidden = html_to_text(decoded)
+        text = normalise_text(decoded)
+        return ExtractedBody(text=text, mime_type=mime_type, hidden_elements_removed=hidden) if text else None
+
+    children = [piece for child in part.get("parts") or [] if (piece := _extract(child)) is not None]
+    if not children:
+        return None
+    if mime_type == "multipart/alternative":
+        return _choose_alternative(children)
+    if mime_type.startswith("multipart/") or mime_type == "message/rfc822":
+        # The message in pieces: text, an inline image, more text. All of it.
+        return ExtractedBody(
+            text="\n\n".join(piece.text for piece in children),
+            mime_type=children[0].mime_type,
+            hidden_elements_removed=sum(piece.hidden_elements_removed for piece in children),
+        )
+    return None
+
+
+def _choose_alternative(forms: list[ExtractedBody]) -> ExtractedBody:
+    """One message, several renderings. Plain text unless it is a stub.
+
+    Plain text is preferred when it is real: it is what the sender wrote, with no
+    layout to strip and no markup to hide text in. HTML is used when there is no
+    plain form, or when the plain form is too short to be the same message.
+    """
+    plain = next((form for form in forms if form.mime_type == "text/plain"), None)
+    html = next((form for form in forms if form.mime_type == "text/html"), None)
+    if plain is None or html is None:
+        return plain or html or forms[0]
+    return html if len(plain.text) * _STUB_RATIO < len(html.text) else plain
 
 
 def extract_attachments(payload: GmailPayload) -> list[Attachment]:

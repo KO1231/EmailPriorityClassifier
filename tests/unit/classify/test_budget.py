@@ -104,14 +104,59 @@ def test_ordinary_lines_that_look_like_history_cut_nothing(text: str) -> None:
         "Date: Mon, 14 Sep 2026\nSubject: Contract\n至急対応してください",
         "ご確認ください\n---------- 転送メッセージ ---------\n差出人: 田中 <tanaka@example.com>\n"
         "日付: 2026年9月14日\n件名: 契約\n本日中に返送が必要です",
-        # Outlook forwards look like Outlook replies; the subject tells them apart.
-        "See below.\n________________________________\nFrom: Boss\nSent: Monday\nSubject: FW: Contract\nSign by Friday",
+        # Apple Mail writes a sentence, not a rule.
+        "FYI, please handle.\n\nBegin forwarded message:\n\nFrom: Boss <boss@example.com>\n"
+        "Subject: Contract\nDate: 14 September 2026\nTo: me@example.com\n\nSign by Friday.",
+        # A forwarded conversation carries its own attributions; they are part of
+        # what was forwarded.
+        "See below\n---------- Forwarded message ---------\nFrom: A <a@example.com>\n"
+        "Date: Mon\n\nAgreed.\n\nOn Sun, 13 Sep 2026, B wrote:\n> Can you sign?",
     ],
-    ids=["gmail-forward", "gmail-forward-ja", "outlook-forward"],
+    ids=["gmail-forward", "gmail-forward-ja", "apple-mail-forward", "forwarded-conversation"],
 )
 def test_a_forwarded_message_is_kept(text: str) -> None:
     """It is not elsewhere in the thread, and often the whole point of the mail."""
     assert strip_quoted_reply(text) == text
+
+
+def _single_message_body(body: str, subject: str) -> str:
+    thread = parse_thread(
+        fx.thread(
+            fx.message(
+                fx.text_part(body),
+                headers=[("From", "me@example.com"), ("Subject", subject)],
+            )
+        )
+    )
+    return build_payload(thread, BUDGET).messages[0].body
+
+
+# What Outlook writes above a forwarded message: the *original* headers, subject
+# included. It is character for character what it writes above a quoted reply.
+OUTLOOK_BLOCK = (
+    "\n\n________________________________\nFrom: Boss <boss@example.com>\n"
+    "Sent: Monday, September 14, 2026 9:00 AM\nTo: me@example.com\nSubject: Contract\n\nSign by Friday."
+)
+
+
+@pytest.mark.parametrize("subject", ["FW: Contract", "Fwd: Contract", "[External] FW: Contract", "転送: 契約"])
+def test_an_outlook_forward_is_recognised_by_its_own_subject(subject: str) -> None:
+    body = _single_message_body("FYI, please handle." + OUTLOOK_BLOCK, subject)
+    assert "Sign by Friday." in body
+
+
+def test_the_same_block_under_a_reply_is_still_history() -> None:
+    body = _single_message_body("Done." + OUTLOOK_BLOCK, "RE: Contract")
+    assert body == "Done."
+
+
+def test_a_reply_to_a_forward_strips_the_forward_it_quotes() -> None:
+    """The copied subject reads FW:, but this message is a reply: that is history."""
+    text = (
+        "Thanks, on it.\n\n________________________________\nFrom: Boss <boss@example.com>\n"
+        "Sent: Monday\nSubject: FW: Contract\n\nFYI"
+    )
+    assert strip_quoted_reply(text) == "Thanks, on it."
 
 
 def test_an_address_confirms_a_dated_japanese_attribution() -> None:

@@ -73,9 +73,17 @@ _WEAK_ATTRIBUTIONS = (
 _OUTLOOK_RULE = re.compile(r"^\s*_{10,}\s*$")
 _HEADER_FROM = re.compile("^\\s*(?:From|差出人)\\s*[:\uff1a]\\s*(.+)$", re.IGNORECASE)
 _HEADER_DATE = re.compile("^\\s*(?:Sent|Date|送信日時|日付)\\s*[:\uff1a]", re.IGNORECASE)
-_HEADER_SUBJECT = re.compile("^\\s*(?:Subject|件名)\\s*[:\uff1a]\\s*(.*)$", re.IGNORECASE)
-_FORWARD_SUBJECT = re.compile("^(?:fwd?|転送)\\s*[:\uff1a]", re.IGNORECASE)
-_FORWARD_MARKER = re.compile(r"^\s*-{2,}\s*(?:forwarded message|転送(?:された)?メッセージ)\s*-{2,}\s*$", re.IGNORECASE)
+# A message whose own subject says it is a forward. Its body cannot say so
+# reliably: Outlook copies the original headers above a forwarded message in
+# exactly the form it uses above a quoted reply, original subject and all.
+# Leading tags such as "[External]" are allowed for.
+_FORWARD_SUBJECT = re.compile("^(?:\\[[^\\]]*\\]\\s*)*(?:fwd?|転送)\\s*[:\uff1a]", re.IGNORECASE)
+# Lines that introduce a forwarded message: Gmail's rule, Apple Mail's sentence.
+# Everything below one is the forwarded mail, including any history it quotes.
+_FORWARD_MARKERS = (
+    re.compile(r"^\s*-{2,}\s*(?:forwarded message|転送(?:された)?メッセージ)\s*-{2,}\s*$", re.IGNORECASE),
+    re.compile("^\\s*(?:begin forwarded message|転送されたメッセージ)\\s*[:\uff1a]\\s*$", re.IGNORECASE),
+)
 # How far below a From line its Sent/Date and Subject lines may sit.
 _HEADER_BLOCK_LINES = 5
 
@@ -111,6 +119,10 @@ def strip_quoted_reply(text: str) -> str:
     """
     lines = text.split("\n")
     for index in range(len(lines)):
+        if any(marker.match(lines[index]) for marker in _FORWARD_MARKERS):
+            # A forward reached before any quote: what follows is not in the
+            # thread anywhere else, so none of it is cut.
+            return text.strip()
         if _quote_starts_at(lines, index):
             lines = lines[:index]
             break
@@ -140,32 +152,23 @@ def _is_header_block(lines: list[str], index: int, *, trust_sender: bool) -> boo
 
     `trust_sender` is set when an Outlook rule line came first, which already
     says what follows. Without it the From line must name an address, so
-    "From: Tokyo (HND)" in an itinerary is left alone. A block whose subject is
-    a forward, or which sits under a forwarding marker, is a forwarded message
-    and is kept.
+    "From: Tokyo (HND)" in an itinerary is left alone.
+
+    Whether the block is a quoted reply or a forward is not decided here; the
+    body alone cannot tell them apart. `build_payload` skips stripping for a
+    message whose own subject is a forward, and a forwarding marker line ends
+    the search before any block below it is reached.
     """
     sender = _HEADER_FROM.match(lines[index])
     if sender is None or not (trust_sender or "@" in sender.group(1)):
         return False
 
     block = lines[index + 1 : index + 1 + _HEADER_BLOCK_LINES]
-    if not trust_sender and not any(_HEADER_DATE.match(line) for line in block):
-        return False
-    for line in block:
-        subject = _HEADER_SUBJECT.match(line)
-        if subject and _FORWARD_SUBJECT.match(subject.group(1).strip()):
-            return False
-
-    previous = _previous_nonblank(lines, index)
-    return not (previous is not None and _FORWARD_MARKER.match(lines[previous]))
+    return trust_sender or any(_HEADER_DATE.match(line) for line in block)
 
 
 def _next_nonblank(lines: list[str], index: int) -> int | None:
     return next((i for i in range(index + 1, len(lines)) if lines[i].strip()), None)
-
-
-def _previous_nonblank(lines: list[str], index: int) -> int | None:
-    return next((i for i in range(index - 1, -1, -1) if lines[i].strip()), None)
 
 
 def strip_signature(text: str) -> str:
@@ -255,7 +258,11 @@ def build_payload(thread: EmailThread, budget: BudgetSettings) -> ThreadPayload:
         # Sanitised here as well as on the way out: quote stripping needs the
         # line structure normalised, and the cap has to apply before budgeting.
         body, report = sanitise(message.body, max_chars=budget.message_chars)
-        body = strip_signature(strip_quoted_reply(body))
+        # A forward's body is the forwarded mail, which is not elsewhere in the
+        # thread — so there is no history in it to strip.
+        if not _FORWARD_SUBJECT.match(message.subject.strip()):
+            body = strip_quoted_reply(body)
+        body = strip_signature(body)
         used_hiding = used_hiding or report.carries_hiding_techniques or bool(message.hidden_elements_removed)
 
         cost = estimate_tokens(body) + _HEADER_TOKEN_ALLOWANCE

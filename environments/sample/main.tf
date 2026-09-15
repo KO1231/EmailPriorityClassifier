@@ -149,9 +149,10 @@ output "next_steps" {
          uv run epc login   # with credentials.backend: ssm in your config.yml
          aws ssm put-parameter --overwrite --type SecureString \
            --name ${module.aws_ssm.openai_api_key.name} --value sk-...
-         aws ssm put-parameter --overwrite --type SecureString \
+         # --tier: without it a put falls back to Standard (4 KB) and a full config is refused.
+         aws ssm put-parameter --overwrite --type SecureString --tier Intelligent-Tiering \
            --name ${module.aws_ssm.config.name} --value file://config.yml
-         aws ssm put-parameter --overwrite --type SecureString \
+         aws ssm put-parameter --overwrite --type SecureString --tier Intelligent-Tiering \
            --name ${module.aws_ssm.policy.name} --value file://policy.yml   # optional
 
     3. Read one run before enabling the schedule:

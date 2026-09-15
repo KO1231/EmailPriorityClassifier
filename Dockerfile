@@ -69,6 +69,13 @@ COPY prompts/ /app/prompts/
 # to write once these are mounted.
 RUN mkdir -p /app/log /app/.state && chown -R epc:epc /app/log /app/.state
 
+# /tmp as a declared volume, world-writable with the sticky bit. On Fargate, a
+# task volume mounted at a path the image declares as a VOLUME is seeded from
+# the image, permissions included. Mounted anywhere else it is root-owned 0755,
+# which UID 10001 cannot write to — and a dry run on ECS writes its plan there.
+RUN chmod 1777 /tmp
+VOLUME ["/tmp"]
+
 USER epc
 
 # `epc` rather than a script path, so `docker run … run --dry-run` reads the

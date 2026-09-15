@@ -42,8 +42,14 @@ resource "aws_ssm_parameter" "openai_api_key" {
 # encrypted like the credentials. Intelligent-Tiering moves a parameter to the
 # Advanced tier only if it outgrows Standard's 4 KB.
 #
-#   aws ssm put-parameter --overwrite --type SecureString \
+#   aws ssm put-parameter --overwrite --type SecureString --tier Intelligent-Tiering \
 #     --name /epc/<env>/config --value file://config.yml
+#
+# `--tier` matters. A tier is chosen per write, not remembered from creation, so
+# a put without it falls back to the account default — Standard, 4 KB — and a
+# config copied from config.yml.example is refused. For the same reason the
+# tier is ignored below: once a large value moves a parameter to Advanced, AWS
+# reports Advanced, and a plan asking for the downgrade would fail.
 resource "aws_ssm_parameter" "config" {
   name        = "${local.prefix}/config"
   description = "config.yml, injected as EPC_CONFIG_YAML."
@@ -52,7 +58,7 @@ resource "aws_ssm_parameter" "config" {
   value       = "placeholder"
 
   lifecycle {
-    ignore_changes = [value]
+    ignore_changes = [value, tier]
   }
 }
 
@@ -64,7 +70,7 @@ resource "aws_ssm_parameter" "policy" {
   value       = "{}"
 
   lifecycle {
-    ignore_changes = [value]
+    ignore_changes = [value, tier]
   }
 }
 

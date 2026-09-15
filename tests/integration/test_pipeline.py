@@ -858,3 +858,24 @@ def test_each_injection_response_does_what_it_says(settings: Any, response: str,
 
     assert ("STARRED" in gmail.writes[0]["add"]) is starred
     assert (summary.suspicious == 1) is recorded
+
+
+def test_a_failure_before_classification_still_closes_the_sink(settings: Any, tmp_path: Path) -> None:
+    """Fetching used to happen before the `try`. A raw error there left the plan
+    file — opened, and truncated, when the sink was built — closed by nobody."""
+
+    class BrokenFetch(FakeGmail):
+        def get_thread(self, thread_id: str) -> Any:
+            raise RuntimeError("an error nobody wrapped")
+
+    gmail = BrokenFetch({"t1": labelled_thread_with_a_new_reply("t1")})
+    closed: list[bool] = []
+
+    class RecordingSink(JsonlSink):
+        def close(self) -> Any:
+            closed.append(True)
+            return super().close()
+
+    with pytest.raises(RuntimeError):
+        build(settings, gmail, FakeClassifier(), RecordingSink(tmp_path / "plan.jsonl")).run()
+    assert closed == [True]

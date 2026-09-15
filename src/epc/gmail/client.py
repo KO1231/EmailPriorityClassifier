@@ -12,8 +12,8 @@ Two properties this wrapper is responsible for:
   :class:`~epc.errors.GmailError` that says what was being attempted — and so
   does a failure below HTTP. `execute(num_retries=…)` retries a dropped
   connection or a socket timeout, then re-raises it as whatever the transport
-  raised: `TimeoutError`, `ssl.SSLError`, `httplib2.ServerNotFoundError`, a
-  token refresh that could not reach Google. Callers catch `GmailError` to lose
+  raised: `TimeoutError`, `ssl.SSLError`, `httplib2.ServerNotFoundError`,
+  `http.client.IncompleteRead`, a token refresh that could not reach Google. Callers catch `GmailError` to lose
   one thread rather than the run, so every one of those has to arrive as one.
 
 .. warning::
@@ -21,6 +21,7 @@ Two properties this wrapper is responsible for:
    :class:`GmailClient` per worker thread rather than sharing one.
 """
 
+import http.client
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -43,9 +44,11 @@ BATCH_MODIFY_LIMIT = 1000
 THREAD_PAGE_LIMIT = 500
 
 # What the transport raises once `execute`'s own retries are spent. `OSError`
-# covers sockets, timeouts and TLS; the other two are the HTTP library's and
-# google-auth's own hierarchies.
-_TRANSPORT_ERRORS = (OSError, httplib2.HttpLib2Error, GoogleAuthError)
+# covers sockets, timeouts and TLS. `http.client.HTTPException` covers a response
+# cut short or malformed (`IncompleteRead`, `BadStatusLine`), which httplib2
+# re-raises as it found it and which is not an `OSError`. The other two are the
+# HTTP library's and google-auth's own hierarchies.
+_TRANSPORT_ERRORS = (OSError, http.client.HTTPException, httplib2.HttpLib2Error, GoogleAuthError)
 
 
 class GmailClient:

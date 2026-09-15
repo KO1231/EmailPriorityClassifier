@@ -1,5 +1,6 @@
 """The Gmail wrapper's two responsibilities: retries, and errors that say what failed."""
 
+import http.client
 from typing import Any
 
 import httplib2
@@ -133,8 +134,10 @@ def test_an_http_error_names_the_operation(make_client: Any) -> None:
         ConnectionResetError("reset by peer"),
         httplib2.ServerNotFoundError("Unable to find the server at gmail.googleapis.com"),
         RefreshError("token refresh failed"),
+        http.client.IncompleteRead(b"partial"),
+        http.client.BadStatusLine("garbage"),
     ],
-    ids=["timeout", "reset", "dns", "refresh"],
+    ids=["timeout", "reset", "dns", "refresh", "incomplete-read", "bad-status-line"],
 )
 def test_a_failure_below_http_is_a_gmail_error_too(make_client: Any, error: Exception) -> None:
     """`execute` retries these and then re-raises them raw. Callers catch

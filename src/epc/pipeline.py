@@ -192,14 +192,16 @@ class Pipeline:
         started = time.monotonic()
         summary = RunSummary()
 
-        state = self._state_store.load().for_run(
-            mailbox=self._client.mailbox_address(),
-            classifier=self._classifier_version,
-        )
-        threads = self._hydrate(self._threads_to_consider(state, summary), summary)
-
+        state = RunState()
         try:
-            # Inside the `try`, so the sink that takes them is always closed.
+            # Everything from the first Gmail call on is inside the `try`. The
+            # sink already exists — a plan file has already been opened, and
+            # truncated — so any way out of the run has to close it.
+            state = self._state_store.load().for_run(
+                mailbox=self._client.mailbox_address(),
+                classifier=self._classifier_version,
+            )
+            threads = self._hydrate(self._threads_to_consider(state, summary), summary)
             for mutation in self._carried_forward:
                 self._sink.emit(mutation)
             self._classify_all(threads, summary)

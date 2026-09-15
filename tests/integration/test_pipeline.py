@@ -674,20 +674,54 @@ def test_failures_that_say_nothing_about_the_thread_are_not_recorded(
     assert store.load().failures == {}
 
 
-def test_a_thread_the_parser_cannot_read_is_recorded(
-    settings: Any, store: Any, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("error", "recorded"),
+    [
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), True),
+        (RecursionError("nested too deep"), True),
+        (LookupError("unknown charset"), True),
+        (RuntimeError("a bug"), False),
+        (ImportError("no module named lxml"), False),
+    ],
+    ids=["bad-encoding", "deep-nesting", "unknown-charset", "bug", "missing-module"],
+)
+def test_only_a_parse_error_the_content_could_cause_is_recorded(
+    settings: Any, store: Any, monkeypatch: pytest.MonkeyPatch, error: Exception, recorded: bool
 ) -> None:
+    """A broken install fails the same threads every run too, and recording that
+    would keep them skipped for thirty days after the fix."""
     from epc.gmail.mime import parse_thread
 
     def fragile_parse(raw: Any) -> Any:
         if raw["id"] == "t1":
-            raise RuntimeError("a shape nobody anticipated")
+            raise error
         return parse_thread(raw)
 
     monkeypatch.setattr("epc.pipeline.parse_thread", fragile_parse)
     gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])})
+    summary = run_once(settings, gmail, FakeClassifier(), store)
+
+    assert summary.parse_failed == 1
+    assert ("t1" in store.load().failures) is recorded
+
+
+def test_a_missing_html_parser_is_not_blamed_on_the_mail(
+    settings: Any, store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`bs4.FeatureNotFound` is a ValueError; it still is not the mail's doing."""
+    from bs4 import FeatureNotFound
+
+    from epc.gmail.mime import parse_thread
+
+    def no_lxml(raw: Any) -> Any:
+        if raw["id"] == "t1":
+            raise FeatureNotFound("Couldn't find a tree builder with the features you requested: lxml")
+        return parse_thread(raw)
+
+    monkeypatch.setattr("epc.pipeline.parse_thread", no_lxml)
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])})
     run_once(settings, gmail, FakeClassifier(), store)
-    assert set(store.load().failures) == {"t1"}
+    assert store.load().failures == {}
 
 
 def test_a_skipped_thread_that_changes_is_tried_again(settings: Any, store: Any) -> None:

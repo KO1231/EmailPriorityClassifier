@@ -143,6 +143,20 @@ def test_past_the_cap_the_oldest_records_go_first() -> None:
     assert f"t{MAX_RECORDED_FAILURES + 4}" in state.failures
 
 
+def test_past_the_cap_an_earned_skip_outlives_a_first_failure() -> None:
+    """Dropping earned skips first let every new failure push one out; the thread
+    pushed out failed again next run and pushed out another, every run, each a
+    paid request refused the same way."""
+    confirmed = {f"old{n}": "1" for n in range(MAX_RECORDED_FAILURES)}
+    state = RunState().after_run(failed=confirmed, succeeded={"ok"}, now=T0)
+    state = state.after_run(failed=confirmed, succeeded=set(), now=later(hours=1))
+    assert len(state.skipped()) == MAX_RECORDED_FAILURES
+
+    state = state.after_run(failed={"new": "1"}, succeeded=set(), now=later(hours=2))
+    assert len(state.skipped()) == MAX_RECORDED_FAILURES
+    assert "new" not in state.failures
+
+
 # --------------------------------------------------------------------------
 # Skipping
 # --------------------------------------------------------------------------

@@ -45,8 +45,10 @@ FORGET_AFTER = timedelta(days=30)
 
 # SSM Parameter Store's Standard tier holds 4 KB. `tests/unit/test_state.py`
 # checks that this many worst-case records fit with room to spare. Past the
-# limit the oldest records go first; a forgotten record costs a retry, never a
-# skipped thread.
+# limit, records that have not yet earned a skip go first, oldest first. A
+# forgotten record costs a retry, never a skipped thread — but forgetting an
+# earned skip first would let every new failure push one out, and the thread
+# pushed out would fail, be recorded, and push out the next, on every run.
 MAX_RECORDED_FAILURES = 24
 
 
@@ -129,8 +131,12 @@ class RunState(BaseModel):
                 failures[thread_id] = FailureRecord(history_id=history_id, first_failed_at=now)
 
         if len(failures) > MAX_RECORDED_FAILURES:
-            newest = sorted(failures.items(), key=lambda item: item[1].first_failed_at, reverse=True)
-            failures = dict(newest[:MAX_RECORDED_FAILURES])
+            ranked = sorted(
+                failures.items(),
+                key=lambda item: (item[1].attempts >= SKIP_AFTER_ATTEMPTS, item[1].first_failed_at),
+                reverse=True,
+            )
+            failures = dict(ranked[:MAX_RECORDED_FAILURES])
 
         return self.model_copy(
             update={

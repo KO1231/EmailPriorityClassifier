@@ -93,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     failures_actions = failures.add_subparsers(dest="failures_command", required=True)
     failures_list = failures_actions.add_parser("list", help="show the recorded failures")
     _add_config_option(failures_list)
+    _add_prompt_options(failures_list)
     failures_clear = failures_actions.add_parser("clear", help="forget recorded failures so they are retried")
     _add_config_option(failures_clear)
     failures_clear.add_argument("thread_ids", nargs="*", metavar="THREAD_ID", help="only these; omit for all")
@@ -341,7 +342,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             state_store=state,
             history=history,
             shutdown=stopping,
-            classifier_version=f"{settings.llm.backend}/{settings.llm.model}/{renderer.fingerprint}",
+            classifier_version=_classifier_version(settings, renderer),
             dry_run=writes_nothing,
         )
         print(f"Query: {pipeline.search_query()}")
@@ -361,11 +362,47 @@ def cmd_run(args: argparse.Namespace) -> int:
     return EXIT_PARTIAL if summary.had_failures else EXIT_OK
 
 
+def _classifier_version(settings: Settings, renderer: PromptRenderer) -> str:
+    """What failure records are valid for. A change retries every one of them.
+
+    Everything that shapes a request or its answer: the whole `llm` section,
+    because output limits, reasoning effort and budgets cause refusals and cut
+    answers as surely as the model does; the prompts and policy; and this
+    program's version, so a fix that ships clears what the bug recorded. Only
+    pacing is left out — it changes when a request is sent, not what comes back.
+    Readable at the front, so `epc failures list` can say what changed.
+    """
+    import hashlib
+
+    material = "\x00".join(
+        [
+            settings.llm.model_dump_json(exclude={"concurrency", "requests_per_min"}),
+            renderer.fingerprint,
+            __version__,
+        ]
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+    return f"{settings.llm.backend}/{settings.llm.model}/{digest}"
+
+
 def cmd_failures_list(args: argparse.Namespace) -> int:
     from epc.backends import build_state_store
     from epc.state import SKIP_AFTER_ATTEMPTS
 
-    state = build_state_store(_load(args.config)).load()
+    settings = _load(args.config)
+    recorded = build_state_store(settings).load()
+    # Through the same filter the next run applies, so this shows what that run
+    # will do rather than what happens to be stored. The mailbox is not checked:
+    # that needs Gmail, and this command works offline.
+    current = _classifier_version(settings, _renderer(args))
+    state = recorded.for_run(mailbox=recorded.mailbox or "", classifier=current)
+    if recorded.failures and not state.failures:
+        if recorded.classifier not in (None, current):
+            print(f"{len(recorded.failures)} failure(s) were recorded under {recorded.classifier}.")
+            print(f"The model, its settings or the prompt has changed since ({current}); all are retried next run.")
+        else:
+            print(f"{len(recorded.failures)} failure(s) are past the 30-day limit; all are retried next run.")
+        return EXIT_OK
     if not state.failures:
         print("No recorded failures.")
         return EXIT_OK

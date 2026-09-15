@@ -21,7 +21,10 @@ import traceback
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from email.errors import MessageError
 from typing import Literal
+
+from bs4 import FeatureNotFound
 
 from epc.actions.model import ThreadMutation
 from epc.actions.planner import plan_carry_forward, plan_mutation
@@ -52,6 +55,16 @@ MAX_CONSECUTIVE_FAILURES = 10
 
 # The summary names skipped threads so they can be looked up, up to a point.
 _SKIPPED_IDS_SHOWN = 10
+
+# Parse errors a message's own content can cause: bad encodings and charsets,
+# malformed structure, nesting deep enough to exhaust recursion. Only these are
+# recorded against a thread.
+_CONTENT_PARSE_ERRORS = (ValueError, LookupError, RecursionError, MessageError)
+# The environment's, not the mail's, even where they subclass one of the above:
+# `FeatureNotFound` is a `ValueError` raised when lxml is missing. Recorded
+# against threads, a broken install would skip every HTML mail for thirty days,
+# and a fixed install would not bring them back.
+_ENVIRONMENT_ERRORS = (ImportError, FeatureNotFound)
 
 
 @dataclass
@@ -339,10 +352,12 @@ class Pipeline:
                 # Anyone can send mail, so anything the parser trips over is
                 # something an outsider can put in every run's path. Named
                 # decoding failures are handled where they occur; this is the
-                # backstop for the ones nobody has thought of yet. It is the
-                # mail's own doing, so it is remembered like one.
+                # backstop for the ones nobody has thought of yet. It costs this
+                # thread either way, but only a failure the content could have
+                # caused is remembered against the thread.
                 summary.parse_failed += 1
-                self._failed_threads[ref.id] = ref.history_id
+                if isinstance(exc, _CONTENT_PARSE_ERRORS) and not isinstance(exc, _ENVIRONMENT_ERRORS):
+                    self._failed_threads[ref.id] = ref.history_id
                 logger.warning("could not parse thread", thread_id=ref.id, error_type=type(exc).__name__)
                 continue
             # Second half of idempotency: a label can appear between the search

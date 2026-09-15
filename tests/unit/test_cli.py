@@ -1,5 +1,6 @@
 """CLI behaviour that does not touch the network."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -79,30 +80,98 @@ def config_with_state(tmp_path: Path) -> Path:
     return path
 
 
-def seed_failures(tmp_path: Path) -> None:
-    from datetime import UTC, datetime
-
+def seed_failures(tmp_path: Path, *, classifier: str | None = None, now: datetime | None = None) -> None:
     from epc.state import LocalFileStateStore, RunState
 
-    now = datetime(2026, 9, 1, tzinfo=UTC)
-    state = RunState().after_run(failed={"t1": "1", "t2": "1"}, succeeded={"ok"}, now=now)
+    now = now or datetime.now(UTC).replace(microsecond=0)
+    state = RunState(classifier=classifier).after_run(failed={"t1": "1", "t2": "1"}, succeeded={"ok"}, now=now)
     state = state.after_run(failed={"t1": "1"}, succeeded=set(), now=now)
     LocalFileStateStore(tmp_path / "state.json").save(state)
 
 
+REPO = Path(__file__).resolve().parents[2]
+
+
+def current_classifier(config: Path) -> str:
+    from epc.classify.prompt import PromptRenderer
+    from epc.cli import _classifier_version
+    from epc.settings import load_settings
+
+    return _classifier_version(load_settings(config), PromptRenderer.load(REPO / "prompts", REPO / "absent.yml"))
+
+
+def failures_list(config: Path) -> list[str]:
+    return ["failures", "list", "--config", str(config), "--prompts", str(REPO / "prompts"), "--policy", "absent.yml"]
+
+
 def test_failures_list_shows_what_is_skipped(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     config = config_with_state(tmp_path)
-    seed_failures(tmp_path)
+    seed_failures(tmp_path, classifier=current_classifier(config))
 
-    assert main(["failures", "list", "--config", str(config)]) == EXIT_OK
+    assert main(failures_list(config)) == EXIT_OK
     out = capsys.readouterr().out
     assert "t1" in out and "skipped" in out
     assert "t2" in out and "retrying (1/2)" in out
 
 
 def test_failures_list_with_nothing_recorded(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["failures", "list", "--config", str(config_with_state(tmp_path))]) == EXIT_OK
+    assert main(failures_list(config_with_state(tmp_path))) == EXIT_OK
     assert "No recorded failures" in capsys.readouterr().out
+
+
+def test_failures_list_says_when_a_change_will_retry_everything(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """It used to list these as skipped while the next run retried them all."""
+    config = config_with_state(tmp_path)
+    seed_failures(tmp_path, classifier="openai/an-older-model/000000000000")
+
+    assert main(failures_list(config)) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "retried next run" in out
+    assert "skipped" not in out
+
+
+def test_failures_list_leaves_out_what_has_expired(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = config_with_state(tmp_path)
+    seed_failures(tmp_path, classifier=current_classifier(config), now=datetime(2020, 1, 1, tzinfo=UTC))
+
+    assert main(failures_list(config)) == EXIT_OK
+    assert "past the 30-day limit" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"max_output_tokens": 256}, {"reasoning_effort": "high"}, {"budget": {"thread_tokens": 1000}}],
+    ids=["output-limit", "reasoning", "budget"],
+)
+def test_a_change_to_how_requests_are_made_changes_the_classifier_version(
+    tmp_path: Path, change: dict[str, object]
+) -> None:
+    """Each of these can cause a refusal or a cut answer as surely as the model."""
+    from epc.classify.prompt import PromptRenderer
+    from epc.cli import _classifier_version
+    from epc.settings import load_settings
+
+    config = tmp_path / "config.yml"
+    config.write_text(VALID_CONFIG, encoding="utf-8")
+    renderer = PromptRenderer.load(REPO / "prompts", REPO / "absent.yml")
+    before = _classifier_version(load_settings(config), renderer)
+    after = _classifier_version(load_settings(config, llm=change), renderer)
+    assert before != after
+
+
+def test_pacing_does_not_change_the_classifier_version(tmp_path: Path) -> None:
+    from epc.classify.prompt import PromptRenderer
+    from epc.cli import _classifier_version
+    from epc.settings import load_settings
+
+    config = tmp_path / "config.yml"
+    config.write_text(VALID_CONFIG, encoding="utf-8")
+    renderer = PromptRenderer.load(REPO / "prompts", REPO / "absent.yml")
+    assert _classifier_version(load_settings(config), renderer) == _classifier_version(
+        load_settings(config, llm={"concurrency": 1, "requests_per_min": 5}), renderer
+    )
 
 
 def test_failures_clear_forgets_the_named_threads(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

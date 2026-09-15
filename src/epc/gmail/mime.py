@@ -68,8 +68,14 @@ _OVERFLOW_HIDDEN_RE = re.compile(_PROPERTY + r"overflow(?:-y)?\s*:\s*hidden", re
 # `font-size` is inherited, and a descendant can set it back. Responsive email
 # layouts depend on exactly that — `font-size:0` on a table cell to close the
 # gaps between inline-block columns, readable sizes on the columns inside — so
-# it is judged per piece of text, by the nearest size that applies to it.
-_FONT_SIZE_RE = re.compile(_PROPERTY + r"font-size\s*:\s*([\d.]+)", re.IGNORECASE)
+# it is judged per piece of text, by the nearest size declaration over it.
+#
+# The size can be set back in many ways: `font: 16px/24px Arial`, `medium`,
+# `calc()`, `var()`. Recognising each would leave the next one out and empty the
+# body again, so the rule is the other way round: only a declaration that is
+# explicitly zero hides. `font: 0/0 a`, the preheader idiom, is one.
+_FONT_DECLARATION_RE = re.compile(_PROPERTY + r"(font-size|font)\s*:\s*([^;]*)", re.IGNORECASE)
+_ZERO_LENGTH_RE = re.compile(r"^[+-]?(?:0+(?:\.0*)?|\.0+)(?:px|pt|pc|em|rem|ex|ch|%|vw|vh|mm|cm|in|q)?$", re.IGNORECASE)
 
 _CHARSET_RE = re.compile(r'charset\s*=\s*["\']?([\w\-.:+]+)', re.IGNORECASE)
 _AUTH_RESULT_RE = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*(\w+)", re.IGNORECASE)
@@ -231,7 +237,7 @@ def _hides_element(style: str | None) -> bool:
 
 
 def _rendered_at_zero_size(element: Any) -> bool:
-    """Whether the nearest `font-size` over this element is zero.
+    """Whether the nearest font size declared over this element is an explicit zero.
 
     The inline-style inheritance chain only; no stylesheet is consulted, as
     everywhere else in this function.
@@ -239,15 +245,22 @@ def _rendered_at_zero_size(element: Any) -> bool:
     while element is not None:
         style = element.get("style") if hasattr(element, "get") else None
         if style:
-            sizes = _FONT_SIZE_RE.findall(style)
-            if sizes:
+            declarations = _FONT_DECLARATION_RE.findall(style)
+            if declarations:
                 # The last declaration in an attribute is the one that applies.
-                try:
-                    return float(sizes[-1]) == 0
-                except ValueError:
-                    return False
+                prop, value = declarations[-1]
+                return _declares_zero_size(prop.lower(), value)
         element = element.parent
     return False
+
+
+def _declares_zero_size(prop: str, value: str) -> bool:
+    value = value.replace("!important", "").strip()
+    if prop == "font-size":
+        return bool(_ZERO_LENGTH_RE.match(value))
+    # `font` shorthand: the size is the token before any "/line-height". Only
+    # the size is checked; "16px/0" is a zero line height, and the text shows.
+    return any(_ZERO_LENGTH_RE.match(token.split("/")[0]) for token in value.split())
 
 
 def normalise_text(text: str) -> str:

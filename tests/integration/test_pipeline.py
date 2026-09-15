@@ -549,7 +549,6 @@ def run_once(
     store: Any,
     *,
     classifier_version: str = "fake/fake-model/abc",
-    dry_run: bool = False,
     sink: Any = None,
 ) -> Any:
     return Pipeline(
@@ -560,7 +559,6 @@ def run_once(
         priority_label_ids=LABEL_IDS,
         state_store=store,
         classifier_version=classifier_version,
-        dry_run=dry_run,
     ).run()
 
 
@@ -613,14 +611,16 @@ def test_threads_past_the_limit_are_taken_up_by_the_next_run(settings: Any, stor
 
 def test_a_dry_run_leaves_the_state_untouched(settings: Any, store: Any, tmp_path: Path) -> None:
     """A dry run must not change what the next real run does. It used to store a
-    checkpoint, after which everything it had looked at was never seen again."""
+    checkpoint, after which everything it had looked at was never seen again.
+    Nothing but the sink says it is a dry run: a separate flag that had to be
+    remembered beside it was one more way to save state from a run that wrote
+    nothing."""
     gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"]), "t2": thread("t2", labels=["INBOX"])})
     run_once(
         settings,
         gmail,
         ScriptedClassifier({"t1": refused()}),
         store,
-        dry_run=True,
         sink=JsonlSink(tmp_path / "mutations.jsonl"),
     )
     assert not (tmp_path / "state.json").exists()
@@ -855,7 +855,7 @@ def test_a_reply_in_a_labelled_thread_gets_the_label_and_the_thread_stops_coming
 def test_a_dry_run_only_plans_the_carried_label(settings: Any, store: Any, tmp_path: Path) -> None:
     gmail = FakeGmail({"t1": labelled_thread_with_a_new_reply("t1")})
     path = tmp_path / "mutations.jsonl"
-    run_once(settings, gmail, FakeClassifier(), store, dry_run=True, sink=JsonlSink(path))
+    run_once(settings, gmail, FakeClassifier(), store, sink=JsonlSink(path))
 
     assert gmail.writes == []
     (planned,) = list(read_mutations(path))

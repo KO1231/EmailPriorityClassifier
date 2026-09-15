@@ -50,12 +50,14 @@ EXIT_PARTIAL = 2
 
 
 def _add_config_option(parser: argparse.ArgumentParser) -> None:
+    # No default here: whether the flag was given decides between the file and
+    # EPC_CONFIG_YAML, so an omitted flag has to be distinguishable.
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(DEFAULT_CONFIG_FILENAME),
+        default=None,
         metavar="PATH",
-        help=f"configuration file (default: {DEFAULT_CONFIG_FILENAME})",
+        help=f"configuration file (default: ${CONFIG_ENV} if set, else {DEFAULT_CONFIG_FILENAME})",
     )
 
 
@@ -112,29 +114,44 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="a Gmail threads.get JSON response; omit for a built-in example thread",
     )
-    render.add_argument("--prompts", type=Path, default=Path("prompts"), metavar="DIR", help="prompt directory")
-    render.add_argument("--policy", type=Path, default=Path("policy.yml"), metavar="PATH", help="personal policy")
+    _add_prompt_options(render)
 
     return parser
 
 
 def _add_prompt_options(parser: argparse.ArgumentParser) -> None:
+    from epc.classify.prompt import DEFAULT_POLICY_FILENAME, POLICY_ENV
+
     parser.add_argument("--prompts", type=Path, default=Path("prompts"), metavar="DIR", help="prompt directory")
-    parser.add_argument("--policy", type=Path, default=Path("policy.yml"), metavar="PATH", help="personal policy")
+    parser.add_argument(
+        "--policy",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=f"personal policy (default: ${POLICY_ENV} if set, else {DEFAULT_POLICY_FILENAME})",
+    )
 
 
-def _config_source(path: Path) -> str:
+def _config_source(path: Path | None) -> str:
     """What the configuration is read from, for messages."""
-    return CONFIG_ENV if os.environ.get(CONFIG_ENV) else str(path)
+    if path is None and os.environ.get(CONFIG_ENV):
+        return CONFIG_ENV
+    return str(path or DEFAULT_CONFIG_FILENAME)
 
 
-def _load(path: Path, **overrides: Any) -> Settings:
-    # The environment variable wins when it is set: it is how a deployment with
-    # no config file delivers one, and a stray file in the image must not
-    # quietly take its place.
-    text = os.environ.get(CONFIG_ENV)
-    if text:
-        return load_settings(config_text=text, **overrides)
+def _load(path: Path | None, **overrides: Any) -> Settings:
+    """Settings from `--config` if given, else `EPC_CONFIG_YAML`, else config.yml.
+
+    The same order as every other setting: the command line, then the
+    environment, then the default. A variable picked up from `--env-file` must
+    not quietly replace a file someone named on purpose — and on ECS, where the
+    variable is how the config arrives, nobody passes the flag.
+    """
+    if path is None:
+        text = os.environ.get(CONFIG_ENV)
+        if text:
+            return load_settings(config_text=text, **overrides)
+        path = Path(DEFAULT_CONFIG_FILENAME)
     if not path.is_file():
         raise EpcError(
             f"configuration file not found: {path}\n"
@@ -143,18 +160,21 @@ def _load(path: Path, **overrides: Any) -> Settings:
     return load_settings(path, **overrides)
 
 
-def _policy_source(path: Path) -> str:
-    from epc.classify.prompt import POLICY_ENV
+def _policy_source(path: Path | None) -> str:
+    from epc.classify.prompt import DEFAULT_POLICY_FILENAME, POLICY_ENV
 
-    if os.environ.get(POLICY_ENV):
+    if path is None and os.environ.get(POLICY_ENV):
         return POLICY_ENV
-    return str(path) if path.is_file() else "none"
+    resolved = path or Path(DEFAULT_POLICY_FILENAME)
+    return str(resolved) if resolved.is_file() else "none"
 
 
 def _renderer(args: argparse.Namespace) -> PromptRenderer:
     from epc.classify.prompt import POLICY_ENV, PromptRenderer
 
-    return PromptRenderer.load(args.prompts, args.policy, policy_text=os.environ.get(POLICY_ENV) or None)
+    # The same order as `--config`: the flag, then the variable, then policy.yml.
+    policy_text = os.environ.get(POLICY_ENV) or None if args.policy is None else None
+    return PromptRenderer.load(args.prompts, args.policy, policy_text=policy_text)
 
 
 def cmd_config_validate(args: argparse.Namespace) -> int:
@@ -343,7 +363,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             history=history,
             shutdown=stopping,
             classifier_version=_classifier_version(settings, renderer),
-            dry_run=writes_nothing,
         )
         print(f"Query: {pipeline.search_query()}")
         summary = pipeline.run()

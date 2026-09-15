@@ -178,8 +178,10 @@ Baked in: the package and the generic prompts. Mounted: `config.yml`, `policy.ym
 
 On ECS nothing is mounted. `config.yml` and `policy.yml` live in SecureString parameters
 and arrive as `EPC_CONFIG_YAML` / `EPC_POLICY_YAML` through the task's `secrets` block,
-beside `OPENAI_API_KEY`. When `EPC_CONFIG_YAML` is set it wins over any file, and `EPC__…`
-variables still override single keys on top of it. Those `secrets` are resolved by the
+beside `OPENAI_API_KEY`. The order is the usual one: a `--config` or `--policy` given on the
+command line, then the variable, then the default file. A variable picked up from
+`--env-file` therefore cannot replace a file someone named, and a stray `config.yml` cannot
+replace what the deployment delivered. `EPC__…` variables still override single keys on top. Those `secrets` are resolved by the
 **execution** role before the program starts, so that role needs `ssm:GetParameters` and
 `kms:Decrypt` on them. The task role deliberately cannot read them. The root filesystem is
 read-only and Fargate adds no tmpfs, so an ephemeral volume is mounted at `/tmp`. A dry

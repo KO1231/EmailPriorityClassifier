@@ -112,13 +112,9 @@ def load_policy(path: Path) -> Policy:
 
 def load_policy_text(text: str, *, source: str = POLICY_ENV) -> Policy:
     """Personal guidance from YAML text rather than a file."""
-    try:
-        raw = yaml.safe_load(text) or {}
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"{source} is not valid YAML: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise ConfigError(f"{source} must be a mapping")
-    return Policy(**raw)
+    from epc.settings import parse_yaml_mapping
+
+    return Policy(**parse_yaml_mapping(text, source=source))
 
 
 class RenderedPrompt(BaseModel):

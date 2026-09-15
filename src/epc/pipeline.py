@@ -163,7 +163,6 @@ class Pipeline:
         shutdown: threading.Event | None = None,
         max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
         classifier_version: str = "",
-        dry_run: bool = False,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -181,9 +180,11 @@ class Pipeline:
         self._max_consecutive_failures = max_consecutive_failures
         # What failure records are valid for; a change retries every one.
         self._classifier_version = classifier_version
-        # A dry run reads the records, so it lists what a real run would, and
-        # writes none — it must not change what the next real run does.
-        self._dry_run = dry_run
+        # A run that writes nothing to Gmail reads the records, so it lists what
+        # a real run would, and writes none — it must not change what the next
+        # real run does. Taken from the sink rather than passed in beside it:
+        # two sources for one fact is one way to get them to disagree.
+        self._dry_run = isinstance(sink, JsonlSink)
 
         # One run's outcome, for the failure records.
         self._history_ids: dict[str, str] = {}

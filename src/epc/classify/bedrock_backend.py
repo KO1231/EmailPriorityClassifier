@@ -114,10 +114,18 @@ class BedrockClassifier:
                 # throttling, a timeout, a model that is not enabled.
                 raise _as_classification_error(self.backend, retry_exc) from retry_exc
 
+        usage = _usage_of(response)
+        try:
+            classification = _parse_converse(response)
+        except ClassificationError as exc:
+            # The answer was unusable, but it was an answer, and it was billed.
+            exc.usage = usage
+            raise
+
         return ClassificationResult(
             thread_id=payload.thread_id,
-            classification=_parse_converse(response),
-            usage=_usage_of(response),
+            classification=classification,
+            usage=usage,
             backend=self.backend,
             model=self._model,
             prompt_version=rendered.prompt_version,
@@ -143,7 +151,9 @@ def _as_classification_error(backend: str, exc: Exception) -> ClassificationErro
     and availability errors say nothing about the thread.
     """
     kind = RejectedByProviderError if "validationexception" in str(exc).lower() else ClassificationError
-    return kind(f"{backend} request failed: {exc}")
+    # botocore's ClientError carries the code separately; anything else has none.
+    code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code")
+    return kind(f"{backend} request failed: {exc}", status=code)
 
 
 def _parse_converse(response: Mapping[str, Any]) -> Classification:

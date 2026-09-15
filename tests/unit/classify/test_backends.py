@@ -302,6 +302,29 @@ def test_an_unparseable_answer_is_named_as_such(renderer: PromptRenderer, payloa
         OpenAIClassifier(model="gpt-test", renderer=renderer, client=cast(Any, client)).classify(payload)
 
 
+def test_a_refusal_carries_its_status(renderer: PromptRenderer, payload: Any) -> None:
+    client = FakeResponses(error=status_error(400))
+    with pytest.raises(RejectedByProviderError) as caught:
+        OpenAIClassifier(model="gpt-test", renderer=renderer, client=cast(Any, client)).classify(payload)
+    assert caught.value.status == 400
+
+
+def test_an_unusable_answer_carries_what_it_cost(renderer: PromptRenderer, payload: Any) -> None:
+    client = FakeResponses(content="I think this one is urgent.")
+    with pytest.raises(UnusableResponseError) as caught:
+        OpenAIClassifier(model="gpt-test", renderer=renderer, client=cast(Any, client)).classify(payload)
+    assert caught.value.usage is not None
+    assert caught.value.usage.input_tokens == 120
+
+
+def test_an_unusable_bedrock_answer_carries_what_it_cost(renderer: PromptRenderer, payload: Any) -> None:
+    client = FakeBedrock(text_response("no idea"))
+    with pytest.raises(UnusableResponseError) as caught:
+        BedrockClassifier(model="any.model", renderer=renderer, client=cast(Any, client)).classify(payload)
+    assert caught.value.usage is not None
+    assert caught.value.usage.input_tokens == 200
+
+
 def test_a_bedrock_validation_error_is_a_refusal(renderer: PromptRenderer, payload: Any) -> None:
     client = FakeBedrock(Exception("ValidationException: Input is too long for requested model."))
     with pytest.raises(RejectedByProviderError):

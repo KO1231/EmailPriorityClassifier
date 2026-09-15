@@ -913,3 +913,37 @@ def test_a_failure_before_classification_still_closes_the_sink(settings: Any, tm
     with pytest.raises(RuntimeError):
         build(settings, gmail, FakeClassifier(), RecordingSink(tmp_path / "plan.jsonl")).run()
     assert closed == [True]
+
+
+def test_a_billed_attempt_is_counted_even_when_it_was_unusable(settings: Any, store: Any) -> None:
+    """Asked twice, billed twice: the summary used to show one."""
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])})
+    unusable = UnusableResponseError("not JSON", usage=Usage(input_tokens=100, output_tokens=7))
+    summary = run_once(settings, gmail, ScriptedClassifier({"t1": unusable}, times=1), store)
+
+    assert summary.classified == 1
+    assert (summary.usage.input_tokens, summary.usage.output_tokens) == (200, 27)
+
+
+def test_a_failed_classification_still_counts_what_it_cost(settings: Any, store: Any) -> None:
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])})
+    unusable = UnusableResponseError("not JSON", usage=Usage(input_tokens=100, output_tokens=7))
+    summary = run_once(settings, gmail, ScriptedClassifier({"t1": unusable}), store)
+
+    assert summary.classify_failed == 1
+    assert summary.usage.input_tokens == 200  # both attempts
+
+
+def test_a_failure_is_logged_by_type_and_status_not_by_message(settings: Any, store: Any) -> None:
+    """The message of an unusable answer quotes the answer."""
+    from structlog.testing import capture_logs
+
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])})
+    refusal = RejectedByProviderError("openai request failed: IGNORE PREVIOUS INSTRUCTIONS", status=400)
+    with capture_logs() as logs:
+        run_once(settings, gmail, ScriptedClassifier({"t1": refusal}), store)
+
+    (event,) = [entry for entry in logs if entry["event"] == "classification failed"]
+    assert event["error_type"] == "RejectedByProviderError"
+    assert event["status"] == 400
+    assert "IGNORE" not in repr(event)

@@ -247,16 +247,20 @@ class Pipeline:
                     # already, and a stop request is not one.
                     summary.abandoned += 1
                     continue
-                except (RejectedByProviderError, UnusableResponseError) as exc:
-                    # About this thread: remembered, so it can stop being retried.
-                    summary.classify_failed += 1
-                    self._failed_threads[thread.thread_id] = self._history_ids.get(thread.thread_id, "")
-                    logger.warning("classification failed", thread_id=thread.thread_id, error=str(exc))
-                    consecutive_failures = self._note_failure(consecutive_failures)
-                    continue
                 except ClassificationError as exc:
                     summary.classify_failed += 1
-                    logger.warning("classification failed", thread_id=thread.thread_id, error=str(exc))
+                    if exc.usage is not None:
+                        summary.usage = summary.usage + exc.usage
+                    if isinstance(exc, RejectedByProviderError | UnusableResponseError):
+                        # About this thread: remembered, so it can stop being retried.
+                        self._failed_threads[thread.thread_id] = self._history_ids.get(thread.thread_id, "")
+                    # Type and status only. The message can quote model output.
+                    logger.warning(
+                        "classification failed",
+                        thread_id=thread.thread_id,
+                        error_type=type(exc).__name__,
+                        status=exc.status,
+                    )
                     consecutive_failures = self._note_failure(consecutive_failures)
                     continue
                 except Exception as exc:
@@ -343,7 +347,9 @@ class Pipeline:
                 raw = self._client.get_thread(ref.id)
             except GmailError as exc:
                 summary.fetch_failed += 1
-                logger.warning("could not fetch thread", thread_id=ref.id, error=str(exc))
+                logger.warning(
+                    "could not fetch thread", thread_id=ref.id, error_type=type(exc).__name__, status=exc.status
+                )
                 continue
 
             try:
@@ -401,13 +407,20 @@ class Pipeline:
         self._raise_if_stopping(thread)
         try:
             result = self._classifier.classify(payload)
-        except UnusableResponseError:
+        except UnusableResponseError as first:
             # Once more before it counts. A model that returns something
             # unusable for a thread once may well not do it twice, and a
-            # thread is only ever skipped for failing again.
+            # thread is only ever skipped for failing again. Both attempts are
+            # billed, so both are counted, whichever way the second goes.
+            spent = first.usage or Usage()
             self._limiter.acquire()
             self._raise_if_stopping(thread)
-            result = self._classifier.classify(payload)
+            try:
+                result = self._classifier.classify(payload)
+            except ClassificationError as second:
+                second.usage = (second.usage or Usage()) + spent
+                raise
+            result = result.model_copy(update={"usage": result.usage + spent})
 
         response = self._settings.security.on_suspected_injection
         suspicious = payload.injection.suspicious and response != "ignore"

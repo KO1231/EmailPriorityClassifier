@@ -6,6 +6,8 @@ nothing was touched) versus everything else (a single thread is lost, the run
 continues, exit code 2).
 """
 
+from typing import Any
+
 
 class EpcError(Exception):
     """Base class for every error this package raises deliberately."""
@@ -31,6 +33,13 @@ class CredentialError(EpcError):
 class GmailError(EpcError):
     """A Gmail API call failed after exhausting its retries."""
 
+    def __init__(self, message: str = "", *, status: int | None = None) -> None:
+        super().__init__(message)
+        # The HTTP status, when there was a response. This, and the exception's
+        # type, are what a log line says about a failure; the message carries
+        # request details and is not logged.
+        self.status = status
+
 
 class ClassificationError(EpcError):
     """A thread could not be classified. Costs that thread, not the run.
@@ -39,6 +48,15 @@ class ClassificationError(EpcError):
     throttling, an outage. The two subclasses below are the failures that do,
     and only they are remembered between runs.
     """
+
+    def __init__(self, message: str = "", *, status: int | str | None = None, usage: Any = None) -> None:
+        super().__init__(message)
+        # HTTP status or provider error code. Logged in place of the message,
+        # which can quote model output.
+        self.status = status
+        # Tokens the failed request still cost (`epc.classify.base.Usage`), when
+        # the provider answered at all. A refused answer is billed like any other.
+        self.usage = usage
 
 
 class RejectedByProviderError(ClassificationError):

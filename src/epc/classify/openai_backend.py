@@ -25,6 +25,7 @@ from openai.types.shared_params import Reasoning
 from epc.classify.base import ClassificationResult, Usage, parse_classification
 from epc.classify.budget import ThreadPayload
 from epc.classify.prompt import PromptRenderer, RenderedPrompt, response_json_schema
+from epc.errors import ClassificationError, RejectedByProviderError
 
 SCHEMA_NAME = "email_priority"
 DEFAULT_TIMEOUT = 60.0
@@ -84,9 +85,16 @@ class _OpenAICompatibleClassifier:
         except APIError as exc:
             raise _as_classification_error(self.backend, exc) from exc
 
+        try:
+            classification = parse_classification(text)
+        except ClassificationError as exc:
+            # The answer was unusable, but it was an answer, and it was billed.
+            exc.usage = usage
+            raise
+
         return ClassificationResult(
             thread_id=payload.thread_id,
-            classification=parse_classification(text),
+            classification=classification,
             usage=usage,
             backend=self.backend,
             model=self._model,
@@ -199,9 +207,7 @@ class LocalClassifier(_OpenAICompatibleClassifier):
 _REJECTED_STATUSES = frozenset({400, 413, 422})
 
 
-def _as_classification_error(backend: str, exc: APIError) -> Exception:
-    from epc.errors import ClassificationError, RejectedByProviderError
-
+def _as_classification_error(backend: str, exc: APIError) -> ClassificationError:
     status = getattr(exc, "status_code", None)
     kind = RejectedByProviderError if status in _REJECTED_STATUSES else ClassificationError
-    return kind(f"{backend} request failed: {exc}")
+    return kind(f"{backend} request failed: {exc}", status=status)

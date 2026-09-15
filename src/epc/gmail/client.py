@@ -62,7 +62,7 @@ class GmailClient:
         try:
             result = request.execute(num_retries=self._num_retries)
         except HttpError as exc:
-            raise GmailError(f"{operation} failed: {exc}") from exc
+            raise GmailError(f"{operation} failed: {exc}", status=exc.resp.status) from exc
         except _TRANSPORT_ERRORS as exc:
             raise GmailError(f"{operation} failed: {type(exc).__name__}: {exc}") from exc
         return result if isinstance(result, dict) else {}

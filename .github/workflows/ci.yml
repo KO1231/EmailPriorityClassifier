@@ -71,6 +71,11 @@ jobs:
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       - name: Audit dependencies for known vulnerabilities
+        # The exported lockfile is audited as it stands: every package pinned and
+        # hashed, nothing installed. Left to resolve it, pip-audit builds a
+        # throwaway environment with the runner's Python and compiles lxml from
+        # source there, which fails for reasons that have nothing to do with a
+        # vulnerability. The tool itself is pinned like everything else.
         run: |
           uv export --all-extras --no-emit-project --format requirements.txt > requirements.txt
-          uvx pip-audit --requirement requirements.txt --strict
+          uvx pip-audit@2.10.1 --disable-pip --require-hashes --requirement requirements.txt --strict

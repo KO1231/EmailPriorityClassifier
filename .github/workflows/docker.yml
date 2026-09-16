@@ -43,7 +43,7 @@ jobs:
 
       - name: No build toolchain reached the runtime image
         run: |
-          if docker run --rm --entrypoint sh epc:ci -c "command -v gcc cc make uv" 2>/dev/null; then
+          if docker run --rm --entrypoint sh epc:ci -c "command -v gcc cc make uv pip pip3" 2>/dev/null; then
             echo "a build tool survived into the runtime layer"; exit 1
           fi
 

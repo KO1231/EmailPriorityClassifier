@@ -55,6 +55,20 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:${PATH}" \
     TZ=Asia/Tokyo
 
+# Two things the pinned base does not do for us:
+#
+# * Debian's security updates. The digest fixes what the image starts from, but
+#   the official image is rebuilt on its own schedule, and fixes published in
+#   between would ship unpatched — CI's vulnerability scan fails on exactly
+#   those. Upgrading here takes them without unpinning the base.
+# * Removing pip. Nothing installs packages at runtime, and pip's vendored
+#   libraries (msgpack, setuptools' pkg_resources) carry advisories of their own
+#   into an image that never uses them.
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/* \
+ && python -m pip uninstall --yes --root-user-action=ignore pip
+
 # A fixed UID and GID so a bind-mounted log/ or .state/ has predictable
 # ownership on any host. Both are pinned: `useradd` alone picks the group's GID
 # itself, and only happens to pick 10001 today.
@@ -79,7 +93,10 @@ RUN mkdir -p /app/log /app/.state && chown -R epc:epc /app/log /app/.state
 RUN chmod 1777 /tmp
 VOLUME ["/tmp"]
 
-USER epc
+# Numeric, not the name: it is the number the kernel checks against a bind
+# mount, and the one a host or an orchestrator can resolve without this image's
+# /etc/passwd.
+USER 10001:10001
 
 # `epc` rather than a script path, so `docker run … run --dry-run` reads the
 # same as the command you would type locally.

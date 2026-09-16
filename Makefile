@@ -36,7 +36,7 @@ check: lint typecheck test ## Everything CI runs
 .PHONY: audit
 audit: ## Check locked dependencies against known vulnerabilities
 	uv export --all-extras --no-emit-project --format requirements.txt > /tmp/epc-requirements.txt
-	uvx pip-audit --requirement /tmp/epc-requirements.txt --strict
+	uvx pip-audit@2.10.1 --disable-pip --require-hashes --requirement /tmp/epc-requirements.txt --strict
 
 .PHONY: lock-refresh
 lock-refresh: ## Move the supply-chain cooldown window forward, then re-lock

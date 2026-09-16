@@ -212,7 +212,11 @@ run there writes its plan to `/tmp` and, with `dispatch.log_planned`, to CloudWa
 the file is gone when the task stops.
 
 - **Base images are pinned by digest.** A tag is mutable, and a base that changes under
-  a build is the same hole `uv.lock` closes on the dependency side.
+  a build is the same hole `uv.lock` closes on the dependency side. The runtime stage
+  still runs `apt-get upgrade`. The official image is rebuilt on its own schedule, and
+  Debian fixes published in between would otherwise ship unpatched; CI's trivy scan
+  fails on exactly those. pip is removed from the runtime image for the same reason:
+  nothing uses it there, and its vendored libraries carry advisories of their own.
 - **uv is installed from PyPI, not copied from `ghcr.io/astral-sh/uv`.** One registry,
   one credential path. uv never reaches the runtime layer anyway, and what actually
   ships is pinned by `uv.lock`'s per-package hashes.

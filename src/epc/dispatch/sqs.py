@@ -98,7 +98,7 @@ class SqsSink:
         # enqueue count as `applied` would claim work that has not happened.
         return ApplyReport(
             applied=0,
-            skipped_noop=self._sent,
+            handed_off=self._sent,
             failed=self._failed,
             api_calls=0,
             failures=self._failures,

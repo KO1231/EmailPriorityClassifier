@@ -473,7 +473,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
     skipped = len(mutations) - len(current) - len(unchecked)
     print(
-        f"  applied {report.applied}  no-op {report.skipped_noop}  "
+        f"  applied {report.applied}  already as planned {report.skipped_noop}  "
         f"failed {report.failed + len(unchecked)}  gmail calls {report.api_calls}"
     )
     if skipped:

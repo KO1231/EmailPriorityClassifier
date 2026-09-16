@@ -84,7 +84,7 @@ def test_message_ids_are_chunked_to_the_api_limit() -> None:
 
 def test_a_noop_costs_no_api_call() -> None:
     report = MutationApplier(FakeClient()).apply([mutation("a", add=[])])  # type: ignore[arg-type]
-    assert (report.applied, report.skipped_noop, report.api_calls) == (0, 1, 0)
+    assert (report.applied, report.skipped_noop, report.handed_off, report.api_calls) == (0, 1, 0, 0)
 
 
 def test_a_failed_group_does_not_stop_the_others() -> None:
@@ -219,3 +219,12 @@ def _dry_run_mutation() -> ThreadMutation:
         reason="The sender says the invoice for 3,000,000 yen is overdue",
         classified_at=datetime(2026, 9, 14, tzinfo=UTC),
     )
+
+
+def test_a_dry_run_reports_what_it_planned_as_handed_off(tmp_path: Path) -> None:
+    """Planned and not applied is not the same as nothing to do."""
+    sink = JsonlSink(tmp_path / "plan.jsonl")
+    sink.emit(_dry_run_mutation())
+    sink.emit(_dry_run_mutation())
+    report = sink.close()
+    assert (report.applied, report.skipped_noop, report.handed_off) == (0, 0, 2)

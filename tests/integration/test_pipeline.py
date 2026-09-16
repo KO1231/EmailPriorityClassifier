@@ -947,3 +947,21 @@ def test_a_failure_is_logged_by_type_and_status_not_by_message(settings: Any, st
     assert event["error_type"] == "RejectedByProviderError"
     assert event["status"] == 400
     assert "IGNORE" not in repr(event)
+
+
+def test_a_dry_run_summary_says_planned_not_no_op(settings: Any, tmp_path: Path) -> None:
+    """ "applied 0 (no-op: 20)" read as if nothing had been worth doing."""
+    gmail = FakeGmail({f"t{i}": thread(f"t{i}", labels=["INBOX"]) for i in range(3)})
+    rendered = build(settings, gmail, FakeClassifier(), JsonlSink(tmp_path / "plan.jsonl")).run().render()
+
+    assert "planned           3  (dry run" in rendered
+    assert "no-op" not in rendered
+    assert "gmail write calls" not in rendered
+
+
+def test_a_direct_run_summary_still_counts_writes(settings: Any) -> None:
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])})
+    rendered = build(settings, gmail, FakeClassifier(), DirectSink(MutationApplier(gmail))).run().render()  # type: ignore[arg-type]
+
+    assert "applied           1" in rendered
+    assert "gmail write calls 1" in rendered

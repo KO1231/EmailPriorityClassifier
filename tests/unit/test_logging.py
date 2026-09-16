@@ -88,3 +88,23 @@ def test_our_own_events_are_still_redacted(capsys: pytest.CaptureFixture[str], r
     assert line["event"] == "classification failed"
     assert line["thread_id"] == "t1"
     assert line["body"] == REDACTION
+
+
+@pytest.mark.parametrize("name", ["httpx2", "openai", "googleapiclient"])
+def test_per_request_library_logs_are_held_back(
+    capsys: pytest.CaptureFixture[str], restored_logging: None, name: str
+) -> None:
+    """One INFO line per request is 1500 lines in a scheduled run's log."""
+    configure_logging(json_output=True)
+    logging.getLogger(name).info('HTTP Request: POST https://api.example.invalid "HTTP/1.1 200 OK"')
+    logging.getLogger(name).warning("retrying after 429")
+
+    err = capsys.readouterr().err
+    assert "HTTP Request" not in err
+    assert "retrying after 429" in err
+
+
+def test_debug_lets_library_logs_through(capsys: pytest.CaptureFixture[str], restored_logging: None) -> None:
+    configure_logging(level="DEBUG", json_output=True)
+    logging.getLogger("httpx2").info("HTTP Request: POST")
+    assert "HTTP Request" in capsys.readouterr().err

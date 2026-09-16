@@ -101,6 +101,8 @@ class RunSummary:
     # the next one will retry what it should have skipped — and if it keeps
     # happening, someone should hear about it.
     state_not_saved: bool = False
+    # Where planned changes went, which decides how `apply` reads.
+    dispatched_via: Literal["direct", "sqs", "jsonl"] = "direct"
     elapsed_seconds: float = 0.0
 
     @property
@@ -133,14 +135,27 @@ class RunSummary:
             f"  suspicious        {self.suspicious}",
             *([f"  not started       {self.abandoned}  ({self._stop_reason})"] if self.abandoned else []),
             f"  tokens            in {self.usage.input_tokens:,} / out {self.usage.output_tokens:,}",
-            f"  applied           {self.apply.applied}"
-            f"  (no-op: {self.apply.skipped_noop}, failed: {self.apply.failed})",
-            f"  gmail write calls {self.apply.api_calls}",
+            *self._dispatch_lines(),
             f"  elapsed           {self.elapsed_seconds:.1f}s",
             *(["  ! run state could not be saved"] if self.state_not_saved else []),
         ]
         lines.extend(f"  ! {failure}" for failure in self.apply.failures)
         return "\n".join(lines)
+
+    def _dispatch_lines(self) -> list[str]:
+        report = self.apply
+        if self.dispatched_via == "jsonl":
+            return [f"  planned           {report.handed_off}  (dry run: written to the plan file, nothing applied)"]
+        if self.dispatched_via == "sqs":
+            return [
+                f"  queued            {report.handed_off}"
+                f"  (applied by the apply Lambda; failed to queue: {report.failed})"
+            ]
+        return [
+            f"  applied           {report.applied}"
+            f"  (already as planned: {report.skipped_noop}, failed: {report.failed})",
+            f"  gmail write calls {report.api_calls}",
+        ]
 
     @property
     def _stop_reason(self) -> str:
@@ -204,7 +219,7 @@ class Pipeline:
 
     def run(self) -> RunSummary:
         started = time.monotonic()
-        summary = RunSummary()
+        summary = RunSummary(dispatched_via=self._dispatched_via)
 
         state = RunState()
         try:

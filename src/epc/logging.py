@@ -56,6 +56,11 @@ REDACTION = "<redacted>"
 # Even a key that is meant to be loggable can carry more than a log line should.
 MAX_VALUE_CHARS = 200
 
+# Client libraries that log every request at INFO. The lines carry a URL and a
+# status, nothing of the mail, but a scheduled run of 1500 threads would write
+# 1500 of them. Held at WARNING unless DEBUG is asked for.
+QUIET_LIBRARIES = ("httpx", "httpx2", "httpcore", "openai", "googleapiclient", "urllib3", "botocore", "boto3")
+
 LOG_FILE_BYTES = 5 * 2**20
 LOG_FILE_BACKUPS = 5
 
@@ -114,6 +119,8 @@ def configure_logging(
         handler.setFormatter(formatter)
 
     logging.basicConfig(level=numeric_level, handlers=handlers, force=True)
+    for name in QUIET_LIBRARIES:
+        logging.getLogger(name).setLevel(numeric_level if numeric_level <= logging.DEBUG else logging.WARNING)
 
     structlog.configure(
         processors=[*shared, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],

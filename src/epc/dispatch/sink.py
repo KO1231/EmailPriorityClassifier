@@ -96,7 +96,7 @@ class JsonlSink:
     def close(self) -> ApplyReport:
         self._handle.close()
         # Nothing was applied, and saying so plainly is the point of a dry run.
-        return ApplyReport(skipped_noop=self._count)
+        return ApplyReport(handed_off=self._count)
 
     @property
     def path(self) -> Path:
@@ -123,6 +123,7 @@ def _merge(first: ApplyReport, second: ApplyReport) -> ApplyReport:
     return ApplyReport(
         applied=first.applied + second.applied,
         skipped_noop=first.skipped_noop + second.skipped_noop,
+        handed_off=first.handed_off + second.handed_off,
         failed=first.failed + second.failed,
         api_calls=first.api_calls + second.api_calls,
         failures=[*first.failures, *second.failures],

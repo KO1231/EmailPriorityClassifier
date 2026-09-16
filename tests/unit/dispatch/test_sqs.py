@@ -65,6 +65,16 @@ def test_messages_are_batched() -> None:
     assert len(client.sent[0]["entries"]) == 10
 
 
+def test_queued_changes_are_reported_as_handed_off() -> None:
+    """Queued is neither applied nor a no-op; the Lambda applies them later."""
+    client = FakeSqs()
+    s = sink(client)
+    for i in range(3):
+        s.emit(mutation(f"t{i}"))
+    report = s.close()
+    assert (report.applied, report.skipped_noop, report.handed_off) == (0, 0, 3)
+
+
 def test_a_partial_batch_is_flushed_on_close() -> None:
     client = FakeSqs()
     s = sink(client)

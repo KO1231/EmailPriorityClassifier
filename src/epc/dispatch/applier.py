@@ -14,6 +14,10 @@ class ApplyReport(BaseModel):
 
     applied: int = 0
     skipped_noop: int = 0
+    # Passed on without being applied here: written to a dry run's plan file,
+    # or put on the queue for the apply Lambda. Counted apart from `skipped_noop`
+    # so a dry run of twenty threads does not read as twenty no-ops.
+    handed_off: int = 0
     failed: int = 0
     api_calls: int = 0
     failures: list[str] = Field(default_factory=list)

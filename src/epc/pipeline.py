@@ -21,6 +21,7 @@ import traceback
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from email.errors import MessageError
 from typing import Literal
 
@@ -103,6 +104,8 @@ class RunSummary:
     state_not_saved: bool = False
     # Where planned changes went, which decides how `apply` reads.
     dispatched_via: Literal["direct", "sqs", "jsonl"] = "direct"
+    # Local time, so a log with one run a minute can be read against a clock.
+    started_at: datetime = field(default_factory=lambda: datetime.now().astimezone())
     elapsed_seconds: float = 0.0
 
     @property
@@ -115,12 +118,26 @@ class RunSummary:
             or self.state_not_saved
         )
 
+    @property
+    def nothing_to_do(self) -> bool:
+        """No thread needed anything, and nothing went wrong.
+
+        The common case for a run scheduled every minute. It is reported in one
+        line, because a full summary each time would bury the runs that did
+        something.
+        """
+        return self.listed == 0 and not self.had_failures and not self.interrupted and not self.halted
+
+    def render_idle(self) -> str:
+        skipped = f", {self.skipped_known_failures} known failure(s) skipped" if self.skipped_known_failures else ""
+        return f"{self.started_at:%Y-%m-%d %H:%M:%S%z} nothing to do ({self.elapsed_seconds:.1f}s{skipped})"
+
     def render(self) -> str:
         shown = ", ".join(self.skipped_thread_ids[:_SKIPPED_IDS_SHOWN])
         if len(self.skipped_thread_ids) > _SKIPPED_IDS_SHOWN:
             shown += f" +{len(self.skipped_thread_ids) - _SKIPPED_IDS_SHOWN}"
         lines = [
-            "=== Summary ===",
+            f"=== Summary {self.started_at:%Y-%m-%d %H:%M:%S%z} ===",
             f"  listed            {self.listed}",
             f"  already labelled  {self.already_labelled}"
             f"  (skipped, no LLM call; label carried to new replies: {self.labels_carried_forward})",

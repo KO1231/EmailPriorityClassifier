@@ -965,3 +965,28 @@ def test_a_direct_run_summary_still_counts_writes(settings: Any) -> None:
 
     assert "applied           1" in rendered
     assert "gmail write calls 1" in rendered
+
+
+def test_an_empty_inbox_is_nothing_to_do(settings: Any, store: Any) -> None:
+    summary = run_once(settings, FakeGmail({}), FakeClassifier(), store)
+    assert summary.nothing_to_do
+    assert "nothing to do" in summary.render_idle()
+    assert "\n" not in summary.render_idle()
+
+
+def test_skipped_known_failures_are_mentioned_on_the_one_line(settings: Any, store: Any) -> None:
+    gmail = FakeGmail(
+        {"bad": thread("bad", labels=["INBOX"]), "ok": thread("ok", labels=["INBOX"])}, exclude_labelled=True
+    )
+    classifier = ScriptedClassifier({"bad": refused()})
+    run_once(settings, gmail, classifier, store)
+    run_once(settings, gmail, classifier, store)
+
+    summary = run_once(settings, gmail, classifier, store)
+    assert summary.nothing_to_do
+    assert "1 known failure(s) skipped" in summary.render_idle()
+
+
+def test_a_run_with_work_is_not_nothing_to_do(settings: Any, store: Any) -> None:
+    gmail = FakeGmail({"t1": thread("t1", labels=["INBOX"])})
+    assert not run_once(settings, gmail, FakeClassifier(), store).nothing_to_do

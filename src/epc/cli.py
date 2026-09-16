@@ -345,10 +345,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     sink_kind = settings.resolve_sink(force_dry_run=args.dry_run)
     writes_nothing = sink_kind == "jsonl"
     sink = build_sink(settings, gmail_client=client, force_dry_run=args.dry_run)
-    if writes_nothing:
-        print(f"Dry run - planned changes go to {settings.dispatch.jsonl_path}, nothing is applied.")
-    elif sink_kind == "sqs":
-        print(f"Dispatching to {settings.dispatch.queue_url}; another process applies them.")
 
     state = build_state_store(settings)
     history: HistorySink = (
@@ -369,9 +365,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             shutdown=stopping,
             classifier_version=_classifier_version(settings, renderer),
         )
-        print(f"Query: {pipeline.search_query()}")
         summary = pipeline.run()
 
+    # Printed after the run rather than before, so that a run with nothing to
+    # do — most of them, on a one-minute schedule — leaves a single line.
+    if summary.nothing_to_do:
+        print(summary.render_idle())
+        return EXIT_OK
+
+    print(f"Query: {pipeline.search_query()}")
+    if writes_nothing:
+        print(f"Dry run - planned changes go to {settings.dispatch.jsonl_path}, nothing is applied.")
+    elif sink_kind == "sqs":
+        print(f"Dispatching to {settings.dispatch.queue_url}; another process applies them.")
     print()
     print(summary.render())
     if summary.interrupted:

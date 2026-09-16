@@ -452,3 +452,57 @@ def test_no_policy_at_all_is_still_fine(
     monkeypatch.setenv("EPC_CONFIG_YAML", VALID_CONFIG)
     assert main(["prompt", "render", "--prompts", str(REPO / "prompts")]) == EXIT_OK
     assert "# policy: none" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# epc run output
+# --------------------------------------------------------------------------
+
+
+def run_with_summary(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], summary: object
+) -> tuple[int, list[str]]:
+    """`epc run` with Gmail, the model and the pipeline itself replaced."""
+    monkeypatch.setenv("EPC_CONFIG_YAML", VALID_CONFIG)
+    use_fake_client(monkeypatch, FakeGmailClient(PRIORITY_LABELS))
+    monkeypatch.setattr("epc.classify.factory.build_classifier", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("epc.pipeline.Pipeline.run", lambda _self: summary)
+    code = main(["run", "--dry-run", "--prompts", str(REPO / "prompts")])
+    return code, capsys.readouterr().out.strip().splitlines()
+
+
+def test_a_run_with_nothing_to_do_prints_one_line(
+    no_config_here: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On a one-minute schedule, a full summary every time buries the runs that
+    did something: about 17,000 lines a day."""
+    from epc.pipeline import RunSummary
+
+    code, lines = run_with_summary(monkeypatch, capsys, RunSummary(elapsed_seconds=2.5))
+    assert code == EXIT_OK
+    assert len(lines) == 1
+    assert "nothing to do (2.5s)" in lines[0]
+
+
+def test_a_run_that_did_something_prints_the_full_summary(
+    no_config_here: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from epc.pipeline import RunSummary
+
+    code, lines = run_with_summary(monkeypatch, capsys, RunSummary(listed=1, classified=1, dispatched_via="jsonl"))
+    assert code == EXIT_OK
+    assert lines[0].startswith("Query: ")
+    assert any(line.startswith("=== Summary 20") for line in lines)
+    assert any("Replay with" in line for line in lines)
+
+
+def test_an_empty_run_that_failed_is_not_quiet(
+    no_config_here: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Nothing listed, but the state could not be saved: that has to be seen."""
+    from epc.pipeline import RunSummary
+
+    code, lines = run_with_summary(monkeypatch, capsys, RunSummary(state_not_saved=True))
+    assert code == EXIT_PARTIAL
+    assert len(lines) > 1
+    assert any("run state could not be saved" in line for line in lines)

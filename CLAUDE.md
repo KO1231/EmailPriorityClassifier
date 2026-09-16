@@ -1,0 +1,318 @@
+# CLAUDE.md
+
+Implementation notes. Product description and setup live in `README.md`; this file
+covers what an implementer needs — the invariants, the reasons behind the odd-looking
+choices, and the traps.
+
+`epc` is short for *EmailPriorityClassifier*. It is the Python package (`src/epc/`),
+the CLI command, and the environment-variable prefix (`EPC__GMAIL__MAX_THREADS`). The
+distribution keeps the full name because that is what appears in a lockfile.
+
+---
+
+## Commands
+
+```bash
+make install        # uv sync --all-extras + install the git hooks
+make check          # ruff + ruff format --check + mypy --strict + pytest
+make test           # pytest, excluding the opt-in eval suite
+make audit          # pip-audit over the locked dependency set
+
+uv run epc config validate      # parse and print the config; no network
+uv run epc labels               # resolve the configured labels against the mailbox
+uv run epc login                # OAuth, once
+uv run epc prompt render        # the exact prompt a thread produces
+uv run epc run --dry-run        # plan everything, write nothing
+uv run epc apply log/mutations.jsonl
+uv run epc failures list        # threads skipped for failing repeatedly
+```
+
+`.env` is not read by the application — there is no `python-dotenv`. Use
+`uv run --env-file .env …`, or export the variables. Anything that adds a new
+entrypoint (Docker, cron, systemd) has to load it explicitly.
+
+Python 3.14, pinned in `.python-version` and `requires-python`.
+
+---
+
+## The two rules everything rests on
+
+**A. The model chooses a priority, never an action.** Its whole output surface is
+`{priority: "P1"|"P2"|"P3", reason, confidence, signals}` under a strict JSON schema —
+see `classify/prompt.py::response_json_schema`. There is no field for naming a label,
+requesting an action, or calling a tool. Actions are derived by `actions/planner.py`
+from configuration. **A completely successful prompt injection can therefore do exactly
+one thing: mislabel one thread.** Any feature that lets the model pick an action
+invalidates the entire security story, not just part of it.
+
+**B. Only newly classified threads are planned.** A thread that already carries a
+priority label is counted and skipped (`pipeline.py::_hydrate`); at most, its label is
+carried to replies that arrived later. It may have been set by
+hand, and now that actions can *remove* labels, re-planning would undo that correction
+on every run — silently, forever.
+
+Both are covered by tests. Breaking either should fail the suite, not a mailbox.
+
+---
+
+## Flow
+
+```
+epc run
+ ├ resolve labels          gmail/labels.py    names → IDs, at startup, fails loud
+ ├ list threads            gmail/query.py     quoted label exclusions, every run
+ │   less known failures   state.py           threads that keep failing on their own
+ ├ fetch + parse           gmail/mime.py      ★ recursive MIME walk, charsets, headers
+ ├ budget + sanitise       classify/budget.py ★ the only route to a prompt
+ ├ classify                classify/*         openai | bedrock | local
+ ├ plan                    actions/planner.py priority + rules → ThreadMutation
+ └ dispatch                dispatch/sink.py   DirectSink applies, JsonlSink is dry-run
+```
+
+### Things that look odd and are not
+
+**`classify/budget.py::build_payload` is the sanitisation gate.** It is the only
+supported route from a parsed thread to a prompt, and it sanitises on the way through.
+Anything reading `EmailMessage.body` directly has skipped that; `tests/injection/`
+exists to catch it.
+
+**Nothing is cut from a body on the strength of its shape alone.** A false cut
+loses the only copy the model will see; a missed cut costs tokens. So:
+
+- `strip_quoted_reply` finds where quoted history seems to start, then cuts only if
+  enough of it (`_SHARED_ENOUGH`, compared in whitespace-free fragments) is found in an
+  earlier message of the same thread. A first message is never stripped. A message
+  someone was CC'd into halfway keeps its history, and so does a reply whose earlier
+  messages were deleted. Quoted lines interleaved with answers are kept, and a forward
+  is never stripped.
+- Signatures are not stripped. Their only marker, a bare `--`, is also a section rule.
+  In a real inbox it appeared in a fifth of messages.
+- The per-message cap applies *after* stripping, and gives up `>` lines before
+  anything else. Otherwise a reply written below a long quote is cut off.
+- `extract_body` follows MIME structure. It picks one child of `multipart/alternative`
+  and joins every child of any other multipart. A plain-text alternative under a
+  third of the HTML's visible length is treated as a stub, and the HTML is used.
+
+These were settled by measuring a real inbox (330 messages), not by reasoning alone.
+Change them the same way: before and after, lengths only — no message got shorter.
+
+**Hidden-text removal lives in `gmail/mime.py`, not `security/`.** Text hidden with
+`display:none` is a question of what is *visible*, and deciding it needs the markup —
+which is gone by the time sanitisation runs. `html_to_text` parses; it does not render,
+resolve the CSS cascade, or compute layout. Two kinds of hiding therefore get through
+(class selectors in a `<style>` block, and colour matching an inherited background);
+both are named cases in `tests/injection/corpus.py` and are held shut by detection
+rather than removal. On a real inbox, what the rules remove is preheader text: the
+inbox-preview summary, styled `display:none; max-height:0; opacity:0`. None of the
+removed text was visible body text. It is a summary of the body, lost on purpose,
+because it is also the commonest place to hide an instruction.
+
+**The injection signal is never shown to the model.** Telling it "this thread looks
+hostile" would make that judgement itself worth attacking. It travels beside the
+payload and is acted on by the planner.
+
+**`actions/` and `dispatch/` must not import `classify/` or `gmail/mime`.** That is
+what keeps the apply side's dependencies to `google-api-python-client` plus `boto3`.
+`tests/unit/test_layering.py` asserts it against the import graph — a convention nobody
+can verify is one that erodes.
+
+**Threads, not processes.** The work is HTTP wait end to end. Processes forced the
+classifier to be picklable (hence module-global API clients), paid spawn cost per run,
+and had every child open the same rotating log. `ratelimit.py` is a next-slot clock, so
+one slow response delays only itself.
+
+**OpenAI goes through the Responses API; local goes through chat completions.** A key
+scoped to `api.responses.write` reaches Responses without `model.request`, which is
+"call any model on any endpoint". Local servers implement chat completions and mostly
+not Responses, so that end cannot follow. `store=False` on every OpenAI request.
+
+**Bedrock uses boto3 Converse, not a vendor client.** Converse is provider-agnostic —
+the same request reaches Claude, Nova, Llama, Mistral. Structured output is *requested*
+through a tool definition and never depended on: forcing a tool is unsupported on some
+models, so a rejection latches and degrades to `toolChoice: auto`, then to reading text.
+`parse_classification` is the backstop, which keeps the enum — not the transport — as
+the boundary.
+
+**Logging redaction is a backstop, not the policy.** Call sites pass IDs, counts and
+enums. `logging.py::redact` replaces content-bearing keys anyway, so a future mistake
+leaks a truncated line instead of a mailbox.
+
+**The history file records a subject digest and a sender domain, never the mail.** It
+outlives the run, gets copied to S3, and ends up in backups. Default is off. The model's
+`reason` is omitted too unless `history_include_reason`: the model writes it about the
+mail, so it carries the mail's content. `dispatched_via` says where a change was handed,
+not that it landed. `batchModify` reports nothing per thread, so a record cannot know.
+
+**`dry_run` is top level, not inside a section.** It overrides `dispatch`, so it is not
+one of dispatch's peers. `Settings.resolve_sink()` holds that precedence in one place:
+every command that plans gets it, and a sink added later cannot accidentally become one
+that writes during a dry run. It governs planning, not replaying. `epc apply` ignores it
+on purpose: applying a reviewed plan is what a dry run is for, and honouring the flag there
+would make that impossible without editing the config. The apply Lambda cannot see a dry
+run's plan, because a dry run never enqueues. `epc apply` does re-read each thread's
+labels first, since a plan can wait hours and a person may have labelled a thread in the
+meantime. The Lambda skips that read: its window is seconds, and the read costs quota.
+
+**A stop request means "stop starting work", not "stop".** ECS sends `SIGTERM` and
+`SIGKILL` thirty seconds later. `shutdown.py` sets a flag; the pipeline stops beginning
+new classifications, lets running ones finish, flushes the sink, and reports
+`interrupted`. Classifications already paid for must not die with the process.
+Abandoned threads are counted separately from failures — nothing went wrong — and still
+have no label, so they come round again.
+
+**There is no checkpoint, deliberately.** Every run searches the configured query, which
+excludes labelled threads, so it returns exactly what still needs a label and costs a page
+or two. A History API checkpoint was tried and removed. It could not honour `gmail.query`.
+It moved past threads a capped run cut off, and a dry run advanced it too. Worst, it broke
+the way the user re-classifies mail after changing their criteria: removing a label from
+old threads in Gmail. That has to keep working, which rules out time windows
+(`newer_than:`) as well.
+
+**A labelled thread's label is carried to replies that arrive later.** Labels sit on
+messages, a new reply does not inherit them, and Gmail search matches messages — so
+without this such a thread is listed, fetched and skipped on every run, and with no time
+limit they only accumulate (two appeared in a real mailbox in one day).
+`planner.py::plan_carry_forward` adds the thread's existing priority label to the
+messages lacking it, through the sink like any mutation (`origin: carried_forward`). It
+does not break rule B: nothing is classified or planned, and a label a person set is only
+extended, never replaced. With two priority labels on the thread it does nothing. A
+removed label is still a request to re-classify, because removing a label in Gmail's
+conversation view removes it from every message.
+
+**Failures are remembered only when the thread caused them.** `state.py` records parse
+failures, `RejectedByProviderError` (HTTP 400/413/422, Bedrock `ValidationException`) and
+`UnusableResponseError` (asked twice within the run). Throttling, outages, credentials and
+bugs are never recorded, so no incident can make mail be skipped. A thread is skipped
+after two failed runs, *and only if something else classified successfully since it
+first failed* — a misconfiguration that refuses every request looks thread-specific one
+thread at a time. A record is dropped when the thread's `historyId` moves, when backend,
+model or the prompt fingerprint changes, or after 30 days. Labels are not used for this:
+the user does not want the tool writing bookkeeping into their mailbox.
+
+---
+
+## Container
+
+One image for every deployment; only environment variables and mounts differ.
+`make docker-build`, then `make docker-run` (compose, with the local config mounted).
+
+Baked in: the package and the generic prompts. Mounted: `config.yml`, `policy.yml`,
+`secrets/`, `log/`, `.state/`.
+
+On ECS nothing is mounted. `config.yml` and `policy.yml` live in SecureString parameters
+and arrive as `EPC_CONFIG_YAML` / `EPC_POLICY_YAML` through the task's `secrets` block,
+beside `OPENAI_API_KEY`. The order is the usual one: a `--config` or `--policy` given on the
+command line, then the variable, then the default file. A variable picked up from
+`--env-file` therefore cannot replace a file someone named, and a stray `config.yml` cannot
+replace what the deployment delivered. `EPC__…` variables still override single keys on top. Those `secrets` are resolved by the
+**execution** role before the program starts, so that role needs `ssm:GetParameters` and
+`kms:Decrypt` on them. The task role deliberately cannot read them. The root filesystem is
+read-only and Fargate adds no tmpfs, so an ephemeral volume is mounted at `/tmp`. A dry
+run there writes its plan to `/tmp` and, with `dispatch.log_planned`, to CloudWatch, since
+the file is gone when the task stops.
+
+- **Base images are pinned by digest.** A tag is mutable, and a base that changes under
+  a build is the same hole `uv.lock` closes on the dependency side. The runtime stage
+  still runs `apt-get upgrade`. The official image is rebuilt on its own schedule, and
+  Debian fixes published in between would otherwise ship unpatched; CI's trivy scan
+  fails on exactly those. pip is removed from the runtime image for the same reason:
+  nothing uses it there, and its vendored libraries carry advisories of their own.
+- **uv is installed from PyPI, not copied from `ghcr.io/astral-sh/uv`.** One registry,
+  one credential path. uv never reaches the runtime layer anyway, and what actually
+  ships is pinned by `uv.lock`'s per-package hashes.
+- **`uv sync --no-editable`.** The default editable install points the runtime layer at
+  a `/build/src` that only exists in the builder — the image builds and then fails to
+  import.
+- **`secrets/` is mounted read-only.** A consequence of storing only the durable
+  credential fields: a token refresh needs no write, and `epc login` runs on the host.
+  Storing the access token would change that.
+- The root filesystem is read-only, `/tmp` is tmpfs, and the process runs as UID 10001
+  so a bind-mounted `log/` has predictable ownership.
+
+`.github/workflows/docker.yml` checks these rather than assuming them: non-root, no
+build toolchain in the runtime layer, and — because `.dockerignore` is the last thing
+between a secret and a pushed layer — that no personal file was copied in.
+
+## Conventions
+
+**Language.** `README.md` is Japanese — it is the public face of a personal tool, and its
+audience reads Japanese. This file stays English, as do log messages, exception messages,
+prompts, and the comments and docstrings that sit next to code an English-speaking model
+or contributor will read. Code comments are Japanese where the surrounding code is.
+
+**Commits.** `type: summary` — `add:`, `fix:`, `update:`, `refactor:`, `remove:`,
+`change:`. Summaries are usually Japanese. No attribution or co-author trailers.
+
+**Branches.** `main` is released state, `develop` integrates, features branch from
+`develop`. Two GitHub Actions workflows auto-close PRs that violate this. Never commit
+to `main` (a pre-commit hook enforces it).
+
+**The remote is public.** `.gitignore` denies by default where it matters: `prompts/*`
+is excluded and the two generic templates are allow-listed by name, so a new file there
+stays out until someone lists it. `config.yml`, `.env`, `policy.yml`, `secrets/**`,
+`log/**` and `.state/` are excluded. gitleaks runs in pre-commit and CI. Test fixtures
+are **generated**, never captured — `tests/fixtures/gmail.py` builds Gmail JSON from
+synthetic MIME, which is also why hostile shapes are cheap to author.
+
+**Every dependency admits exactly one breaking line.** Floored at what `uv.lock` pins,
+capped below the next major — or the next *minor* for 0.x, where `<1` is as loose as no
+ceiling. This is an application with a lockfile: there is no downstream consumer who
+needs a wide range, so the range says what is tested. A range spanning two majors claims
+compatibility nobody checked, and turns a resolver failure into a run-time one.
+`[tool.uv] add-bounds = "major"` makes `uv add` write ranges this way;
+`tests/unit/test_dependency_bounds.py` enforces it anyway, because that option is marked
+preview and a hand-edited requirement never goes through `uv add`. Crossing a major is
+therefore always a deliberate edit to `pyproject.toml`, which is exactly the review point.
+
+**Personal rules go in `policy.yml`, not in `prompts/`.** The committed prompts have to
+stay publishable. A guard test asserts they contain no personal context.
+
+---
+
+## AWS
+
+Terraform laid out like `KO1231/Delibird-priv`: `environments/<env>/` wires
+`modules/aws_*` together. `dev/` and `prod/` stay git-ignored; only `sample/` is committed.
+
+- **Secrets never pass through Terraform state.** Parameters are created holding a
+  placeholder with `lifecycle { ignore_changes = [value] }` and filled out of band
+  (`terraform output next_steps`). A value passed through a variable ends up in plaintext
+  in the state file and in every plan.
+- **SQS dispatch** is FIFO with `MessageGroupId = thread_id`. The per-thread ordering is
+  what matters. The five-minute dedup window is a cost optimisation, not a correctness
+  mechanism: re-applying a label is a no-op. The apply Lambda reports partial batch
+  failures, and anything that keeps failing lands in the DLQ.
+- **Backends.** Credentials: `local`, `ssm`, `secrets_manager`. State: `local`, `ssm`,
+  `s3`. `service_account` is accepted by the schema and refused at startup; it needs a
+  Workspace domain to delegate from.
+
+## Not done yet
+
+- **Quoted label names in search are unverified.** A probe returned no hits for
+  `label:"name"` and hits for the bare `label:name`. `query.py::quote_label` quotes names
+  with spaces or non-ASCII characters. If Gmail does not accept the quotes, `-label:"…"`
+  excludes nothing, and every run re-lists the whole inbox. The configured labels need
+  no quotes, so nothing is affected today. Confirming it needs a throwaway label with a
+  space in its name.
+- **Eval harness.** A golden set and `epc eval`, so prompt changes are measured rather
+  than guessed at. `report.py` already writes what it needs. Deferred by choice — worth
+  building when the priority criteria are still being tuned, not before.
+
+  Three design decisions are already settled, and they came out of noticing that a
+  golden set is not simply built once and reused:
+
+  - **The set is the specification; the prompt is the implementation.** A prompt change
+    has two causes. Either the criteria are unchanged and the prompt expressed them
+    badly — the set is right, the prompt was wrong, and eval measures the fix. Or the
+    criteria themselves changed, in which case editing the set *is* how the new
+    criterion gets stated, and the prompt follows. Framing the edit as overhead gets
+    the order backwards.
+  - **A criteria change touches the affected entries, not the set.** "OTPs are P3 now"
+    moves three rows; how CloudWatch alarms or newsletters are rated has not changed.
+  - **A stale set actively misleads** — it asserts criteria you no longer hold and
+    reports a good change as a regression. So each entry carries a one-line reason for
+    the verdict plus the date and prompt version it was made under, and `epc eval`
+    reports *which cases changed* rather than only a score. Distinguishing an intended
+    flip from collateral damage is the main thing the set is for.
+- **Notification.** Deferred deliberately; revisit once the run summary is something
+  worth sending.

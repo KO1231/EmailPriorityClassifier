@@ -1,15 +1,139 @@
-labelID:
-  P1: "Label_????"
-  P2: "Label_????"
-  P3: "Label_????"
+# EmailPriorityClassifier configuration.
+#
+# Policy only — no secrets. API keys and OAuth tokens come from the environment
+# or a credential backend, so this file can be read, diffed and reviewed freely.
+#
+# Any value here can be overridden by an EPC__-prefixed environment variable,
+# with __ between levels: EPC__GMAIL__MAX_THREADS=50 overrides gmail.max_threads.
+# Precedence, highest first: command line > environment > this file > defaults.
+#
+# Unknown keys are an error rather than being ignored, so a typo fails loudly.
 
-priorityLabels:
-  P1: "????"
-  P2: "????"
-  P3: "????"
+# The three Gmail labels this tool writes. Display names only: the internal
+# Label_... IDs are resolved from the mailbox at startup, so there is nothing to
+# keep in sync by hand. `epc labels` shows what they resolve to.
+labels:
+  p1: "#/P1"
+  p2: "#/P2"
+  p3: "#/P3"
+  # Labels that do not exist yet are an error at startup, never created mid-run:
+  # a dry run writes nothing, and that includes labels. `epc labels --create`
+  # creates them once.
 
-maxThreads: 1500
-concurrency: 15
-requestsPerMin: 120
+gmail:
+  query: "in:inbox"
+  # Appended to `query`. Every run already leaves out threads that carry a
+  # priority label, so the search returns only what still needs one.
+  #
+  # Think twice before adding a time limit such as `newer_than:14d`. It saves
+  # little, and it means that removing a label from anything older — the way
+  # to have old mail re-classified after changing your criteria — does nothing.
+  extra_query: ""
+  # Threads classified per run, newest first. Whatever does not fit is still
+  # unlabelled, so the next run takes it up.
+  max_threads: 1500
 
-model: "openai"
+credentials:
+  backend: local # local | ssm | secrets_manager | service_account
+  token_file: secrets/token.json
+  client_secrets_file: secrets/client_secrets.json
+  # Required for the ssm and secrets_manager backends: the parameter path or
+  # secret name holding the durable half of the credentials.
+  # parameter_name: /epc/prod/gmail-credentials
+
+llm:
+  backend: openai # openai | bedrock | local
+  model: gpt-5.4-mini
+
+  # OpenAI-compatible backends only. Classification is a short, well-specified
+  # judgement, so the low end is usually right — and on a reasoning model the
+  # thinking is billed as output tokens.
+  reasoning_effort: low # none | minimal | low | medium | high | xhigh | max
+  verbosity: low # low | medium | high
+  # Reasoning tokens count against this too, so it is not simply "how long is
+  # the answer".
+  max_output_tokens: 2048
+
+  # backend: local — an OpenAI-compatible server (LM Studio, llama.cpp, vLLM).
+  # Nothing leaves the machine. Not hardcoded to localhost, so the same image
+  # can reach a server outside its own container.
+  # base_url: http://host.docker.internal:1234/v1
+
+  # backend: bedrock — Converse is provider-agnostic, so `model` can name any
+  # Bedrock model, not only Anthropic's. Region falls back to the usual AWS
+  # resolution when unset.
+  # region: ap-northeast-1
+
+  concurrency: 15
+  requests_per_min: 120
+  budget:
+    thread_tokens: 4000
+    message_chars: 2000
+
+# What happens to a thread once its priority is known. These rules live here
+# rather than in the prompt because this is the half of the decision that must
+# not be negotiable: a mail that talks its way to P1 still cannot talk its way
+# into being starred. The first matching rule wins.
+actions:
+  rules:
+    - when: { priority: P1 }
+      unless: { any_label: [SPAM, TRASH] } # a P1 verdict on filtered mail stays quiet
+      do: [add_star, move_to_primary, mark_important]
+    - when: { priority: P2 }
+      do: [move_to_primary]
+  # Which tabs move_to_primary will leave. Gmail treats the absence of a
+  # category label as Primary, so moving a thread means removing one.
+  move_targets: [CATEGORY_PROMOTIONS, CATEGORY_SOCIAL, CATEGORY_UPDATES, CATEGORY_FORUMS]
+  # Verbs that take a thread out of the inbox (archive). Off unless asked for.
+  allow_destructive: false
+
+dispatch:
+  sink: direct # direct | jsonl
+  jsonl_path: log/mutations.jsonl
+  # Also log each planned change (IDs, priority, labels; never content). For
+  # containers, where the plan file does not outlive the run.
+  log_planned: false
+  # Threads buffered before a write. batchModify takes 1000 message IDs per
+  # call, which is what turns 1500 round trips into two.
+  batch_size: 1000
+
+security:
+  # What to do with a thread whose content trips the injection heuristics.
+  # ignore: nothing. flag: record the signal (and let rules match on it) but
+  # take no action away. downgrade_and_flag: record it and withhold the
+  # high-privilege actions (starring, marking important, moving to Primary).
+  on_suspected_injection: downgrade_and_flag # ignore | flag | downgrade_and_flag
+
+observability:
+  log_level: INFO
+  # JSON when something is going to parse the output; readable text otherwise.
+  log_json: false
+  # log_file: log/epc.log
+
+  # Where to record what was decided — thread ID, a digest of the subject, the
+  # sender's domain, the priority and why. Never the mail itself. Unset means
+  # no record is kept; set it to be able to answer "why was this P1?" weeks
+  # later, and to measure whether a prompt change helped.
+  # history_dir: log/history
+  # Also keep the model's one-line reason. Off by default: the model writes it
+  # about the mail, so it tends to repeat what the mail said.
+  history_include_reason: false
+
+# Where run state is kept: the threads that keep failing for reasons of their
+# own (content a provider refuses, say), so they stop being retried every run.
+# A thread is only skipped after failing twice with other mail classifying
+# fine in between, and comes back when it changes, when the model or prompt
+# changes, or after 30 days. `epc failures list` shows them. Holds thread IDs,
+# never content, and no secret.
+state:
+  backend: local # local | ssm | s3
+  file: .state/run.json
+
+# Top level, and not inside a section, because it overrides one: whatever
+# `dispatch` is set to, this says nothing is written to Gmail.
+dry_run: false
+
+# `actions` and `dispatch` arrive with the action planner and the mutation
+# sinks. They are deliberately absent rather than stubbed: a config schema is
+# the expensive thing to change afterwards, so it is written once its consumer
+# exists.

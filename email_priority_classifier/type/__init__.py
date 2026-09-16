@@ -1,2 +1,0 @@
-from email_priority_classifier.type.classified_email_data import ClassifiedEmailData
-from email_priority_classifier.type.priority import EmailPriority

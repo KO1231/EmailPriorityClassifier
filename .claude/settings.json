@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(/environments/*/config.yml)",
+      "Read(/.env)",
+      "Read(/**/*.env)"
+    ],
+    "ask": [
+      "Read(/.env.*)",
+      "Read(/**/.env.*)"
+    ]
+  }
+}

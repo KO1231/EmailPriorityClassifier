@@ -1,0 +1,37 @@
+# Local runs. `docker compose run --rm epc run --dry-run`
+#
+# The same image is what Fargate runs; only the mounts and environment differ.
+
+services:
+  epc:
+    build:
+      # No platform is pinned: this has to build on whatever runs it — an Apple
+      # silicon laptop, an x86 VPS. The Fargate image is built for ARM by the
+      # explicit `--platform` in the Terraform output, not from here.
+      context: .
+    image: epc:local
+    env_file: .env
+    environment:
+      TZ: Asia/Tokyo
+      # A container's own localhost is itself, so a local model server on the
+      # host needs naming explicitly. Only used by `llm.backend: local`.
+      # EPC__LLM__BASE_URL: http://host.docker.internal:1234/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Nothing writes to the image itself.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - ./policy.yml:/app/policy.yml:ro
+      # Read-only because the container never writes credentials: `epc login`
+      # runs on the host, and only the durable fields are stored, so a token
+      # refresh needs no write. Storing the access token would change that.
+      - ./secrets:/app/secrets:ro
+      - ./log:/app/log
+      - ./.state:/app/.state

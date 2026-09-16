@@ -55,8 +55,11 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:${PATH}" \
     TZ=Asia/Tokyo
 
-# A fixed UID so a bind-mounted log/ or .state/ has predictable ownership.
-RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin epc
+# A fixed UID and GID so a bind-mounted log/ or .state/ has predictable
+# ownership on any host. Both are pinned: `useradd` alone picks the group's GID
+# itself, and only happens to pick 10001 today.
+RUN groupadd --gid 10001 epc \
+ && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin epc
 
 WORKDIR /app
 

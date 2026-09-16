@@ -1,380 +1,383 @@
 # EmailPriorityClassifier
 
-EmailPriorityClassifier intelligently evaluates incoming emails and threads to determine how urgently they require user attention.
+受信トレイのメールを LLM で読み、**どれくらい急いで対応すべきか**を判定して Gmail のラベル（P1〜P3）を付けるツールです。
 
-By analyzing subjects, message bodies, Gmail's native classifications, and user-assigned labels, it assigns each thread a clear Priority label (P1–P3) directly in Gmail.
-The ability to freely configure system prompts allows for flexible labeling and priority logic (e.g., always assigning emails from specific topics or senders to P1).
+件名・本文・送信者・Gmail のカテゴリ・自分で付けたラベルを見て判断します。判断の基準はプロンプトに書いてあり、自由に書き換えられます（「大学からのメールは常に P1」など）。
 
-This application supports both OpenAI models and OpenAI-compatible local LLMs such as those running through LM Studio, allowing users to choose between high-efficiency cloud models and fully private, on-device inference.
-This flexibility enables streamlined inbox triage while meeting diverse performance and privacy requirements.
+OpenAI・Amazon Bedrock・ローカルの OpenAI 互換サーバ（LM Studio 等）を切り替えられます。クラウドの高性能モデルを使うことも、**メールを一切外に出さずに**手元のモデルだけで完結させることもできます。
 
 <img width="756" height="411" alt="email_priority_classifier" src="https://github.com/user-attachments/assets/ed5db17a-f8bb-45d2-94da-9ceae2ae6298" />
 
 ---
 
-## Table of Contents
+## 目次
 
-- [Concept](#concept)
-- [How It Works](#how-it-works)
-- [Design Principles](#design-principles)
-- [Priority Levels](#priority-levels)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Project Layout](#project-layout)
-- [Privacy and Data Handling](#privacy-and-data-handling)
-- [Operational Notes](#operational-notes)
-- [Known Limitations](#known-limitations)
-- [Contributing](#contributing)
-
----
-
-## Concept
-
-Inbox triage is a ranking problem, not a filtering problem. Traditional Gmail filters answer
-"does this match a rule?", which forces you to enumerate every sender and keyword you care
-about in advance. This tool instead answers a different question: **"if I only had time for
-a few emails today, which ones would they be?"**
-
-The answer is expressed as a single Gmail label per thread. Nothing is hidden, archived, or
-deleted — the mailbox stays exactly as it was, with one extra dimension of information that
-you can sort, search, and build filters on top of.
-
-The judgment itself is delegated to an LLM, and the judgment *policy* lives in a prompt that
-you own and edit. Adjusting how aggressively academic mail, invoices, or a specific customer
-gets escalated is a prompt change, not a code change.
+- [考え方](#考え方)
+- [動作の流れ](#動作の流れ)
+- [設計方針](#設計方針)
+- [優先度の定義](#優先度の定義)
+- [必要なもの](#必要なもの)
+- [セットアップ](#セットアップ)
+- [設定](#設定)
+- [使い方](#使い方)
+- [ディレクトリ構成](#ディレクトリ構成)
+- [プライバシーとデータの扱い](#プライバシーとデータの扱い)
+- [運用上の注意](#運用上の注意)
+- [現状](#現状)
+- [開発](#開発)
 
 ---
 
-## How It Works
+## 考え方
 
-One invocation is one batch. The process starts, triages what it finds, applies labels, and exits.
+受信トレイの整理は**絞り込みではなく順位付けの問題**です。
+
+Gmail のフィルタが答えるのは「この条件に一致するか？」で、気にしたい送信者やキーワードを**あらかじめ全部列挙しておく**必要があります。このツールが答えるのは別の質問です。
+
+> **「今日メールを数通しか読む時間がないとしたら、どれを読むべきか？」**
+
+答えはスレッドごとに1つのラベルとして表現されます。何も隠さず、アーカイブせず、削除しません。**受信トレイはそのままで、並べ替えや検索やフィルタの材料になる情報が1次元増える**だけです。
+
+判断そのものは LLM に任せますが、**判断の基準はあなたが所有するプロンプトの中**にあります。請求書をどれだけ強く扱うか、特定の顧客をどう扱うかを変えるのは、コードの変更ではなくプロンプトの変更です。
+
+---
+
+## 動作の流れ
+
+1回の起動が1バッチです。起動して、見つけたものを仕分けて、ラベルを付けて、終了します。常駐しません。
 
 ```
   config.yml + .env
          │
          ▼
-  ┌─────────────────┐
-  │ Load config     │  Which labels mean P1/P2/P3, how many threads,
-  │ Pick classifier │  how fast, and which LLM backend to use
-  └────────┬────────┘
+  ┌──────────────────┐
+  │ 設定の読み込み    │  どのラベルが P1/P2/P3 か、何件まで、どの速さで、
+  │ バックエンド選択  │  どの LLM を使うか
+  └────────┬─────────┘
            ▼
-  ┌─────────────────┐
-  │ Gmail OAuth     │  Desktop-app OAuth flow, token cached locally
-  └────────┬────────┘
+  ┌──────────────────┐
+  │ ラベルIDの解決    │  設定の「名前」からメールボックスの ID を引く。
+  │                  │  存在しない名前なら、ここで候補付きで落ちる
+  └────────┬─────────┘
            ▼
-  ┌─────────────────┐
-  │ List threads    │  in:inbox, excluding anything already labeled P1/P2/P3
-  └────────┬────────┘
+  ┌──────────────────┐
+  │ スレッド一覧      │  in:inbox から、既に P1/P2/P3 が付いたものを除外。
+  │                  │  前回の続きがあれば「何が変わったか」だけ訊く
+  └────────┬─────────┘
            ▼
-  ┌─────────────────┐
-  │ Fetch + parse   │  Full thread payload → subject, body text,
-  │ each thread     │  human-readable label names
-  └────────┬────────┘
+  ┌──────────────────┐
+  │ 取得とパース      │  MIME を再帰的に辿り、charset を見て復号し、
+  │                  │  HTML からテキストを取り出し、ヘッダを抽出
+  └────────┬─────────┘
            ▼
-  ┌─────────────────┐
-  │ Classify        │  Thread JSON → LLM → {"priority": "P1", "reason": "..."}
-  │ (concurrent)    │  Run in parallel, throttled to your rate limit
-  └────────┬────────┘
+  ┌──────────────────┐
+  │ 無害化と予算配分  │  隠し文字・制御文字を除去し、スレッド内に既にある引用だけを落とし、
+  │                  │  新しいメッセージ優先でトークン予算に収める
+  └────────┬─────────┘
            ▼
-  ┌─────────────────┐
-  │ Apply labels    │  Add the matching priority label to each thread
-  └─────────────────┘
+  ┌──────────────────┐
+  │ 分類（並行）      │  → LLM → {"priority": "P1", "reason": "..."}
+  │                  │  レート制限を守りながら並行実行
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ アクション計画    │  優先度と設定から「何を変えるか」を決める
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ 適用              │  ラベルを書き込む。あるいはファイルに出す（dry-run）。
+  │                  │  あるいはキューに入れて別プロセスに任せる
+  └──────────────────┘
 ```
 
-The unit of classification is the **thread**, not the individual message. A reply changes the
-urgency of the whole conversation, so the whole conversation is scored together and the label
-is applied to the thread.
+分類の単位は個々のメッセージではなく**スレッド**です。返信が来れば会話全体の緊急度が変わるので、会話をまとめて評価してスレッドにラベルを付けます。
 
 ---
 
-## Design Principles
+## 設計方針
 
-**Gmail is the database.**
-There is no local store of classification state. The presence of a priority label on a thread
-*is* the record that it has been handled. This keeps the tool stateless, makes it safe to
-interrupt at any point, and means results are visible everywhere Gmail is — phone, web, and
-desktop clients alike.
+### Gmail がデータベース
 
-**Re-running is always safe.**
-Already-labeled threads are excluded by the Gmail search query itself, and re-checked again
-after fetching in case a label was added mid-run. A crashed or killed run costs at most the
-work in flight; the next run picks up where it left off without duplicating LLM calls.
+分類状態をローカルに持ちません。**スレッドに優先度ラベルが付いていること自体が「処理済み」の記録**です。
 
-**Additive changes only.**
-The tool only ever *adds* a priority label. It never removes labels, never archives, never
-deletes, and never moves mail between tabs. If you disagree with a classification, changing
-the label by hand is permanent — the tool will not overwrite your decision on a later run.
+おかげでツールはステートレスで、いつ中断しても安全で、結果はスマホでも Web でもデスクトップでも Gmail が見える場所ならどこでも見えます。
 
-**Policy lives in the prompt, not the code.**
-Priority rules — which domains are always urgent, how to treat newsletters, what to do when
-the content is ambiguous — are expressed in natural language in a prompt you control. The
-Python code decides *what to send* and *what to do with the answer*, never *what counts as
-urgent*.
+### 何度実行しても安全
 
-**The LLM backend is swappable.**
-Classifiers sit behind one small interface: thread messages in, priority out. Switching
-between a hosted OpenAI model and a locally hosted open-weight model is a one-line config
-change, with no other part of the system aware of the difference.
+既にラベルが付いたスレッドは Gmail の検索クエリ自体で除外し、取得後にもう一度確認します（実行中にラベルが付く場合があるため）。
 
-**Cost is a first-class constraint.**
-Inboxes are large and LLM calls are not free. Thread payloads are truncated to a fixed
-character budget before being sent, concurrency and requests-per-minute are configurable, and
-a hard cap on threads per run bounds the worst-case spend of any single invocation.
+**落ちても失うのは処理中の分だけ**で、次の実行は続きから始まります。同じスレッドに2回課金することはありません。
+
+### 手で直した判定は上書きしない
+
+既にラベルが付いたスレッドは、数えるだけで**再判定も再計画もしません**。
+
+あなたが手でラベルを直したかもしれないからです。ラベルを外す操作ができるようになった以上、既存ラベル付きスレッドを再計画すると、**実行のたびにあなたの修正を黙って戻す**ことになります。
+
+### 破壊的な操作は明示的に有効にしたときだけ
+
+既定では、ラベルを追加するだけです。
+
+設定を書けばスターを付けたりメインタブへ移したりもできますが、**受信トレイから出す操作（アーカイブ）は `allow_destructive` を有効にしない限り実行されません**。
+
+### 判断基準はプロンプトに、実行内容は設定に
+
+「どのドメインを常に急ぎとするか」「ニュースレターをどう扱うか」「判断がつかないときどうするか」は、自然言語でプロンプトに書きます。
+
+一方で**その結果として何をするか**（スターを付ける、タブを移す）は設定が決めます。プロンプトではありません。
+
+この分離が効くのは、メール本文が世界中の誰でも書ける入力だからです。**P1 だと言いくるめることができたとしても、設定がそう言っていなければスターは付きません。**
+
+### LLM バックエンドは差し替え可能
+
+分類器のインターフェースは1つだけです。スレッドが入って、優先度が出る。
+
+OpenAI・Bedrock・ローカルサーバの切り替えは設定1行で、他のどこもその違いを知りません。
+
+### コストは一級の制約
+
+受信トレイは大きく、LLM 呼び出しは無料ではありません。
+
+スレッドは送る前にトークン予算に収め、スレッド内の前のメッセージと重複する引用は落とし、並行数と毎分リクエスト数を設定でき、1回の実行で処理する件数に上限があります。毎回の検索は**優先度ラベルの付いたスレッドを除外する**ので、返ってくるのはまだラベルのないスレッドだけです。新着のない定期実行は、一覧を1回取得するだけで終わります。
 
 ---
 
-## Priority Levels
+## 優先度の定義
 
-| Priority | Meaning | Typical content |
+| 優先度 | 意味 | 典型例 |
 |---|---|---|
-| **P1** | Needs attention now | Deadlines within ~48 hours, incidents, security and payment issues, urgent requests from people who matter |
-| **P2** | Needs a reply, but not today | Ordinary work correspondence, scheduling, questions, non-urgent personal mail |
-| **P3** | Can be deferred or ignored | Promotions, newsletters, social notifications, routine automated updates |
+| **P1** | 今すぐ対応が要る | 48時間以内の締切、障害、セキュリティや支払いの問題、重要な相手からの緊急の依頼 |
+| **P2** | 返信は要るが今日でなくていい | 通常の業務連絡、日程調整、質問、急ぎでない私信 |
+| **P3** | 後回しでよい | プロモーション、ニュースレター、SNS通知、返信不要の自動通知 |
 
-The shipped prompt biases toward **P2 when uncertain** — under-triaging an important mail to
-P3 is far more costly than over-triaging a newsletter to P2. It also enforces a floor: mail
-that appears to be individually written by a human is never P3.
+同梱のプロンプトは**迷ったら P2 に倒します**。重要なメールを P3 にしてしまう損失は、ニュースレターを P2 にしてしまう損失よりはるかに大きいためです。
 
-These definitions are conventions of the prompt, not of the code. The code only requires that
-the model return one of the three names.
+また下限を1つ設けています。**人が個別に書いたと見えるメールは P3 になりません。**
 
----
-
-## Requirements
-
-- Python 3.13.5
-    - pyenv (recommended)
-    - pipenv
-- A Google Cloud project with the Gmail API enabled and an OAuth client of type **Desktop app**
-- One of:
-    - An OpenAI API key, or
-    - A local OpenAI-compatible server (e.g. LM Studio) serving an open-weight model
+これらはプロンプトの取り決めであって、コードの制約ではありません。コードが要求するのは「3つのうちどれかを返すこと」だけです。
 
 ---
 
-## Installation
+## 必要なもの
 
-1. (If you use pyenv, and did not install Python 3.13.5 yet)
+- Python 3.14（pyenv 推奨）
+- [uv](https://docs.astral.sh/uv/)
+- Gmail API を有効にした Google Cloud プロジェクトと、**デスクトップアプリ**種別の OAuth クライアント
+- 以下のいずれか
+  - OpenAI の API キー
+  - Bedrock にアクセスできる AWS 認証情報
+  - ローカルの OpenAI 互換サーバ（LM Studio 等）
+
+---
+
+## セットアップ
+
+1. （pyenv を使っていて Python 3.14 が未導入なら）
+
    ```bash
-   pyenv install 3.13.5
+   pyenv install 3.14.5
    ```
 
-2. Clone this repository
+2. クローン
+
    ```bash
    git clone https://github.com/KO1231/EmailPriorityClassifier.git
    cd EmailPriorityClassifier
    ```
 
-3. Install dependencies using pipenv
+3. インストール
+
    ```bash
-   pip3 install pipenv
-   pipenv install
+   make install
    ```
 
-4. Prepare secrets and configuration
-    - Create a `.env` file in the project root, based on `.env.example`.
-    - Create a `config.yml` file in the project root, based on `config.yml.example`.
-    - Place your Gmail API OAuth client credentials (Desktop application) at
-      **`secrets/client_secrets.json`**.
+4. 設定ファイルを用意する
 
-5. Create the three priority labels in Gmail (for example `#/P1`, `#/P2`, `#/P3`), then put
-   both their display names and their internal label IDs into `config.yml`. See
-   [Configuration](#configuration) for how to look the IDs up.
+   - `config.yml.example` を `config.yml` にコピーして埋める
+   - 自分だけのルールがあれば `policy.yml.example` を `policy.yml` にコピーする。このファイルは git 管理外で、**それによって `prompts/` の中身を公開できる状態に保っています**
+   - Gmail の OAuth クライアント認証情報（デスクトップアプリ）を **`secrets/client_secrets.json`** に置く
+   - モデルの認証情報を `.env` に置く（`.env.example` 参照）
 
-6. Create OAuth2 tokens
+5. Gmail に3つのラベルを作る（例: `#/P1` `#/P2` `#/P3`）。`config.yml` には**名前だけ**書きます。内部 ID は起動時にメールボックスから解決するので、手で管理するものはありません。
+
+6. 認証
+
    ```bash
-   pipenv run login_google
+   uv run epc login
+   uv run epc labels            # 設定した名前が正しく解決できるか確認
+   uv run epc labels --create   # まだないラベルを作る場合
    ```
-   A browser window opens for consent. The resulting token is cached at `secrets/token.pickle`
-   and refreshed automatically on later runs.
 
 ---
 
-## Configuration
+## 設定
 
-### `config.yml`
+`config.yml` にはポリシーだけを書き、秘密情報は書きません。そのため読んで diff を取ってレビューできます。注釈付きの全体像は `config.yml.example` にあります。
 
 ```yaml
-labelID:                      # Gmail internal label IDs (Label_...)
-  P1: "Label_????"
-  P2: "Label_????"
-  P3: "Label_????"
+labels:                     # 表示名だけ。ID は起動時に解決する
+  p1: "#/P1"
+  p2: "#/P2"
+  p3: "#/P3"
 
-priorityLabels:               # Display names of the same three labels
-  P1: "#/P1"
-  P2: "#/P2"
-  P3: "#/P3"
+gmail:
+  query: "in:inbox"
+  extra_query: ""            # 期間制限は付けない（下の「運用上の注意」参照）
+  max_threads: 1500         # 1回に分類する上限。残りは次の実行が続ける
 
-maxThreads: 1500              # Hard cap on threads classified per run
-concurrency: 15               # Parallel LLM requests
-requestsPerMin: 120           # LLM request rate limit
-model: "openai"               # "openai" | "gpt-oss"
+llm:
+  backend: openai           # openai | bedrock | local
+  model: gpt-5.4-mini
+  reasoning_effort: low
+  concurrency: 15
+  requests_per_min: 120
+
+actions:                    # 優先度が決まった後に何をするか
+  rules:
+    - when:   { priority: P1 }
+      unless: { any_label: [SPAM, TRASH] }   # 迷惑メール判定なら何もしない
+      do:     [add_star, move_to_primary, mark_important]
+
+dry_run: false              # dispatch より優先される。Gmail に一切書かない
 ```
 
-| Key | Purpose |
-|---|---|
-| `labelID` | Used when **writing** labels back to Gmail. Must be the internal `Label_...` IDs. |
-| `priorityLabels` | Used when **reading** — both to exclude already-classified threads from the search query and to detect existing labels after fetching. Must be the display names of the same three labels. |
-| `maxThreads` | Upper bound on threads processed in one invocation. Also bounds the cost of a run. |
-| `concurrency` | Number of classification requests in flight at once. Set to `1` to disable parallelism. |
-| `requestsPerMin` | Throttle applied between batches, to stay inside your provider's rate limit. |
-| `model` | Which classifier backend to load. |
+どの値も `EPC__` を前置した環境変数で上書きできます。階層は `__` で区切ります（`EPC__GMAIL__MAX_THREADS=50`）。優先順位は**コマンドライン → 環境変数 → ファイル → 既定値**です。
 
-> **Both `labelID` and `priorityLabels` must describe the same three labels.** They are not
-> cross-checked at startup — a mismatch results in threads being classified as one priority
-> and labeled as another. To look up your label IDs, run
-> `pipenv run python -c "from googleapiclient.discovery import build; from email_priority_classifier.gmail_credentials import get_credential; import json; print(json.dumps({l['name']: l['id'] for l in build('gmail','v1',credentials=get_credential('secrets/client_secrets.json','secrets/token.pickle')).users().labels().list(userId='me').execute()['labels']}, indent=2, ensure_ascii=False))"`.
+知らないキーは無視せずエラーにします。**書いたのに何も起きない設定**を作らないためです。
 
-### `.env`
+### 秘密情報
+
+`config.yml` には絶対に書きません。`OPENAI_API_KEY` などは環境変数から（`.env.example` 参照）、Gmail の認証情報は認証バックエンドが保持します（ローカルでは JSON ファイル、AWS ではパラメータストア）。
+
+OpenAI のキーは **`api.responses.write` と `api.responses.read` があれば足ります**。より広い `model.request` は不要です。
+
+### プロンプトと個人ルール
+
+優先度の判断基準はプロンプトそのものなので、レビューと diff ができるようリポジトリに置いてあります。
+
+一方で**あなた固有のルールは公開リポジトリに置くべきものではありません**。そちらは `policy.yml`（git 管理外）に書き、実行時にシステムプロンプトへ差し込まれます。
+
+```yaml
+guidance:
+  - "大学・官公庁ドメインからのメールは P3 にしない。"
+  - "example-vendor.com のニュースレターは、件名が URGENT でも P3。"
+```
+
+`epc prompt render` で、実際に送られる内容をそのまま確認できます。
+
+---
+
+## 使い方
+
+まず、何も触らずに「何をするつもりか」を出します。
 
 ```bash
-# Required when model: "openai"
-OPENAI_API_KEY=sk-????
-OPENAI_PROMPT_ID=pmpt_????          # A saved prompt in the OpenAI dashboard
-OPENAI_PROMPT_VERSION=????
-
-# Required when model: "gpt-oss"
-LOCAL_LM_PORT=1234                  # Port of your local OpenAI-compatible server
-
-# Optional
-DEV_NOT_MODIFY=true                 # Dry run: classify but never write labels to Gmail
-EMAIL_PRIORITY_CLASSIFIER_LOG=...   # Override the log file path (default: log/application.log)
+uv run --env-file .env epc run --dry-run
 ```
 
-`.env` is loaded automatically by `pipenv run`. If you invoke `python main.py` outside pipenv,
-you must export these variables yourself.
-
-### Prompts
-
-The two backends source their prompt differently:
-
-- **`openai`** — the prompt is stored server-side in the OpenAI dashboard and referenced by
-  `OPENAI_PROMPT_ID` / `OPENAI_PROMPT_VERSION`. It must accept the variables
-  `thread_subject` and `thread_messages`, and must return a JSON object containing a
-  `priority` field whose value is `"P1"`, `"P2"`, or `"P3"`.
-- **`gpt-oss`** — the prompt is read from `prompts/gptoss_system_prompt.txt` and
-  `prompts/gptoss_user_prompt.txt`, with `{{thread_subject}}` and `{{thread_messages}}`
-  substituted at request time.
-
-> The `prompts/` directory is git-ignored, so it is **not** present in a fresh clone. The
-> `gpt-oss` backend will fail with `FileNotFoundError` until you supply your own templates.
-
----
-
-## Usage
-
-Dry run first — classify everything, write nothing:
+意図した変更が全部 `log/mutations.jsonl` に書かれ、Gmail には何も適用されません。読んで納得したら、**読んだものをそのまま**適用します。
 
 ```bash
-DEV_NOT_MODIFY=true pipenv run start
+uv run epc apply log/mutations.jsonl
 ```
 
-Then, once the results look right:
+設定を信用できるようになったら、直接実行します。
 
 ```bash
-pipenv run start
+uv run --env-file .env epc run
 ```
 
-Progress, per-thread failures, and a line per label written are logged to stdout and to
-`log/application.log` (rotating, 1 MB × 5 backups).
+途中で使うもの:
 
-The tool is a batch job, not a daemon. For continuous triage, schedule it with cron, launchd,
-or a systemd timer.
-
----
-
-## Project Layout
-
-```
-main.py                                   Entry point: fetch → classify → label
-config.yml                                Runtime configuration (git-ignored)
-.env                                      Secrets and environment (git-ignored)
-prompts/                                  Prompt templates for the local backend (git-ignored)
-secrets/                                  OAuth client secrets and cached token (git-ignored)
-log/                                      Rotating application log (git-ignored)
-
-email_priority_classifier/
-├── config.py                             config.yml → typed config object
-├── gmail_credentials.py                  OAuth flow and token caching
-├── exception.py                          Exception hierarchy
-├── classifier/
-│   ├── email_priority_classifier.py      Abstract classifier interface
-│   ├── classifier_openai.py              Hosted OpenAI backend
-│   └── classifier_gptoss.py              Local OpenAI-compatible backend
-├── type/
-│   ├── priority.py                       P1 / P2 / P3 enum
-│   └── classified_email_data.py          Gmail message → LLM-ready representation
-└── util/
-    ├── logger_util.py                    Shared logging setup
-    └── assert_util.py                    Small validation helpers
+```bash
+uv run epc config validate    # 設定を検証して表示する。通信なし
+uv run epc prompt render      # 実際に送られるプロンプト（policy 込み）
+uv run epc run --limit 20     # 試しているあいだ件数を絞る
+uv run epc failures list      # 失敗が続いてスキップしているスレッド
+uv run epc failures clear     # その記録を消して、次の実行で再試行させる
 ```
 
----
-
-## Privacy and Data Handling
-
-**What leaves your machine.** With `model: "openai"`, the subject line and a truncated
-extract of the thread body are sent to the OpenAI API, along with the thread's Gmail label
-names. With `model: "gpt-oss"`, nothing leaves the machine — the request goes to a local
-server over loopback.
-
-**What is stored.** Nothing but the OAuth token (`secrets/token.pickle`) and the application
-log. No message bodies are persisted; the log records thread IDs and priorities, not content.
-
-**Gmail permissions requested.** `gmail.readonly`, `gmail.labels`, and `gmail.modify`. The
-`modify` scope is what allows labels to be applied. Note that this scope technically permits
-deleting and archiving mail — this tool never does either, but you are granting the capability.
+終了コードは `0` 正常、`1` 致命的（設定・認証情報）、`2` 部分的（一部のスレッドを落としたが実行は完走）。常駐しないバッチなので、cron / launchd / systemd timer から回してください。
 
 ---
 
-## Operational Notes
+## ディレクトリ構成
 
-- **Cost scales with inbox size, not with new mail.** The first run over a large inbox will
-  classify up to `maxThreads` threads, including old ones. Consider lowering `maxThreads`
-  for the first few runs to see costs before committing to a full sweep.
-- **A run is interruptible.** Labels are written after classification completes, so killing
-  the process mid-classification loses the work in flight but corrupts nothing.
-- **Failures are per-thread.** A thread that fails to parse or classify is logged and skipped;
-  the rest of the batch continues.
-- **Manual corrections stick.** Relabeling a thread by hand excludes it from all future runs.
+```
+config.yml            実行時の設定（git 管理外）
+policy.yml            自分の判断ルール（git 管理外）
+prompts/              汎用のプロンプト（コミット対象）
+secrets/              OAuth クライアント認証情報とトークン（git 管理外）
 
----
+src/epc/
+├── cli.py            エントリポイント
+├── settings.py       設定スキーマと階層
+├── pipeline.py       実行本体（一覧 → 取得 → 分類 → 計画 → 適用）
+├── ratelimit.py      リクエストの整流
+├── state.py          失敗が続くスレッドの記録
+├── report.py         分類履歴
+├── gmail/            auth · client · query · mime · labels · models
+├── classify/         budget · prompt · base · openai/bedrock/local
+├── security/         sanitize · detect
+├── actions/          model · rules · planner
+└── dispatch/         sink · applier · sqs
 
-## Known Limitations
-
-The project is in active development, and the following are known gaps rather than
-intentional design:
-
-- **Sender headers are not sent to the model.** Only subject, body text, and label names are.
-  "Who sent this" — arguably the strongest signal available — is currently invisible to the
-  classifier unless it appears in the body.
-- **HTML-only mail is sent with markup intact.** Bodies without a `text/plain` alternative
-  are not reliably stripped, which wastes the character budget on tags and scripts.
-- **Nested MIME structures are not traversed.** Mail with attachments often nests the real
-  body one level deeper than the parser looks, and can end up classified with no body at all.
-- **Non-UTF-8 bodies fail.** Legacy Japanese encodings (ISO-2022-JP, Shift_JIS) cause the
-  thread to be skipped.
-- **Truncation drops the newest messages.** Long threads are cut from the end, which is where
-  the most decision-relevant content lives.
-- **No retries.** A transient Gmail or LLM error costs that thread for the run.
-- **No tests.**
-
-A detailed remediation plan exists in `local/improvement_proposals.md` (not committed).
+environments/         Terraform（sample のみコミット）
+modules/              Terraform モジュール（aws_*）
+tests/                unit · integration · injection · fixtures（全て合成データ）
+```
 
 ---
 
-## Contributing
+## プライバシーとデータの扱い
 
-Branching model:
+**外に出るもの。** `backend: openai` の場合、予算内に収めたスレッドの抜粋（ヘッダと、重複する引用を落とした本文）が OpenAI API に送られます。`store: false` を付けているので、**プロバイダ側に保持を依頼しません**。`backend: bedrock` なら送り先が AWS になります。`backend: local` なら**何も外に出ません**。
 
-- `main` — released state. Pull requests targeting `main` are automatically closed unless they
-  originate from `develop`, `hotfix`, or `hotfix/*`.
-- `develop` — integration branch. Feature work branches from here and merges back here.
-- Pull requests *from* `main` are automatically closed.
+**保存されるもの。** OAuth トークン（`secrets/token.json`、本人のみ読み取り可、永続フィールドのみで短命なアクセストークンは含まない）、アプリケーションログ、そして**明示的に有効にした場合のみ**分類履歴。
 
-Both rules are enforced by GitHub Actions workflows in `.github/workflows/`.
+分類履歴が記録するのは件名の**ハッシュ**と送信者の**ドメイン**で、本文は保存しません。このファイルは実行より長生きし、バックアップに入る種類のものだからです。
 
-Commit messages follow a `type: summary` convention — `add:`, `fix:`, `update:`, `refactor:`,
-`remove:`.
+**要求する Gmail の権限。** `gmail.modify` のみです。読み取りとラベル管理を包含します。このスコープは技術的にはアーカイブや削除も許可しますが、このツールがそれを行うのは**あなたがそういうルールを書いたときだけ**で、`allow_destructive` は既定で無効です。
+
+---
+
+## 運用上の注意
+
+- **初回のコストは、受信トレイにあるラベルなしスレッドの数で決まります。** 大きな受信トレイでの初回は、古いメールも含めて `max_threads` まで分類し、残りは次の実行が続けます。最初の数回は `max_threads` を下げて実際のコストを見てから広げるのが安全です。一巡した後の定期実行は新着の分だけです。
+- **ラベルを外せば分類し直します。** 判断基準やプロンプトを変えた後、Gmail で該当スレッドの優先度ラベルを外すと、何年前のメールでも次の実行で新しい基準で分類されます。`extra_query` に `newer_than:14d` のような期間制限を付けると、それより古いメールではこれが効かなくなります。
+- **中断しても壊れません。** 分類済みの結果は停止要求を受けても書き出され、処理できなかった分はラベルがないままなので次回また来ます。
+- **失敗はスレッド単位です。** 失敗したスレッドは次の実行で再試行され、残りは続行します。プロバイダが内容を拒否したなど**そのスレッド自体が原因の失敗**が2回続き、その間に他のメールが正常に分類されていれば、以降はスキップします。スレッドに変化があったとき、モデルやプロンプトを変えたとき、30日経ったときにまた試します。障害や通信エラーによる失敗では、スキップは起きません。
+- **本文は削りすぎないことを優先しています。** 引用を落とすのは、同じ文面がスレッド内の前のメッセージに実際にあると確かめられたときだけです。途中から CC に入ったメールや、元のメッセージが削除された返信では、引用もそのまま送ります。署名は落としません（`--` は区切り線にも使われるため）。1通あたりの文字数の上限を超えたときは、引用行から先に削ります。
+- **手で直した判定は残ります。** 手でラベルを変えたスレッドは、以降の実行対象から外れます。
+- **ラベル付きスレッドに後から届いた返信には、そのスレッドのラベルを付けます。** Gmail のラベルはメッセージ単位なので、付けないと返信のたびにそのスレッドが検索に戻ってきてしまうためです。付けるのはすでに付いている優先度ラベルだけで、優先度の判定し直しやアクションは行いません。優先度ラベルが2つ付いているスレッドには何もしません。
+
+---
+
+## 現状
+
+ローカルでもコンテナでも動きます。AWS 側は Terraform に記述してあります（ECR のイメージ、定期実行される Fargate タスク、FIFO キュー、ラベル変更を適用する Lambda）。
+
+AWS では `config.yml` と `policy.yml` をイメージに入れず、パラメータストアに置きます。ECS が起動時に環境変数 `EPC_CONFIG_YAML` / `EPC_POLICY_YAML` として注入するので、同じイメージをどの環境でも使えます。パラメータの中身は Terraform を通さず、`terraform output next_steps` に出る `aws ssm put-parameter` で入れてください（Terraform を通すと state ファイルに平文で残るため）。Gmail の認証情報はパラメータストアのほか、`credentials.backend: secrets_manager` で Secrets Manager にも置けます。
+
+**未実装**: 評価（eval）の仕組み。プロンプトの変更が良くなったのか悪くなったのかを測れるようにするものです。判断基準をこれから調整していく段階になったら作る価値があります。
+
+---
+
+## 開発
+
+ブランチ運用:
+
+- `main` — リリース状態。`develop` / `hotfix` / `hotfix/*` 以外からの Pull Request は自動的にクローズされます
+- `develop` — 統合ブランチ。機能開発はここから分岐してここへ戻します
+- `main` **から**の Pull Request も自動的にクローズされます
+
+いずれも `.github/workflows/` の GitHub Actions で強制しています。
+
+コミットメッセージは `type: summary` 形式です（`add:` `fix:` `update:` `refactor:` `remove:` `change:`）。
+
+```bash
+make check     # lint + format + 型検査 + テスト
+make audit     # 依存の既知脆弱性チェック
+make docker-build
+make tf-validate
+```

@@ -1,12 +1,52 @@
+# --- IDE / OS -------------------------------------------------------------
 /.idea
-/**/__pycache__
+.DS_Store
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+/.venv/
+/build/
+/dist/
+*.egg-info/
+/.pytest_cache/
+/.ruff_cache/
+/.mypy_cache/
+/.coverage
+/htmlcov/
+
+# --- Secrets and personal configuration -----------------------------------
+# The remote is public. Nothing below this line may ever be committed.
 /.env
-
 /config.yml
-
+/policy.yml
 /secrets/**
 !/secrets/.gitkeep
 
-/prompts
+# Prompts: deny by default, allow the committed generic ones by name. A new
+# file under prompts/ stays ignored until it is listed here explicitly, which is
+# the correct default when the remote is public — the legacy gptoss_*.txt
+# templates carry personal escalation rules and must never be published.
+/prompts/*
+!/prompts/system.md
+!/prompts/user.md
 
+# --- Runtime artefacts ----------------------------------------------------
 /log
+/.state/
+
+# --- Terraform ------------------------------------------------------------
+# Only environments/sample/ is committed. dev/ and prod/ carry real account
+# IDs, ARNs and bucket names.
+/environments/*/
+!/environments/sample/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+/environments/*/.plan
+
+# --- Evaluation data ------------------------------------------------------
+# Golden-set threads are real mail. Fixtures under tests/fixtures/ are
+# synthetic and ARE committed.
+/tests/eval/data/

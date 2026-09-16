@@ -1,0 +1,170 @@
+[project]
+name = "email-priority-classifier"
+version = "2.0.0"
+description = "LLM-based Gmail thread triage that assigns P1/P2/P3 priority labels"
+readme = "README.md"
+requires-python = ">=3.14"
+authors = [{ name = "KO1231" }]
+keywords = ["gmail", "email", "triage", "llm", "classification"]
+
+# Core = what every entrypoint needs, including the apply worker.
+# The apply worker deliberately depends on neither an LLM SDK nor the MIME parser.
+dependencies = [
+    "google-api-python-client>=2.200.0,<3",
+    "google-auth-oauthlib>=1.4.1,<2",
+    "google-auth-httplib2>=0.4.2,<0.5",
+    "pydantic>=2.13.5,<3",
+    "pydantic-settings>=2.15.0,<3",
+    "pyyaml>=6.0.3,<7",
+    "structlog>=26.1.0,<27",
+]
+
+[project.optional-dependencies]
+# Everything the classify path needs on top of core.
+classify = [
+    "openai>=3.8.0,<4",
+    "beautifulsoup4>=4.15.0,<5",
+    "lxml>=6.1.3,<7",
+]
+# Credential/state/dispatch backends on AWS, plus the Bedrock classifier.
+aws = [
+    "boto3>=1.43.89,<2",
+    # The Lambda Runtime Interface Client. Present so that one image can serve
+    # both entrypoints: the CLI on Fargate, and the apply handler on Lambda.
+    "awslambdaric>=3.1.1,<4",
+]
+all = ["email-priority-classifier[classify,aws]"]
+
+[project.scripts]
+epc = "epc.cli:main"
+
+[project.urls]
+Repository = "https://github.com/KO1231/EmailPriorityClassifier"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1,<10",
+    "pytest-cov>=7.1.0,<8",
+    "mypy>=2.3.1,<3",
+    "ruff>=0.16.6,<0.17",
+    "types-PyYAML>=6.0.12.20260815,<7",
+    "pre-commit>=4.6.2,<5",
+    # Typed boto3. The Converse request body is hand-written JSON; a wrong key
+    # name should be a type error, not a runtime ValidationException.
+    "boto3-stubs[bedrock-runtime,s3,sqs,ssm]>=1.43.89,<2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/epc"]
+
+# --------------------------------------------------------------------------
+# uv
+# --------------------------------------------------------------------------
+[tool.uv]
+# Supply-chain cooldown: refuse any distribution published after this instant.
+# Nearly every recent PyPI incident was detected and yanked within days, so a
+# one-week quarantine blocks the class. Bump this date deliberately (and only
+# with a lockfile diff you have read) when pulling in updates.
+exclude-newer = "2026-09-06T00:00:00Z"
+default-groups = ["dev"]
+# `uv add` writes a bare `>=X` by default, so every dependency added after this
+# file was tidied would quietly admit the next major. "major" is semver-aware:
+# `<2` for 1.x, `<0.17` for 0.16.x, where a minor is the breaking line.
+# tests/unit/test_dependency_bounds.py enforces the same rule, because this
+# option is marked preview and a hand-edited requirement bypasses it anyway.
+add-bounds = "major"
+
+# --------------------------------------------------------------------------
+# ruff  (target-version is inferred from requires-python)
+# --------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+# Ruff formats Python inside Markdown; the prose here is not ours to reflow.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "A",         # builtin shadowing
+    "C4",        # comprehensions
+    "SIM",       # simplify
+    "RET",       # return
+    "ARG",       # unused arguments
+    "PTH",       # use pathlib
+    "TID",       # tidy imports
+    "S",         # bandit — this tool parses hostile input, keep it on
+    "RUF",
+]
+ignore = [
+    "S101",      # assert is fine outside of security-sensitive paths
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "ARG"]
+# The adversarial corpus is *made of* confusable characters. Invisible ones are
+# written as escapes; the visible ones (fullwidth forms) are the attack and have
+# to stay legible.
+"tests/injection/corpus.py" = ["S", "ARG", "RUF001"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["epc"]
+
+# --------------------------------------------------------------------------
+# mypy
+# --------------------------------------------------------------------------
+[tool.mypy]
+files = ["src", "tests"]
+strict = true
+warn_unreachable = true
+show_error_codes = true
+# Third-party packages that ship no type information.
+[[tool.mypy.overrides]]
+module = [
+    "googleapiclient.*",
+    "google_auth_httplib2.*",
+    "google_auth_oauthlib.*",
+    "bs4.*",
+    # Only its exception hierarchy is named, in an `except` tuple.
+    "httplib2.*",
+]
+ignore_missing_imports = true
+
+# google-auth ships *incomplete* type information: its modules resolve, but the
+# methods are unannotated, so every call trips --strict. Relax only the module
+# that touches them rather than losing strictness across the package.
+[[tool.mypy.overrides]]
+module = ["epc.gmail.auth", "tests.unit.gmail.test_auth", "tests.unit.gmail.test_client"]
+disallow_untyped_calls = false
+warn_return_any = false
+
+# --------------------------------------------------------------------------
+# pytest
+# --------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: exercises the full pipeline against fakes",
+    "injection: adversarial prompt-injection corpus",
+    "eval: hits a real LLM API against a local golden set (opt-in, never in CI)",
+]
+
+[tool.coverage.run]
+source = ["src/epc"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

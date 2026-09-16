@@ -1,421 +1,318 @@
 # CLAUDE.md
 
-Implementation notes for working on this codebase. Product-level description, design rationale,
-and setup instructions live in `README.md` — this file covers the parts only an implementer
-needs: exact control flow, data shapes, invariants, known defects, and the traps that are easy
-to fall into during a refactor.
+Implementation notes. Product description and setup live in `README.md`; this file
+covers what an implementer needs — the invariants, the reasons behind the odd-looking
+choices, and the traps.
+
+`epc` is short for *EmailPriorityClassifier*. It is the Python package (`src/epc/`),
+the CLI command, and the environment-variable prefix (`EPC__GMAIL__MAX_THREADS`). The
+distribution keeps the full name because that is what appears in a lockfile.
 
 ---
 
 ## Commands
 
 ```bash
-pipenv install                    # Install dependencies (Pipfile.lock is committed)
-pipenv run start                  # python main.py
-pipenv run login_google           # python email_priority_classifier/gmail_credentials.py
-DEV_NOT_MODIFY=true pipenv run start   # Dry run: classify, log intended writes, write nothing
+make install        # uv sync --all-extras + install the git hooks
+make check          # ruff + ruff format --check + mypy --strict + pytest
+make test           # pytest, excluding the opt-in eval suite
+make audit          # pip-audit over the locked dependency set
+
+uv run epc config validate      # parse and print the config; no network
+uv run epc labels               # resolve the configured labels against the mailbox
+uv run epc login                # OAuth, once
+uv run epc prompt render        # the exact prompt a thread produces
+uv run epc run --dry-run        # plan everything, write nothing
+uv run epc apply log/mutations.jsonl
+uv run epc failures list        # threads skipped for failing repeatedly
 ```
 
-There is no test suite, no linter config, and no formatter config in the repo. `.idea/misc.xml`
-references Black via the Pipenv SDK, but Black is not in the `Pipfile` and no formatting is
-enforced anywhere.
+`.env` is not read by the application — there is no `python-dotenv`. Use
+`uv run --env-file .env …`, or export the variables. Anything that adds a new
+entrypoint (Docker, cron, systemd) has to load it explicitly.
 
-**`.env` is loaded by pipenv, not by the application.** There is no `python-dotenv` dependency.
-`pipenv run ...` auto-loads `.env` from the project root; a bare `python main.py` will not, and
-will fail at import time with `KeyError` or an OpenAI auth error. Any refactor that introduces a
-non-pipenv entry point (Docker, cron, systemd) must load `.env` explicitly.
-
-`python-version` is pinned to 3.13.5 in both `.python-version` and `Pipfile`. The code uses
-PEP 701 nested same-quote f-strings (`main.py:52`, `main.py:76`, `main.py:145`), so **3.12 is
-the hard floor** regardless of what the Pipfile says.
+Python 3.14, pinned in `.python-version` and `requires-python`.
 
 ---
 
-## Execution flow
+## The two rules everything rests on
 
-Entry point is the `__main__` block at `main.py:248-260`. One invocation is one batch; there is
-no loop, no daemon, and no scheduler.
+**A. The model chooses a priority, never an action.** Its whole output surface is
+`{priority: "P1"|"P2"|"P3", reason, confidence, signals}` under a strict JSON schema —
+see `classify/prompt.py::response_json_schema`. There is no field for naming a label,
+requesting an action, or calling a tool. Actions are derived by `actions/planner.py`
+from configuration. **A completely successful prompt injection can therefore do exactly
+one thing: mislabel one thread.** Any feature that lets the model pick an action
+invalidates the entire security story, not just part of it.
 
-```
-__main__ (main.py:248)
-├── load_config(CONFIG_FILE)                      config.py:18
-├── get_classifier(config.model_name)             main.py:235   ← lazy import, see below
-└── main(classifier, config)                      main.py:214
-    ├── build("gmail", "v1", credentials=get_credential(...))
-    ├── fetch_personal_label_info(service)        main.py:209   Label_* → display name
-    ├── assert_positive × 3                       main.py:225-227
-    ├── classify(...)                             main.py:61    → dict[EmailPriority, set[str]]
-    └── modify_thread_labels(...)                 main.py:179
-```
+**B. Only newly classified threads are planned.** A thread that already carries a
+priority label is counted and skipped (`pipeline.py::_hydrate`); at most, its label is
+carried to replies that arrived later. It may have been set by
+hand, and now that actions can *remove* labels, re-planning would undo that correction
+on every run — silently, forever.
 
-### `classify()` — `main.py:61-176`
-
-The single largest function in the codebase and the primary refactor target.
-
-```
-build threads().list request                      main.py:71-77
-create Pool(concurrency) if concurrency > 1       main.py:80-85
-while request is not None:                        main.py:89
-  ├── response = request.execute()                main.py:92
-  ├── for each thread in page:                    main.py:99
-  │   ├── get_thread_messages(service, id)        main.py:103   threads().get(format="full")
-  │   ├── ClassifiedEmailData.init(m, labels)     main.py:105   per message; failure skips thread
-  │   ├── if thread already has a priority label: main.py:114-119
-  │   │     fold into result, do NOT re-classify
-  │   └── else append to thread_data_list         main.py:120
-  ├── classify the batch:
-  │   ├── concurrency > 1  → pool.map per batch   main.py:126-152
-  │   └── concurrency == 1 → inline sequential    main.py:154-164
-  └── request = threads().list_next(...)          main.py:167
-finally: pool.close(); pool.join()                main.py:168-171
-```
-
-Key details:
-
-- **The Gmail query is built from label *display names*, not IDs** (`main.py:76`):
-  `(in:inbox) AND NOT(label:#/P1 OR label:#/P2 OR label:#/P3)`. Label names are interpolated
-  unquoted, so a label name containing a space will silently produce a malformed query and
-  classify already-labeled threads again. Quote the names if label naming is ever relaxed.
-- **Idempotency is enforced twice**: once by the query above, and again at `main.py:114-119`
-  after fetching, in case a label appeared mid-run. The second check compares *display names*,
-  because `_PARSE_LABEL` has already converted IDs to names by that point.
-- **Already-labeled threads are folded into `result` and then re-written**. They skip the LLM
-  call, but `modify_thread_labels` still issues a `threads().modify` adding a label the thread
-  already has. Correct, but wasted API calls — one per skipped thread.
-- **`max_threads` short-circuits with `return`, not `break`** (`main.py:142-143`, `main.py:161-162`).
-  This returns from inside the `try`, so the `finally` at `main.py:168` still closes the pool.
-  It does mean the remaining pages are silently abandoned.
-- **`processed_threads` counts failures too** (`main.py:140`). A run where every thread fails
-  still terminates at `max_threads`.
-- **Rate limiting is batch-granular** (`main.py:149-152`): after each batch of `concurrency`
-  requests, sleep `60 * len(batch) / rate_limit_in_min` seconds. The sleep is skipped for the
-  final batch of a page. The single-process path sleeps `60 / rate_limit_in_min` per thread
-  (`main.py:163-164`).
-- **The `try` block spans the entire function** (`main.py:70-174`) and re-raises everything as
-  `EmailPriorityClassifierGmailAPIException("Some error occurred while listing threads.")`.
-  Classification failures on the single-process path therefore surface as a *Gmail* error with
-  a misleading message. See "Known defects" below.
-
-### `modify_thread_labels()` — `main.py:179-206`
-
-Serial loop, one `threads().modify` HTTPS round trip per thread. `addLabelIds` only;
-`removeLabelIds` is hardcoded `[]` (`main.py:187`). Per-thread failures are caught and logged,
-then the loop continues (`main.py:203-205`).
-
-`DEV_NOT_MODIFY` is read from `os.environ` **inside the loop, once per thread** (`main.py:198`).
-Any refactor should hoist this to a flag resolved once at startup.
+Both are covered by tests. Breaking either should fail the suite, not a mailbox.
 
 ---
 
-## Data model
-
-### `ClassifiedEmailData` — `type/classified_email_data.py`
-
-Wraps one Gmail message and produces the LLM-facing representation.
-
-```python
-ClassifiedEmailData(
-    date: int,            # internalDate, Unix ms
-    payload: dict,        # raw Gmail payload, retained whole
-    size_estimate: int,
-    labels: list[str],    # display names, already translated
-)
-# .subject is derived from payload headers in __init__ (line 58)
-```
-
-**Label translation** (`_PARSE_LABEL`, lines 23-31): system labels are mapped through
-`_LABEL_REPLACE_DATA` (lines 7-18) to readable names, user labels through the `Label_* → name`
-dict fetched by `fetch_personal_label_info`. **Anything in neither map is silently dropped** —
-including `UNREAD`, `SENT`, `DRAFT`, and every `CATEGORY_*` value not listed. The raw
-`labelIds` are not retained anywhere, so any feature that needs the original IDs (e.g. moving a
-thread between Gmail tabs) must first plumb them through.
-
-**Body extraction** (`get_data`, lines 62-85), in order:
-1. `payload["body"]` if non-empty and `size != 0` → base64-decode and return.
-2. Otherwise, direct children of `payload["parts"]` whose `mimeType` starts with `text/`.
-   Sorted `reverse=True` on mimeType string, which puts `text/plain` before `text/html` — an
-   incidental property of alphabetical ordering, not an explicit preference.
-3. If no parts matched: the literal string `"parts could not found."`.
-4. If parts matched but none had `body.data`: the first part JSON-dumped whole.
-
-`_decode_body` (lines 42-53) does `re.sub(r"\s+", " ", base64.urlsafe_b64decode(body).decode("utf-8"))`
-— base64 decode, hardcoded UTF-8, whitespace collapse. The commented-out block below it is a
-dead attempt at `Content-Transfer-Encoding` handling; `cchardet` was removed in `38481b0`, so
-there is currently no encoding detection at all.
-
-### `ClassifiedEmailDataEncoder` — `type/classified_email_data.py:97-105`
-
-The JSON encoder that defines **exactly what the model sees per message**:
-
-```json
-{"date": 1700000000000, "size_estimate": 12345, "data": "…body text…"}
-```
-
-That is the complete list. No `From`, no `To`, no `Cc`, no per-message `Subject`. Only the
-thread's first message subject is passed, separately, as a prompt variable
-(`classifier_openai.py:30`). If you are wondering why sender-based rules in the prompt do not
-fire — this is why.
-
-### `_encode_thread_messages` — `classifier/email_priority_classifier.py:10-15`
-
-```json
-{"labels": ["Inbox", "Category: Personal", …], "messages": [ …encoded messages… ]}
-```
-
-Labels are unioned across all messages in the thread and deduplicated. Messages are in Gmail's
-order, which is **oldest first**.
-
----
-
-## Classifier backends
-
-`EmailPriorityClassifier` (`classifier/email_priority_classifier.py:8-19`) is an ABC with one
-abstract method, `calc(thread_messages) -> EmailPriority`, plus the shared static encoder.
-Adding a backend means: subclass, implement `calc`, add a `case` to `get_classifier`
-(`main.py:237-245`).
-
-**`get_classifier` imports lazily on purpose** (`main.py:239`, `main.py:242`). Both backend
-modules construct their `OpenAI` client at module scope, and both read required environment
-variables at import time:
-
-| Backend | Module-level side effect | Fails at import without |
-|---|---|---|
-| `ClassifierOpenAI` | `_CLIENT = OpenAI()` (line 13) | `OPENAI_API_KEY` |
-| `ClassifierGPTOSS` | `OpenAI(base_url=f"http://localhost:{os.environ['LOCAL_LM_PORT']}/v1")` (lines 14-17) | `LOCAL_LM_PORT` |
-
-Eager imports would make `openai` mode require `LOCAL_LM_PORT` and vice versa. **Do not
-"clean up" these imports to the top of the file** without first moving client construction into
-`__init__`.
-
-`ClassifierGPTOSS`'s base URL is hardcoded to `localhost` (line 15), which is the main blocker
-for containerizing the local-model path.
-
-### Truncation
-
-| Backend | Budget | Location |
-|---|---|---|
-| `openai` | 2500 chars | `classifier_openai.py:31` |
-| `gpt-oss` | 1000 chars | `classifier_gptoss.py:48` |
-
-These are **character slices of the already-serialized JSON string**, so the model receives
-truncated, syntactically invalid JSON on any thread that exceeds the budget, with the newest
-messages cut first. The numbers themselves were tuned against cost (~4000 input tokens for the
-OpenAI path); keep the values when fixing *how* the truncation is applied.
-
-### Response parsing
-
-Both backends do the same thing (`classifier_openai.py:48-54`, `classifier_gptoss.py:70-76`):
-
-```python
-raw = json.loads(response.output_text)
-return EmailPriority[raw["priority"]]        # KeyError unless exactly "P1"/"P2"/"P3"
-```
-
-No JSON schema is enforced on the response, no fallback priority, no retry. Any deviation —
-a markdown fence, a prose preamble, `"P1 (high)"` — raises and loses the thread for that run.
-
-### `ClassifierGPTOSS._create_request_prompt` — `classifier_gptoss.py:37-42`
-
-Declared `@staticmethod` but takes `self` as its first parameter, and is called as
-`self._create_request_prompt(self, self._prompt_info, ...)` (line 47). It works by accident.
-Fix it to an instance method or a true static method, but note the call site must change too.
-
----
-
-## Configuration
-
-`load_config` (`config.py:18-29`) is a flat read of `config.yml` into a `NamedTuple`. Every key
-is required; a missing key is a `KeyError` at startup, which is the desired behavior.
-
-**`labelID` and `priorityLabels` are two independent hand-maintained maps of the same three
-labels.** Nothing validates that they agree. A mismatch produces the worst kind of bug: threads
-classified as P1 get labeled P3, silently, forever. Both are needed because Gmail's search
-syntax takes names while `threads().modify` takes IDs — but `fetch_personal_label_info`
-(`main.py:209-211`) already builds the full `Label_* → name` map at startup, so the IDs can be
-resolved from the names and `labelID` removed entirely.
-
-**`priorityAssociatedLabelIDs` exists in the working `config.yml` but is not read by any code.**
-`load_config` ignores it. It is a leftover from the `feature/associated_label` branch; either
-implement it or drop it from the file.
-
-Note that `config.yml` and `config.yml.example` have drifted apart — the example lacks
-`priorityAssociatedLabelIDs`, and its `priorityLabels` values are placeholders rather than the
-`#/P1` style actually in use.
-
----
-
-## Concurrency
-
-`multiprocessing.Pool` (`main.py:84`), sized by `config.concurrency`. Work is dispatched with
-`pool.map` over slices of `batch_size == concurrency` (`main.py:131-135`), so **each batch
-blocks until its slowest request finishes** before the next batch starts.
-
-Consequences that constrain the code as written:
-
-- **The classifier instance must be picklable.** `partial(_classify_worker, classifier=classifier)`
-  (`main.py:128`) ships the classifier to each worker. This is precisely why the `OpenAI` clients
-  are module-level globals rather than instance attributes — an `OpenAI` client is not picklable.
-  Both classifiers currently hold only strings/NamedTuples, so they pickle fine.
-- **macOS uses the `spawn` start method.** Each child re-imports the backend module, so each
-  child constructs its own `OpenAI` client and its own copy of the `logger_util` handlers.
-- **Every child opens the same `RotatingFileHandler`** (`logger_util.py:19-24`). Concurrent
-  rotation across processes is not safe; interleaved or lost log lines are possible under load.
-- The workload is pure HTTP wait. `ThreadPoolExecutor` would remove all three constraints above,
-  but it is a behavioral change and should not be bundled with correctness fixes.
-
-`_classify_worker` (`main.py:28-37`) catches every exception, logs it, and returns `(None, None)`,
-which the caller filters at `main.py:138`. **This safety net only exists on the multiprocess
-path** — see below.
-
----
-
-## Logging
-
-`util/logger_util.py` builds three handlers **at module import**, shared by every logger:
-
-| Handler | Target | Level | Filter |
-|---|---|---|---|
-| `_HANDLER` | stdout | DEBUG | `levelno < ERROR` (line 11) |
-| `_ERROR_HANDLER` | stderr | ERROR | — |
-| `_LOG_FILE_HANDLER` | `log/application.log` | DEBUG | rotating, 1 MB × 5 |
-
-`setup_logger(name, level)` attaches all three to a named logger and returns it. **It does not
-guard against duplicate attachment** — calling it twice with the same name duplicates every log
-line. Currently each module calls it exactly once at import, so this does not bite today.
-
-Log path override: `EMAIL_PRIORITY_CLASSIFIER_LOG` (line 17). `_LOG_FILE.parent.mkdir(exist_ok=True)`
-(line 18) has **no `parents=True`**, so a multi-level override path raises at import.
-
-Per-logger levels as set today: `main` INFO, `classifier_openai` INFO, `classifier_gptoss`
-**DEBUG** — the local backend logs full request and response payloads (`classifier_gptoss.py:66,73`),
-i.e. email content, into `log/application.log`.
-
----
-
-## Exceptions
-
-`exception.py` defines the hierarchy; nothing catches these types specifically anywhere.
+## Flow
 
 ```
-EmailPriorityClassifierException
-├── EmailPriorityClassifierGmailAPIException      raised by main.py:57, 174, 191
-└── EmailPriorityClassifierClassifyException
-    └── EmailPriorityClassifierOpenAIException    raised by both backends
+epc run
+ ├ resolve labels          gmail/labels.py    names → IDs, at startup, fails loud
+ ├ list threads            gmail/query.py     quoted label exclusions, every run
+ │   less known failures   state.py           threads that keep failing on their own
+ ├ fetch + parse           gmail/mime.py      ★ recursive MIME walk, charsets, headers
+ ├ budget + sanitise       classify/budget.py ★ the only route to a prompt
+ ├ classify                classify/*         openai | bedrock | local
+ ├ plan                    actions/planner.py priority + rules → ThreadMutation
+ └ dispatch                dispatch/sink.py   DirectSink applies, JsonlSink is dry-run
 ```
 
-`EmailPriorityClassifierClassifyException` is never raised directly. There is no
-`...ConfigException`, though config errors are the most likely startup failure.
+### Things that look odd and are not
 
-`main()` does not catch anything, and there is no `sys.exit` — **the process exit code is 0 on
-every path that does not crash outright**, which makes failures invisible to cron.
+**`classify/budget.py::build_payload` is the sanitisation gate.** It is the only
+supported route from a parsed thread to a prompt, and it sanitises on the way through.
+Anything reading `EmailMessage.body` directly has skipped that; `tests/injection/`
+exists to catch it.
+
+**Nothing is cut from a body on the strength of its shape alone.** A false cut
+loses the only copy the model will see; a missed cut costs tokens. So:
+
+- `strip_quoted_reply` finds where quoted history seems to start, then cuts only if
+  enough of it (`_SHARED_ENOUGH`, compared in whitespace-free fragments) is found in an
+  earlier message of the same thread. A first message is never stripped. A message
+  someone was CC'd into halfway keeps its history, and so does a reply whose earlier
+  messages were deleted. Quoted lines interleaved with answers are kept, and a forward
+  is never stripped.
+- Signatures are not stripped. Their only marker, a bare `--`, is also a section rule.
+  In a real inbox it appeared in a fifth of messages.
+- The per-message cap applies *after* stripping, and gives up `>` lines before
+  anything else. Otherwise a reply written below a long quote is cut off.
+- `extract_body` follows MIME structure. It picks one child of `multipart/alternative`
+  and joins every child of any other multipart. A plain-text alternative under a
+  third of the HTML's visible length is treated as a stub, and the HTML is used.
+
+These were settled by measuring a real inbox (330 messages), not by reasoning alone.
+Change them the same way: before and after, lengths only — no message got shorter.
+
+**Hidden-text removal lives in `gmail/mime.py`, not `security/`.** Text hidden with
+`display:none` is a question of what is *visible*, and deciding it needs the markup —
+which is gone by the time sanitisation runs. `html_to_text` parses; it does not render,
+resolve the CSS cascade, or compute layout. Two kinds of hiding therefore get through
+(class selectors in a `<style>` block, and colour matching an inherited background);
+both are named cases in `tests/injection/corpus.py` and are held shut by detection
+rather than removal. On a real inbox, what the rules remove is preheader text: the
+inbox-preview summary, styled `display:none; max-height:0; opacity:0`. None of the
+removed text was visible body text. It is a summary of the body, lost on purpose,
+because it is also the commonest place to hide an instruction.
+
+**The injection signal is never shown to the model.** Telling it "this thread looks
+hostile" would make that judgement itself worth attacking. It travels beside the
+payload and is acted on by the planner.
+
+**`actions/` and `dispatch/` must not import `classify/` or `gmail/mime`.** That is
+what keeps the apply side's dependencies to `google-api-python-client` plus `boto3`.
+`tests/unit/test_layering.py` asserts it against the import graph — a convention nobody
+can verify is one that erodes.
+
+**Threads, not processes.** The work is HTTP wait end to end. Processes forced the
+classifier to be picklable (hence module-global API clients), paid spawn cost per run,
+and had every child open the same rotating log. `ratelimit.py` is a next-slot clock, so
+one slow response delays only itself.
+
+**OpenAI goes through the Responses API; local goes through chat completions.** A key
+scoped to `api.responses.write` reaches Responses without `model.request`, which is
+"call any model on any endpoint". Local servers implement chat completions and mostly
+not Responses, so that end cannot follow. `store=False` on every OpenAI request.
+
+**Bedrock uses boto3 Converse, not a vendor client.** Converse is provider-agnostic —
+the same request reaches Claude, Nova, Llama, Mistral. Structured output is *requested*
+through a tool definition and never depended on: forcing a tool is unsupported on some
+models, so a rejection latches and degrades to `toolChoice: auto`, then to reading text.
+`parse_classification` is the backstop, which keeps the enum — not the transport — as
+the boundary.
+
+**Logging redaction is a backstop, not the policy.** Call sites pass IDs, counts and
+enums. `logging.py::redact` replaces content-bearing keys anyway, so a future mistake
+leaks a truncated line instead of a mailbox.
+
+**The history file records a subject digest and a sender domain, never the mail.** It
+outlives the run, gets copied to S3, and ends up in backups. Default is off. The model's
+`reason` is omitted too unless `history_include_reason`: the model writes it about the
+mail, so it carries the mail's content. `dispatched_via` says where a change was handed,
+not that it landed. `batchModify` reports nothing per thread, so a record cannot know.
+
+**`dry_run` is top level, not inside a section.** It overrides `dispatch`, so it is not
+one of dispatch's peers. `Settings.resolve_sink()` holds that precedence in one place:
+every command that plans gets it, and a sink added later cannot accidentally become one
+that writes during a dry run. It governs planning, not replaying. `epc apply` ignores it
+on purpose: applying a reviewed plan is what a dry run is for, and honouring the flag there
+would make that impossible without editing the config. The apply Lambda cannot see a dry
+run's plan, because a dry run never enqueues. `epc apply` does re-read each thread's
+labels first, since a plan can wait hours and a person may have labelled a thread in the
+meantime. The Lambda skips that read: its window is seconds, and the read costs quota.
+
+**A stop request means "stop starting work", not "stop".** ECS sends `SIGTERM` and
+`SIGKILL` thirty seconds later. `shutdown.py` sets a flag; the pipeline stops beginning
+new classifications, lets running ones finish, flushes the sink, and reports
+`interrupted`. Classifications already paid for must not die with the process.
+Abandoned threads are counted separately from failures — nothing went wrong — and still
+have no label, so they come round again.
+
+**There is no checkpoint, deliberately.** Every run searches the configured query, which
+excludes labelled threads, so it returns exactly what still needs a label and costs a page
+or two. A History API checkpoint was tried and removed. It could not honour `gmail.query`.
+It moved past threads a capped run cut off, and a dry run advanced it too. Worst, it broke
+the way the user re-classifies mail after changing their criteria: removing a label from
+old threads in Gmail. That has to keep working, which rules out time windows
+(`newer_than:`) as well.
+
+**A labelled thread's label is carried to replies that arrive later.** Labels sit on
+messages, a new reply does not inherit them, and Gmail search matches messages — so
+without this such a thread is listed, fetched and skipped on every run, and with no time
+limit they only accumulate (two appeared in a real mailbox in one day).
+`planner.py::plan_carry_forward` adds the thread's existing priority label to the
+messages lacking it, through the sink like any mutation (`origin: carried_forward`). It
+does not break rule B: nothing is classified or planned, and a label a person set is only
+extended, never replaced. With two priority labels on the thread it does nothing. A
+removed label is still a request to re-classify, because removing a label in Gmail's
+conversation view removes it from every message.
+
+**Failures are remembered only when the thread caused them.** `state.py` records parse
+failures, `RejectedByProviderError` (HTTP 400/413/422, Bedrock `ValidationException`) and
+`UnusableResponseError` (asked twice within the run). Throttling, outages, credentials and
+bugs are never recorded, so no incident can make mail be skipped. A thread is skipped
+after two failed runs, *and only if something else classified successfully since it
+first failed* — a misconfiguration that refuses every request looks thread-specific one
+thread at a time. A record is dropped when the thread's `historyId` moves, when backend,
+model or the prompt fingerprint changes, or after 30 days. Labels are not used for this:
+the user does not want the tool writing bookkeeping into their mailbox.
 
 ---
 
-## Known defects
+## Container
 
-Verified against the code, ordered by impact. A full remediation plan with implementation
-sketches lives in `local/improvement_proposals.md` (untracked, local only).
+One image for every deployment; only environment variables and mounts differ.
+`make docker-build`, then `make docker-run` (compose, with the local config mounted).
 
-1. **HTML is not stripped** — `type/classified_email_data.py:83`. `BeautifulSoup` is handed the
-   *base64 string* rather than the decoded HTML. Base64 contains no `<`, so `get_text()` returns
-   its input essentially unchanged, and `_decode_body` then base64-decodes it into raw HTML. The
-   model receives tags, inline CSS, and `<script>` bodies, inside a 2500-character budget. Decode
-   first, then parse; also `.decompose()` `script`/`style`/`head`/`noscript`, which `get_text()`
-   does not remove.
+Baked in: the package and the generic prompts. Mounted: `config.yml`, `policy.yml`,
+`secrets/`, `log/`, `.state/`.
 
-2. **Nested MIME parts are not traversed** — `type/classified_email_data.py:69`. Only direct
-   children of `payload["parts"]` are examined. The extremely common
-   `multipart/mixed > multipart/alternative > text/plain` shape yields no match (the
-   `multipart/alternative` wrapper fails the `text/` prefix test), and the model gets the string
-   `"parts could not found."`. Mail with attachments is disproportionately affected, and mail
-   with attachments is disproportionately important.
+On ECS nothing is mounted. `config.yml` and `policy.yml` live in SecureString parameters
+and arrive as `EPC_CONFIG_YAML` / `EPC_POLICY_YAML` through the task's `secrets` block,
+beside `OPENAI_API_KEY`. The order is the usual one: a `--config` or `--policy` given on the
+command line, then the variable, then the default file. A variable picked up from
+`--env-file` therefore cannot replace a file someone named, and a stray `config.yml` cannot
+replace what the deployment delivered. `EPC__…` variables still override single keys on top. Those `secrets` are resolved by the
+**execution** role before the program starts, so that role needs `ssm:GetParameters` and
+`kms:Decrypt` on them. The task role deliberately cannot read them. The root filesystem is
+read-only and Fargate adds no tmpfs, so an ephemeral volume is mounted at `/tmp`. A dry
+run there writes its plan to `/tmp` and, with `dispatch.log_planned`, to CloudWatch, since
+the file is gone when the task stops.
 
-3. **Hardcoded UTF-8 decoding** — `type/classified_email_data.py:43`. ISO-2022-JP and Shift_JIS
-   bodies raise `UnicodeDecodeError`, which propagates to `main.py:106` and **drops the entire
-   thread**. The `charset` parameter is available on each part's `Content-Type` header; combine
-   it with `errors="replace"` so a mislabeled charset degrades instead of skipping.
+- **Base images are pinned by digest.** A tag is mutable, and a base that changes under
+  a build is the same hole `uv.lock` closes on the dependency side. The runtime stage
+  still runs `apt-get upgrade`. The official image is rebuilt on its own schedule, and
+  Debian fixes published in between would otherwise ship unpatched; CI's trivy scan
+  fails on exactly those. pip is removed from the runtime image for the same reason:
+  nothing uses it there, and its vendored libraries carry advisories of their own.
+- **uv is installed from PyPI, not copied from `ghcr.io/astral-sh/uv`.** One registry,
+  one credential path. uv never reaches the runtime layer anyway, and what actually
+  ships is pinned by `uv.lock`'s per-package hashes.
+- **`uv sync --no-editable`.** The default editable install points the runtime layer at
+  a `/build/src` that only exists in the builder — the image builds and then fails to
+  import.
+- **`secrets/` is mounted read-only.** A consequence of storing only the durable
+  credential fields: a token refresh needs no write, and `epc login` runs on the host.
+  Storing the access token would change that.
+- The root filesystem is read-only, `/tmp` is tmpfs, and the process runs as UID 10001
+  so a bind-mounted `log/` has predictable ownership.
 
-4. **Single-process path has no per-thread error handling** — `main.py:157`. `classifier.calc()`
-   is called bare; the exception unwinds to `main.py:173` and is re-raised as
-   `EmailPriorityClassifierGmailAPIException("Some error occurred while listing threads.")`,
-   aborting the run. Behavior therefore differs between `concurrency: 1` and `concurrency: 2`,
-   and the error message is actively misleading. Route both paths through `_classify_worker`.
-
-5. **Truncation drops the newest messages** — `classifier_openai.py:31`,
-   `classifier_gptoss.py:48`. Gmail returns messages oldest-first, and the slice takes the head,
-   so the most recent exchange — the part that determines urgency — is what gets cut. The cut
-   also lands mid-JSON.
-
-6. **No retries anywhere.** A single Gmail 429/5xx or OpenAI 429 loses that thread.
-   `execute(num_retries=...)` and `OpenAI(max_retries=..., timeout=...)` cover both sides with no
-   new dependencies.
-
-7. **`labelID` / `priorityLabels` are unvalidated duplicates.** See "Configuration".
-
-8. **`token.pickle` uses `pickle`** — `gmail_credentials.py:21, 31`. `pickle.load` on a file an
-   attacker can write is arbitrary code execution. `Credentials.from_authorized_user_file` /
-   `creds.to_json()` are drop-in replacements. Also, `_SCOPES` (lines 8-12) requests
-   `gmail.readonly` alongside `gmail.modify`, which subsumes it.
-
-9. **`main.py:75` type annotation lies.** `maxResults=min(500, max_threads)` would `TypeError`
-   if `max_threads` were `None`, but `assert_positive` rejects `None` first. The parameter should
-   be typed `int`, not `int | None`.
-
-Documentation gaps fixed in the current `README.md`, listed here so they are not re-introduced:
-`client_secrets.json` lives in `secrets/`, not the project root; `.env.example` is missing
-`LOCAL_LM_PORT`, `DEV_NOT_MODIFY`, and `EMAIL_PRIORITY_CLASSIFIER_LOG`; and `prompts/` is
-git-ignored, so the `gpt-oss` backend cannot run from a fresh clone.
-
----
+`.github/workflows/docker.yml` checks these rather than assuming them: non-root, no
+build toolchain in the runtime layer, and — because `.dockerignore` is the last thing
+between a secret and a pushed layer — that no personal file was copied in.
 
 ## Conventions
 
-**Language.** Code comments and docstrings are Japanese. Log messages, exception messages, and
-all documentation are English. Keep the split.
+**Language.** `README.md` is Japanese — it is the public face of a personal tool, and its
+audience reads Japanese. This file stays English, as do log messages, exception messages,
+prompts, and the comments and docstrings that sit next to code an English-speaking model
+or contributor will read. Code comments are Japanese where the surrounding code is.
 
-**Commit messages.** `type: summary`, where type is one of `add:`, `fix:`, `update:`,
-`refactor:`, `remove:`. Summaries are usually Japanese. Do not add attribution or co-author
-trailers.
+**Commits.** `type: summary` — `add:`, `fix:`, `update:`, `refactor:`, `remove:`,
+`change:`. Summaries are usually Japanese. No attribution or co-author trailers.
 
-**Branches.** `main` is the released state; `develop` is the integration branch; features branch
-from `develop`. Two GitHub Actions workflows enforce this by auto-closing PRs: any PR *from*
-`main` (`close_pr_from_main.yml`), and any PR *to* `main` not from `develop`/`hotfix`/`hotfix/*`
-(`close_pr_to_main.yml`). Never commit directly to `main`.
+**Branches.** `main` is released state, `develop` integrates, features branch from
+`develop`. Two GitHub Actions workflows auto-close PRs that violate this. Never commit
+to `main` (a pre-commit hook enforces it).
 
-**Untracked-but-present files.** `test.py` and `local/` are excluded via `.git/info/exclude`
-(symlinked as `personal.gitignore`), not `.gitignore`. `config.yml`, `.env`, `prompts/`,
-`secrets/**`, and `log/` are excluded via `.gitignore`. These exist in the working tree and are
-readable — do not assume a file is absent just because `git ls-files` does not list it, and do
-not commit any of them.
+**The remote is public.** `.gitignore` denies by default where it matters: `prompts/*`
+is excluded and the two generic templates are allow-listed by name, so a new file there
+stays out until someone lists it. `config.yml`, `.env`, `policy.yml`, `secrets/**`,
+`log/**` and `.state/` are excluded. gitleaks runs in pre-commit and CI. Test fixtures
+are **generated**, never captured — `tests/fixtures/gmail.py` builds Gmail JSON from
+synthetic MIME, which is also why hostile shapes are cheap to author.
 
-`test.py` is a scratch script for looking up Gmail label IDs, not a test. If a real test suite
-is added under `tests/`, delete it.
+**Every dependency admits exactly one breaking line.** Floored at what `uv.lock` pins,
+capped below the next major — or the next *minor* for 0.x, where `<1` is as loose as no
+ceiling. This is an application with a lockfile: there is no downstream consumer who
+needs a wide range, so the range says what is tested. A range spanning two majors claims
+compatibility nobody checked, and turns a resolver failure into a run-time one.
+`[tool.uv] add-bounds = "major"` makes `uv add` write ranges this way;
+`tests/unit/test_dependency_bounds.py` enforces it anyway, because that option is marked
+preview and a hand-edited requirement never goes through `uv add`. Crossing a major is
+therefore always a deliberate edit to `pyproject.toml`, which is exactly the review point.
+
+**Personal rules go in `policy.yml`, not in `prompts/`.** The committed prompts have to
+stay publishable. A guard test asserts they contain no personal context.
 
 ---
 
-## Refactoring guidance
+## AWS
 
-**Sequence matters.** Fix defects 1-4 before touching prompts or architecture: they all corrupt
-what the model sees, so any accuracy measurement taken before fixing them is measuring noise.
-Their blast radius is almost entirely `type/classified_email_data.py`, which makes them cheap
-and independently verifiable.
+Terraform laid out like `KO1231/Delibird-priv`: `environments/<env>/` wires
+`modules/aws_*` together. `dev/` and `prod/` stay git-ignored; only `sample/` is committed.
 
-**Add tests at the parsing boundary first.** Defects 1, 2, and 3 are all "given this Gmail JSON,
-what text comes out" bugs, and all three would have been caught by a handful of fixtures against
-`ClassifiedEmailData.get_data`. `ClassifiedEmailData`, `_encode_thread_messages`, and
-`load_config` are fully testable with zero network access.
+- **Secrets never pass through Terraform state.** Parameters are created holding a
+  placeholder with `lifecycle { ignore_changes = [value] }` and filled out of band
+  (`terraform output next_steps`). A value passed through a variable ends up in plaintext
+  in the state file and in every plan.
+- **SQS dispatch** is FIFO with `MessageGroupId = thread_id`. The per-thread ordering is
+  what matters. The five-minute dedup window is a cost optimisation, not a correctness
+  mechanism: re-applying a label is a no-op. The apply Lambda reports partial batch
+  failures, and anything that keeps failing lands in the DLQ.
+- **Backends.** Credentials: `local`, `ssm`, `secrets_manager`. State: `local`, `ssm`,
+  `s3`. `service_account` is accepted by the schema and refused at startup; it needs a
+  Workspace domain to delegate from.
 
-**Treat label removal as a separate class of change.** Everything today is additive, which is
-what makes the tool safe to run repeatedly and safe to interrupt. The first feature that calls
-`removeLabelIds` — moving threads between Gmail tabs is the obvious candidate — breaks that
-property and needs a working dry-run path and a decision log before it ships. In particular it
-must never apply to the already-labeled fold-in path (`main.py:114-119`), or it will undo the
-user's manual corrections on every run.
+## Not done yet
 
-**Do not change the truncation budgets or the prompt's priority semantics** while fixing
-mechanics. Both are tuned, and conflating a tuning change with a correctness fix makes the
-result unattributable.
+- **Quoted label names in search are unverified.** A probe returned no hits for
+  `label:"name"` and hits for the bare `label:name`. `query.py::quote_label` quotes names
+  with spaces or non-ASCII characters. If Gmail does not accept the quotes, `-label:"…"`
+  excludes nothing, and every run re-lists the whole inbox. The configured labels need
+  no quotes, so nothing is affected today. Confirming it needs a throwaway label with a
+  space in its name.
+- **Eval harness.** A golden set and `epc eval`, so prompt changes are measured rather
+  than guessed at. `report.py` already writes what it needs. Deferred by choice — worth
+  building when the priority criteria are still being tuned, not before.
 
-**The `classify()` decomposition is the structural win.** Pulling page iteration, thread
-hydration, batch dispatch, and rate limiting apart — and unifying the serial and parallel paths
-— removes roughly half the function and fixes defect 4 as a side effect.
+  Three design decisions are already settled, and they came out of noticing that a
+  golden set is not simply built once and reused:
+
+  - **The set is the specification; the prompt is the implementation.** A prompt change
+    has two causes. Either the criteria are unchanged and the prompt expressed them
+    badly — the set is right, the prompt was wrong, and eval measures the fix. Or the
+    criteria themselves changed, in which case editing the set *is* how the new
+    criterion gets stated, and the prompt follows. Framing the edit as overhead gets
+    the order backwards.
+  - **A criteria change touches the affected entries, not the set.** "OTPs are P3 now"
+    moves three rows; how CloudWatch alarms or newsletters are rated has not changed.
+  - **A stale set actively misleads** — it asserts criteria you no longer hold and
+    reports a good change as a regression. So each entry carries a one-line reason for
+    the verdict plus the date and prompt version it was made under, and `epc eval`
+    reports *which cases changed* rather than only a score. Distinguishing an intended
+    flip from collateral damage is the main thing the set is for.
+- **Notification.** Deferred deliberately; revisit once the run summary is something
+  worth sending.

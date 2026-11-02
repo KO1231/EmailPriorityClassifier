@@ -1,0 +1,13 @@
+# Vulnerabilities deliberately left open. Each entry says why and when it goes.
+# pip-audit (ci.yml, `make audit`) reads its ignores from this file too, so an
+# ID listed here is open in both scanners and nowhere else.
+
+# pyasn1 0.6.4: quadratic CPU on crafted BER/DER. Fixed in 0.6.5, published
+# 2026-10-27, still inside the 7-day supply-chain cooldown. Unreachable here: its
+# only importer is google-auth's pure-Python RSA fallback, which needs `rsa`,
+# and `rsa` is not installed — keys go through `cryptography` instead.
+# Remove once pyasn1 0.6.5 is locked (2026-11-03 or later).
+CVE-2026-119194
+CVE-2026-119195
+CVE-2026-119196
+CVE-2026-119197

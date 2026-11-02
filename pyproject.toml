@@ -69,7 +69,8 @@ packages = ["src/epc"]
 # Nearly every recent PyPI incident was detected and yanked within days, so a
 # one-week quarantine blocks the class. Bump this date deliberately (and only
 # with a lockfile diff you have read) when pulling in updates.
-exclude-newer = "2026-10-26T00:00:00Z"
+# The timezone is set to +09:00 to match JST.
+exclude-newer = "2026-10-26T23:59:59+09:00"
 default-groups = ["dev"]
 # `uv add` writes a bare `>=X` by default, so every dependency added after this
 # file was tidied would quietly admit the next major. "major" is semver-aware:
@@ -89,24 +90,24 @@ extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = [
-    "E", "W",    # pycodestyle
-    "F",         # pyflakes
-    "I",         # isort
-    "N",         # pep8-naming
-    "UP",        # pyupgrade
-    "B",         # bugbear
-    "A",         # builtin shadowing
-    "C4",        # comprehensions
-    "SIM",       # simplify
-    "RET",       # return
-    "ARG",       # unused arguments
-    "PTH",       # use pathlib
-    "TID",       # tidy imports
-    "S",         # bandit — this tool parses hostile input, keep it on
+    "E", "W", # pycodestyle
+    "F", # pyflakes
+    "I", # isort
+    "N", # pep8-naming
+    "UP", # pyupgrade
+    "B", # bugbear
+    "A", # builtin shadowing
+    "C4", # comprehensions
+    "SIM", # simplify
+    "RET", # return
+    "ARG", # unused arguments
+    "PTH", # use pathlib
+    "TID", # tidy imports
+    "S", # bandit — this tool parses hostile input, keep it on
     "RUF",
 ]
 ignore = [
-    "S101",      # assert is fine outside of security-sensitive paths
+    "S101", # assert is fine outside of security-sensitive paths
 ]
 
 [tool.ruff.lint.per-file-ignores]

@@ -31,7 +31,7 @@ aws = [
     "boto3>=1.43.118,<2",
     # The Lambda Runtime Interface Client. Present so that one image can serve
     # both entrypoints: the CLI on Fargate, and the apply handler on Lambda.
-    "awslambdaric>=3.1.1,<4",
+    "awslambdaric>=4.2.2,<5",
 ]
 all = ["email-priority-classifier[classify,aws]"]
 
@@ -46,7 +46,7 @@ dev = [
     "pytest>=9.1.1,<10",
     "pytest-cov>=7.1.0,<8",
     "mypy>=2.4.0,<3",
-    "ruff>=0.16.10,<0.17",
+    "ruff>=0.17.2,<0.18",
     "types-PyYAML>=6.0.12.20260906,<7",
     "pre-commit>=4.7.0,<5",
     # Typed boto3. The Converse request body is hand-written JSON; a wrong key

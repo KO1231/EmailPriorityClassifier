@@ -2,7 +2,7 @@ name: Container
 
 on:
   pull_request:
-    paths: [Dockerfile, .dockerignore, compose.yaml, pyproject.toml, uv.lock, "src/**"]
+    paths: [Dockerfile, .dockerignore, .trivyignore, compose.yaml, pyproject.toml, uv.lock, "src/**"]
   push:
     branches: [develop]
   workflow_dispatch:
@@ -62,4 +62,5 @@ jobs:
           image-ref: epc:ci
           severity: HIGH,CRITICAL
           ignore-unfixed: true
+          trivyignores: .trivyignore
           exit-code: "1"

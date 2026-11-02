@@ -76,6 +76,8 @@ jobs:
         # throwaway environment with the runner's Python and compiles lxml from
         # source there, which fails for reasons that have nothing to do with a
         # vulnerability. The tool itself is pinned like everything else.
+        # Ignored IDs are the ones in .trivyignore, which says why each is open.
         run: |
           uv export --all-extras --no-emit-project --format requirements.txt > requirements.txt
-          uvx pip-audit@2.10.1 --disable-pip --require-hashes --requirement requirements.txt --strict
+          uvx pip-audit@2.10.1 --disable-pip --require-hashes --requirement requirements.txt --strict \
+            $(grep -E '^[A-Z]+-' .trivyignore | sed 's/^/--ignore-vuln /')
